@@ -1,0 +1,22 @@
+{
+  "name": "day-trader-india",
+  "description": "11 Claude skills for day trading Indian stocks on the NSE: scan the Nifty for breakouts, read exchange filings, time every entry and exit, and replay every outcome before you risk a rupee.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Raghav Verma"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "claude-skills",
+    "day-trading",
+    "nse",
+    "nifty",
+    "india",
+    "intraday",
+    "opening-range-breakout",
+    "paper-trading",
+    "zerodha-kite"
+  ],
+  "skills": "./"
+}

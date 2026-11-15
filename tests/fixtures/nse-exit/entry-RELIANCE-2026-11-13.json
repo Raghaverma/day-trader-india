@@ -1,0 +1,22 @@
+{
+  "created_by": "nse-entry",
+  "symbol": "RELIANCE",
+  "setup": "orb",
+  "side": "buy",
+  "date": "2026-11-13",
+  "status": "triggered",
+  "time": "10:05",
+  "bar_start": "10:00",
+  "bar_index": 9,
+  "price": 1334.0,
+  "level": 1333.4,
+  "interval": "5m",
+  "opening_range": {
+    "high": 1333.4,
+    "low": 1324.3,
+    "minutes": 15
+  },
+  "source": "yahoo",
+  "checked_at": "2026-11-13T04:35:00Z",
+  "reason": "the 10:00 bar closed above the range high"
+}

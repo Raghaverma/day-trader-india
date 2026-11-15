@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kite": {
+      "command": "/full/path/to/kite-mcp-server",
+      "args": [],
+      "env": {
+        "APP_MODE": "stdio",
+        "KITE_API_KEY": "${KITE_API_KEY}",
+        "KITE_API_SECRET": "${KITE_API_SECRET}",
+        "EXCLUDED_TOOLS": "modify_order,place_gtt_order,modify_gtt_order,delete_gtt_order"
+      }
+    }
+  }
+}
