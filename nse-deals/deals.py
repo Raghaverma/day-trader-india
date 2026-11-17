@@ -36,10 +36,22 @@ Client types are a guess from the name (mutual fund, insurance, bank, foreign
 fund, otherwise "other"); check the name yourself before saying who it is.
 
 State: trader/state/deals.json keeps every deal seen (90 days, deduplicated)
-and which ones have alerted, so each deal alerts once. Config (trader/config.json):
+and which ones have alerted, so each deal alerts once. "trader/" is the folder
+nse_common.trader_home() finds ($NSE_TRADER_HOME, else the nearest trader/ with a
+config.json), wherever Claude Code was started. Config (trader/config.json):
 "follow_clients": ["societe generale", "hdfc mutual fund"] (name substrings) and
-"deals_min_value_inr": 10000000. Offline: --offline DIR reads the newest
-bulk*.csv and block*.csv in DIR, or --bulk FILE / --block FILE. The tests use it.
+"deals_min_value_inr": 10000000. The config is optional: a line on stderr says
+which file was used, or that the built-in defaults are (no follow list, ₹1 crore).
+Offline: --offline DIR reads the newest bulk*.csv and block*.csv in DIR, or
+--bulk FILE / --block FILE. The tests use it.
+
+A file that cannot be read is never "no deals". An empty body, a web page, the
+wrong columns, or rows none of which parse make that file fail; rows that do not
+parse among good ones are counted in a note. Exit codes: 0 deals shown, 1 nothing
+matched (every file was read), 2 usage or no file could be read, 3 nothing shown
+and one file (bulk.csv or block.csv) could not be read: the header says
+INCOMPLETE and `new` does not move "since" forward. A day with only NSE's "NO
+RECORDS" row, or only the header, is a real empty day.
 """
 
 import argparse
@@ -129,26 +141,39 @@ def _col(head, *words):
     return None
 
 
-def parse_deals(text, kind):
-    """bulk.csv / block.csv text -> deals (one dict per row), in file order."""
-    text = text.lstrip("﻿")
+def parse_deals(text, kind, problems=None):
+    """bulk.csv / block.csv text -> deals (one dict per row), in file order.
+
+    A header with no rows (or NSE's "NO RECORDS") is a day with no deals. An empty body, a
+    web page, missing columns, or rows none of which can be read raise DealsError: they are
+    not "no deals". Rows that cannot be read when others can are skipped and counted in
+    `problems` (a list), so a partial read is never reported as the whole file."""
+    text = str(text or "").lstrip("﻿")
+    if not text.strip():
+        raise DealsError("%s.csv came back empty (not even a header): NSE did not send the file" % kind)
+    if text.lstrip()[:1] == "<":
+        raise DealsError("NSE sent a web page, not %s.csv (blocked or not published yet): try again later" % kind)
     rows = list(csv.reader(io.StringIO(text)))
-    if not rows:
-        return []
     head = [h.strip() for h in rows[0]]
     cols = {"date": _col(head, "date"), "symbol": _col(head, "symbol"), "security": _col(head, "security"),
             "client": _col(head, "client"), "side": _col(head, "buy"), "qty": _col(head, "quantity"),
             "price": _col(head, "price"), "remarks": _col(head, "remark")}
     if None in (cols["date"], cols["symbol"], cols["client"], cols["side"], cols["qty"], cols["price"]):
         raise DealsError("%s.csv does not have the expected columns (got: %s)" % (kind, ", ".join(head)))
-    out, count = [], {}
+    out, count, unread = [], {}, []
     for r in rows[1:]:
-        if len(r) < len(head) - 1 or not "".join(r).strip():
+        if not "".join(r).strip():
+            continue
+        if re.sub(r"[^A-Z]", "", ",".join(r).upper()) == "NORECORDS":
+            continue  # NSE's marker for a day with no deals
+        if len(r) < len(head) - 1:
+            unread.append(",".join(r)[:80])  # cut off or garbled: counted, never silently dropped
             continue
         get = lambda k: r[cols[k]].strip() if cols[k] is not None and cols[k] < len(r) else ""
         date, qty, price = _iso(get("date")), _num(get("qty")), _num(get("price"))
         side = get("side").upper()
         if not date or qty is None or price is None or side not in ("BUY", "SELL"):
+            unread.append(",".join(r)[:80])
             continue
         sym = nc.nse_symbol(get("symbol"))
         client = " ".join(get("client").split())
@@ -160,6 +185,12 @@ def parse_deals(text, kind):
                     "client": client, "side": side, "qty": int(qty), "price": price,
                     "value": round(qty * price, 2), "client_type": classify(client),
                     "remarks": "" if remarks in ("-", "") else remarks})
+    if unread and not out:
+        raise DealsError("none of the %d rows in %s.csv could be read (a new date or number format?), "
+                         "first: %s" % (len(unread), kind, unread[0]))
+    if unread and problems is not None:
+        problems.append("%s.csv: %d of %d rows could not be read and are left out, first: %s"
+                        % (kind, len(unread), len(unread) + len(out), unread[0]))
     return out
 
 
@@ -208,14 +239,19 @@ class Source(object):
             raise DealsError("could not reach %s: %s" % (url, getattr(exc, "reason", exc)))
 
 
-def load_latest(source, kinds=("bulk", "block"), errors=None):
+def load_latest(source, kinds=("bulk", "block"), errors=None, failed=None):
+    """The latest day's deals from each file. A file that cannot be read goes into `errors`
+    and its kind into `failed` (a set), so the report can say "bulk.csv could not be read"
+    instead of "0 bulk"."""
     errors = [] if errors is None else errors
+    failed = set() if failed is None else failed
     deals = []
     for kind in kinds:
         try:
-            deals += parse_deals(source.text(kind), kind)
+            deals += parse_deals(source.text(kind), kind, errors)
         except (DealsError, OSError) as exc:
             errors.append("%s deals: %s" % (kind, exc))
+            failed.add(kind)
     return annotate(deals)
 
 
@@ -294,14 +330,18 @@ def select(deals, symbols=None, clients=None, side=None, min_value=0, kinds=None
     return out
 
 
-def your_symbols(portfolio, watchlist):
-    """{SYMBOL: "portfolio" | "watchlist"} from trader/portfolio.json and trader/watchlist.json."""
+def your_symbols(portfolio, watchlist, problems=None):
+    """{SYMBOL: "portfolio" | "watchlist"} from trader/portfolio.json and trader/watchlist.json.
+    A file that is not there is fine; one that is there but cannot be read goes into `problems`
+    (a list), so "your stocks" is never silently empty."""
     out = {}
     for path, key, label in ((watchlist, "hits", "watchlist"), (portfolio, "positions", "portfolio")):
         try:
             doc = nc.read_json(path) if path else None
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             doc = None
+            if problems is not None:
+                problems.append("could not read %s, so your %s is not flagged: %s" % (path, label, exc))
         for row in (doc or {}).get(key, []) if isinstance(doc, dict) else []:
             if isinstance(row, dict):
                 sym = row.get("symbol") or row.get("tradingsymbol") or row.get("ticker")
@@ -317,6 +357,38 @@ def prev_session(today, holidays=None):
             return d
         d -= _dt.timedelta(days=1)
     return d
+
+
+HOLIDAY_FETCH = None  # tests swap in a fake; None means nse_common fetches NSE's holiday-master
+
+
+def holidays_for(cfg, state_dir, today, now, offline=False):
+    """(holidays, known years, note) for the "is NSE's file the latest session?" check.
+    Online it refreshes NSE's list when stale (nc.ensure_holidays, best effort, never raises);
+    offline (tests, --bulk/--block files) it only reads what is there."""
+    if offline:
+        hol, years = nc.load_holidays(cfg, state_dir)
+        return hol, years, ""
+    try:
+        return nc.ensure_holidays(cfg, state_dir, today, now, fetch=HOLIDAY_FETCH)
+    except Exception as exc:  # noqa: BLE001  best effort: a holiday refresh never stops the report
+        hol, years = nc.load_holidays(cfg, state_dir)
+        return hol, years, "could not refresh NSE's holiday list: %s" % exc
+
+
+def config_note(path):
+    """Which config the run used, in a few words (printed to stderr, and as "config" in --json)."""
+    if path and os.path.isfile(path):
+        return "config %s" % path
+    return "no config at %s: built-in defaults (no follow list, %s minimum)" % (path, money(MIN_VALUE))
+
+
+def _since(stamp):
+    """state["last_check"] (UTC ISO) -> "2026-11-14 10:00 IST"; anything else as it is."""
+    try:
+        return nc.ist_text(_dt.datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return str(stamp)
 
 
 # ---------------------------------------------------------------- output
@@ -399,10 +471,10 @@ def _parser():
         p.add_argument("--mine", action="store_true", help="only stocks in your portfolio or watchlist")
         p.add_argument("--round-trips", action="store_true",
                        help="include clients who bought and sold the same stock the same day (hidden by default)")
-        p.add_argument("--config", default=os.path.join("trader", "config.json"))
-        p.add_argument("--portfolio", default=os.path.join("trader", "portfolio.json"))
-        p.add_argument("--watchlist", default=os.path.join("trader", "watchlist.json"))
-        p.add_argument("--state", default=os.path.join("trader", "state", "deals.json"))
+        p.add_argument("--config", default=nc.tpath("config.json"))
+        p.add_argument("--portfolio", default=nc.tpath("portfolio.json"))
+        p.add_argument("--watchlist", default=nc.tpath("watchlist.json"))
+        p.add_argument("--state", default=nc.tpath("state", "deals.json"))
         p.add_argument("--now", help='"YYYY-MM-DD HH:MM" IST, for reproducible runs')
         p.add_argument("--json", action="store_true")
         if fetch:
@@ -435,15 +507,44 @@ def main(argv=None):
         return 2
 
 
+def _follow_list(cfg):
+    """config "follow_clients": a list of name substrings (a lone string counts as one)."""
+    raw = cfg.get("follow_clients") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise DealsError('"follow_clients" in the config must be a list of names, got %r' % (raw,))
+    return [str(c) for c in raw]
+
+
+def _counts(latest, failed):
+    """ "26 block, 136 bulk": a file that could not be read says so instead of "0"."""
+    return ", ".join("%s.csv NOT READ" % k if k in failed else "%d %s" % (sum(1 for d in latest if d["kind"] == k), k)
+                     for k in ("block", "bulk"))
+
+
 def _run(args):
-    cfg = nc.load_config(args.config)
+    try:
+        cfg = nc.load_config(args.config)
+    except (ValueError, OSError) as exc:
+        raise DealsError("%s is not a usable config file: %s" % (args.config, exc))
+    cnote = config_note(args.config)
+    if not args.json:
+        print("deals: " + cnote, file=sys.stderr)  # stderr: the report on stdout stays clean
     now = nc.parse_now(args.now)
     today = nc.to_ist(now).date()
-    follow = [] if args.any_client else [str(c) for c in cfg.get("follow_clients") or []]
+    follow = [] if args.any_client else _follow_list(cfg)
     clients = follow + (args.client or [])
-    min_value = parse_value(args.min_value) if args.min_value is not None else \
-        float(cfg.get("deals_min_value_inr", MIN_VALUE) or 0)
-    yours = your_symbols(args.portfolio, args.watchlist)
+    if args.min_value is not None:
+        min_value = parse_value(args.min_value)
+    else:
+        try:
+            min_value = float(cfg.get("deals_min_value_inr", MIN_VALUE) or 0)
+        except (TypeError, ValueError):
+            raise DealsError('"deals_min_value_inr" in %s must be a number of rupees, got %r'
+                             % (args.config, cfg.get("deals_min_value_inr")))
+    errors = []
+    yours = your_symbols(args.portfolio, args.watchlist, errors)
     kinds = None if args.kind == "all" else {args.kind}
     filt = dict(symbols=args.symbol, clients=clients, side=args.side, min_value=min_value, kinds=kinds,
                 types=set(args.type) if args.type else None, mine=set(yours) if args.mine else None,
@@ -452,7 +553,8 @@ def _run(args):
         state = nc.read_json(args.state, {}) or {}
     except ValueError:
         raise DealsError("%s is not valid JSON" % args.state)
-    errors = []
+    if not isinstance(state, dict):
+        raise DealsError("%s is not a deals state file (expected a JSON object)" % args.state)
     what = []
     if clients:
         what.append("clients: " + ", ".join(clients))
@@ -476,15 +578,20 @@ def _run(args):
         header = "NSE bulk and block deals kept in %s, last %d days: %d of %d shown.%s" % (
             args.state, args.days, len(picked), len(deals), filters)
         if args.json:
-            print(json.dumps({"deals": picked, "summary": summary(picked)}, indent=2, ensure_ascii=False))
+            print(json.dumps({"deals": picked, "summary": summary(picked), "notes": errors, "config": cnote},
+                             indent=2, ensure_ascii=False))
         else:
-            sys.stdout.write(render(picked, header, yours, follow, "No deals in the history match. Run "
-                                    "`deals.py show` after 18:00 IST on a trading day to collect them."))
+            text = render(picked, header, yours, follow, "No deals in the history match. Run "
+                          "`deals.py show` after 18:00 IST on a trading day to collect them.")
+            sys.stdout.write(text + "".join("note: %s\n" % e for e in errors))
         return 0 if picked else 1
 
     source = Source(args.offline, args.bulk, args.block)
-    latest = load_latest(source, ("bulk", "block") if args.kind == "all" else (args.kind,), errors)
-    if not latest and errors:
+    asked = ("bulk", "block") if args.kind == "all" else (args.kind,)
+    failed = set()
+    latest = load_latest(source, asked, errors, failed)
+    if len(failed) == len(asked):
+        # nothing could be read: that is an error, not "no deals today"
         for e in errors:
             print("deals: %s" % e, file=sys.stderr)
         return 2
@@ -492,33 +599,47 @@ def _run(args):
     dates = sorted({d["date"] for d in latest})
     day = dates[-1] if dates else None
     if day:
-        hol, _ = nc.load_holidays(cfg)
+        state_dir = os.path.dirname(os.path.abspath(args.state))
+        hol, years, hnote = holidays_for(cfg, state_dir, today, now,
+                                         offline=bool(args.offline or args.bulk or args.block))
+        if hnote.startswith("could not"):
+            errors.append(hnote)
+        if today.year not in years:
+            errors.append("NSE's %d holiday list is not loaded, so the check that these are the latest "
+                          "session's files may be wrong around a holiday" % today.year)
         expected = prev_session(today, hol) if nc.to_ist(now).time() < _dt.time(18, 0) or \
             not nc.trading_day(today, hol)[0] else today
         if day < expected.isoformat():
             errors.append("NSE's files are for %s; the last session was %s. They may not be updated yet."
                           % (day, expected.isoformat()))
     picked = select(latest, **filt)
-    counts = "%d block, %d bulk" % (sum(1 for d in latest if d["kind"] == "block"),
-                                    sum(1 for d in latest if d["kind"] == "bulk"))
+    counts = _counts(latest, failed)
+    incomplete = ""
+    if failed:
+        incomplete = " INCOMPLETE: %s could not be read, so this covers %s only." % (
+            " and ".join("%s.csv" % k for k in sorted(failed)),
+            " and ".join("%s deals" % k for k in asked if k not in failed))
     if args.cmd == "show":
         shown, fresh = picked, None
-        header = "NSE bulk and block deals for %s (%s): %d shown.%s" % (
-            _day(day) if day else "?", counts, len(shown), filters)
+        header = "NSE bulk and block deals for %s (%s): %d shown.%s%s" % (
+            _day(day) if day else "?", counts, len(shown), incomplete, filters)
     else:
         alerted = state.setdefault("alerted", {})
         fresh = [d for d in picked if d["id"] not in alerted]
         shown = fresh
-        header = "New NSE bulk and block deals since %s: %d (%s on %s).%s" % (
-            state.get("last_check") or "the first check", len(fresh), counts, _day(day) if day else "?", filters)
+        header = "New NSE bulk and block deals since %s: %d (%s on %s).%s%s" % (
+            _since(state["last_check"]) if state.get("last_check") else "the first check", len(fresh), counts,
+            _day(day) if day else "?", incomplete, filters)
     if args.json:
         print(json.dumps({"date": day, "deals": shown, "summary": summary(shown), "notes": errors,
+                          "complete": not failed, "failed": sorted(failed), "config": cnote,
                           "filters": {"clients": clients, "min_value_inr": min_value, "symbols": args.symbol,
                                       "side": args.side, "kind": args.kind, "types": args.type,
                                       "mine": args.mine}}, indent=2, ensure_ascii=False))
     else:
-        text = render(shown, header, yours, follow,
-                      "Nothing new." if args.cmd == "new" else "No deals match.")
+        empty = ("Nothing new in what could be read." if failed else "Nothing new.") if args.cmd == "new" \
+            else "No deals match."
+        text = render(shown, header, yours, follow, empty)
         for e in errors:
             text += "note: %s\n" % e
         sys.stdout.write(text)
@@ -527,9 +648,10 @@ def _run(args):
             stamp = nc.utc_iso(now)
             for d in fresh:
                 state["alerted"][d["id"]] = stamp
-            state["last_check"] = stamp
+            if not failed:
+                state["last_check"] = stamp  # "since" must not claim a file was checked when it was not
         nc.write_json(args.state, state)
-    return 0 if shown else 1
+    return 0 if shown else (3 if failed else 1)
 
 
 if __name__ == "__main__":

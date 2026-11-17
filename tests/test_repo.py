@@ -41,7 +41,7 @@ class Repo(unittest.TestCase):
 
     def test_root_layout(self):
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith((".git", ".DS_Store")))
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "PORTING.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "CHANGELOG.md", "LICENSE", "README.md", "PORTING.md", "hooks", "tests"] + SKILLS))
 
     def test_every_skill_has_its_script(self):
         for s, script in SCRIPTS.items():
@@ -62,6 +62,31 @@ class Repo(unittest.TestCase):
             self.assertRegex(fm, r"description: ", s)
             self.assertGreater(len(fm), 200, "%s description is too thin" % s)
             self.assertGreater(len(text.splitlines()), 60, s)
+
+    def test_descriptions_stay_short_enough_for_the_skill_list(self):
+        # a long description can push a skill out of the session's skill list (nse-timemachine once
+        # showed up with none), so keep each one well under the 1,024-character limit
+        for s in SKILLS:
+            fm, _ = frontmatter(os.path.join(ROOT, s, "SKILL.md"))
+            m = re.search(r"^description: >-?\n((?:  .*\n?)+)", fm + "\n", re.M)
+            self.assertIsNotNone(m, "%s has no folded description" % s)
+            text = " ".join(m.group(1).split())
+            self.assertLessEqual(len(text), 700, "%s description is %d characters" % (s, len(text)))
+            self.assertGreater(len(text), 150, s)
+
+    def test_hooks_are_wired_and_compile(self):
+        with open(os.path.join(ROOT, "hooks", "hooks.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        events = doc.get("hooks") or doc
+        for event in ("PreToolUse", "UserPromptSubmit", "SessionStart"):
+            self.assertIn(event, events, event)
+        blob = json.dumps(events)
+        self.assertIn("place_order", blob)
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}", blob)
+        for f in os.listdir(os.path.join(ROOT, "hooks")):
+            if f.endswith(".py"):
+                with open(os.path.join(ROOT, "hooks", f), encoding="utf-8") as fh:
+                    compile(fh.read(), f, "exec")
 
     def test_order_path_skills_carry_the_safety_rule(self):
         for s in ORDER_PATH:

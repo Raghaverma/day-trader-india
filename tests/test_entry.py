@@ -21,6 +21,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 from _load import load, FIX, ROOT
 
@@ -597,7 +598,10 @@ class Cli(unittest.TestCase):
             self.assertEqual(e[k], v, k)
         # the same moment given in UTC
         code, text2, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13T04:35:00Z"])
-        self.assertEqual(text2, text.replace("Wrote trader/entry.json (status triggered).\n", ""))
+        # the Wrote line names the real file in the trader folder (not a path relative to wherever you stand)
+        wrote = "Wrote %s (status triggered).\n" % os.path.join(os.getcwd(), "trader", "entry.json")
+        self.assertIn(wrote, text)
+        self.assertEqual(text2, text.replace(wrote, ""))
 
     def test_check_waiting_json_and_exit_codes(self):
         code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:04", "--json"])
@@ -719,6 +723,333 @@ class Cli(unittest.TestCase):
         self.assertIn("run /nse-scanner first", err)
 
 
+def hole_at(d, hhmm):
+    """The same chart with one 5-minute bar left out the way Yahoo sometimes does (a null bar)."""
+    d = copy.deepcopy(d)
+    r = d["chart"]["result"][0]
+    want = int((nc.to_utc(DT.combine(FRI, nc.parse_hhmm(hhmm))) - DT(1970, 1, 1)).total_seconds())
+    i = r["timestamp"].index(want)
+    for k, arr in r["indicators"]["quote"][0].items():
+        arr[i] = None
+    return d
+
+
+class IncompleteRange(unittest.TestCase):
+    """Review item 13: an opening range built from the bars Yahoo happened to send."""
+
+    def test_the_control_with_the_whole_range(self):
+        r = at("2026-11-13 10:05")
+        self.assertEqual((r["status"], r["opening_range"]["bars"], r["opening_range"]["complete"]),
+                         ("triggered", 3, True))
+
+    def test_a_missing_range_bar_waits_instead_of_triggering(self):
+        # the 09:15 bar holds the real range high (1,333.40). Without it the "range" is 09:20 and 09:25:
+        # high 1,330.10, and the 09:30 bar (close 1,331.60) used to trigger at 09:35 off that wrong high
+        d = hole_at(doc(), "09:15")
+        for now in ("2026-11-13 09:35", "2026-11-13 10:05", "2026-11-13 12:00"):
+            r = at(now, d)
+            self.assertEqual((r["status"], r["phase"], r["trigger"]), ("waiting", "open", None), now)
+            self.assertEqual(r["reason"], "opening range incomplete: 2 of 3 bars")
+            self.assertEqual((r["opening_range"]["bars"], r["opening_range"]["of"], r["opening_range"]["complete"]),
+                             (2, 3, False))
+            self.assertIsNone(r["level"])
+        text = "\n".join(entry.describe(at("2026-11-13 10:05", d)))
+        self.assertIn("WAITING  opening range incomplete: 2 of 3 bars.", text)
+        self.assertNotIn("TRIGGERED", text)
+        self.assertIn("high ₹1,330.10, low ₹1,324.30 (2 of 3 bars, incomplete).", text)       # not "still forming"
+
+    def test_every_position_in_the_window(self):
+        for hhmm in ("09:15", "09:20", "09:25"):
+            r = at("2026-11-13 10:05", hole_at(doc(), hhmm))
+            self.assertEqual((r["status"], r["reason"]), ("waiting", "opening range incomplete: 2 of 3 bars"), hhmm)
+
+    def test_it_expires_at_the_cutoff_when_the_range_never_completes(self):
+        d = hole_at(doc(), "09:20")
+        r = at("2026-11-13 14:29", d)
+        self.assertEqual(r["status"], "waiting")
+        r = at("2026-11-13 14:30", d)
+        self.assertEqual((r["status"], r["phase"]), ("expired", "after-cutoff"))
+        self.assertEqual(r["reason"], "opening range incomplete: 2 of 3 bars; no entry by 14:30, the last time for a "
+                                      "new entry")
+        self.assertIsNone(r["trigger"])
+
+    def test_only_one_range_bar_and_none(self):
+        d = hole_at(hole_at(doc(), "09:20"), "09:25")
+        r = at("2026-11-13 10:05", d)
+        self.assertEqual((r["status"], r["reason"]), ("waiting", "opening range incomplete: 1 of 3 bars"))
+        d = hole_at(d, "09:15")
+        self.assertEqual(at("2026-11-13 10:05", d)["status"], "no-data")       # no range bar at all
+
+    def test_the_last_range_bar_still_settling(self):
+        d = live_cut(doc(), "09:25", "09:29:50")             # Yahoo's last trade is before the 09:25 bar's close
+        r = at("2026-11-13 09:30:05", d)
+        self.assertEqual((r["status"], r["reason"]), ("waiting", "opening range incomplete: 2 of 3 bars"))
+        self.assertIn("Yahoo's last trade is 09:29:50", r["lag_note"])
+        self.assertEqual(at("2026-11-13 10:05")["status"], "triggered")        # the whole file: fine
+
+    def test_the_level_setup_does_not_need_the_range(self):
+        r = at("2026-11-13 10:30", hole_at(doc(), "09:15"), setup="level", level=1340)
+        self.assertEqual((r["status"], r["trigger"]["time"]), ("triggered", "10:10"))
+
+    def test_a_bar_counts_at_its_close_and_not_a_second_before(self):
+        self.assertEqual(at("2026-11-13 10:04:59")["status"], "waiting")
+        self.assertEqual(at("2026-11-13 10:05:00")["status"], "triggered")
+        c1 = entry.parse_chart(json.dumps(doc(R1)), "RELIANCE")
+        self.assertEqual(entry.evaluate(c1, ist("2026-11-13 09:45:59"), interval="1m")["status"], "waiting")
+        self.assertEqual(entry.evaluate(c1, ist("2026-11-13 09:46:00"), interval="1m")["status"], "triggered")
+
+
+class TriggeredAt(unittest.TestCase):
+    """Review item 14: nse-exit refuses an old trigger by its time stamp."""
+
+    def test_triggered_at_is_the_trigger_bars_close_in_utc(self):
+        r = at("2026-11-13 10:05")
+        self.assertEqual(r["triggered_at"], "2026-11-13T04:35:00Z")           # 10:05 IST
+        self.assertEqual(r["trigger"]["triggered_at"], "2026-11-13T04:35:00Z")
+        self.assertEqual(r["late_by_minutes"], 0)
+        e = entry.entry_doc(r, ist("2026-11-13 10:05"))
+        self.assertEqual((e["triggered_at"], e["late_by_minutes"], e["time"], e["price"]),
+                         ("2026-11-13T04:35:00Z", 0, "10:05", 1334.0))
+        self.assertEqual(entry.entry_doc(at("2026-11-13 10:04"), ist("2026-11-13 10:04"))["triggered_at"], None)
+
+    def test_the_old_fields_are_all_still_there(self):
+        e = entry.entry_doc(at("2026-11-13 10:05"), ist("2026-11-13 10:05"))
+        for k in ("created_by", "exchange", "symbol", "setup", "side", "date", "status", "time", "bar_start",
+                  "bar_index", "price", "level", "interval", "opening_range", "source", "checked_at", "reason"):
+            self.assertIn(k, e)
+
+    def test_late_by_minutes_is_in_the_json_and_in_the_text(self):
+        for now, late in (("2026-11-13 10:05", 0), ("2026-11-13 10:09", 0), ("2026-11-13 10:10", 0),
+                          ("2026-11-13 10:11", 6), ("2026-11-13 10:30", 25), ("2026-11-13 15:45", 340)):
+            r = at(now)
+            self.assertEqual((r["late_by_minutes"], r["minutes_since"]), (late, int((ist(now) - ist("2026-11-13 10:05"))
+                                                                                  .total_seconds() // 60)), now)
+            text = "\n".join(entry.describe(r))
+            if late:
+                self.assertIn("That was %d minutes ago (late_by_minutes %d)" % (late, late), text)
+                self.assertIn("A late entry is a different trade", text)
+                self.assertNotIn("This is the moment to get in", text)
+            else:
+                self.assertNotIn("late", text.lower())
+                self.assertIn("This is the moment to get in", text)
+        # the same numbers through the CLI's --json and --write
+        d = tempfile.mkdtemp()
+        try:
+            out = os.path.join(d, "e.json")
+            code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:30", "--json",
+                                 "--write", out])
+            j = json.loads(text)
+            self.assertEqual((code, j["late_by_minutes"], j["triggered_at"]), (0, 25, "2026-11-13T04:35:00Z"))
+            with open(out, encoding="utf-8") as fh:
+                e = json.load(fh)
+            self.assertEqual((e["late_by_minutes"], e["triggered_at"], e["checked_at"]),
+                             (25, "2026-11-13T04:35:00Z", "2026-11-13T05:00:00Z"))
+        finally:
+            shutil.rmtree(d)
+
+
+class OrderTick(unittest.TestCase):
+    """Review item 11: the tick written to entry.json is the order tick."""
+
+    def test_a_level_near_a_slab_edge_gets_the_coarser_tick(self):
+        # 997.97 is on the 0.05 slab, but NSE sets a stock's tick from an earlier close: the stop and the
+        # entry must sit on the 0.10 grid or the stock's own tick may reject them
+        r = at("2026-11-13 10:30", setup="level", level=997.97)
+        self.assertEqual(r["tick"], "0.10")
+        self.assertEqual(at("2026-11-13 10:30", setup="level", level=1340)["tick"], "0.10")
+        self.assertEqual(at("2026-11-13 10:30", setup="level", level=240)["tick"], "0.05")      # 0.01 slab, 0.05 at +10%
+        self.assertEqual(at("2026-11-13 10:30", setup="level", level=200)["tick"], "0.01")
+        r = at("2026-11-13 10:30", setup="level", level=1300, cfg=dict(nc.DEFAULT_CONFIG, tick_sizes={"RELIANCE": 0.5}))
+        self.assertEqual(r["tick"], "0.5")
+
+
+class WatchlistLevel(unittest.TestCase):
+    """Review item 18, the entry end: it reads "level" and says so when a hit has none."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.mkdir("charts")
+        shutil.copy(R5, os.path.join("charts", "RELIANCE.json"))
+        shutil.copy(R5, os.path.join("charts", "TCS.json"))
+        os.mkdir("trader")
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def write(self, hits):
+        with open(os.path.join("trader", "watchlist.json"), "w") as fh:
+            json.dump({"created_by": "nse-scanner", "hits": hits}, fh)
+
+    def test_each_hit_uses_its_own_level(self):
+        self.write([{"symbol": "RELIANCE", "setups": ["breakout"], "level": 1340.0, "name": "Reliance Industries Limited"}])
+        code, text, _ = run(["watchlist", "--setup", "level", "--offline", "charts", "--now", "2026-11-13 10:30"])
+        self.assertEqual(code, 0)
+        row = text.splitlines()[1]
+        self.assertTrue(row.startswith("RELIANCE    triggered  10:10  ₹1,341.00"), row)   # the 10:05 bar closed 1,341
+        self.assertIn("₹1,340.00", row)
+
+    def test_a_hit_without_a_level_says_what_to_do(self):
+        self.write([{"symbol": "RELIANCE", "setups": ["oversold"]}, {"symbol": "TCS", "setups": ["breakout"],
+                                                                   "level": "n/a"}])
+        code, text, _ = run(["watchlist", "--setup", "level", "--offline", "charts", "--now", "2026-11-13 10:30"])
+        self.assertEqual(code, 1)
+        lines = text.splitlines()
+        self.assertIn("RELIANCE    error: no level for RELIANCE: its hit in", lines[1])
+        self.assertIn("has no \"level\" (nse-scanner writes the prior 20-day closing high on 20-day-breakout hits "
+                      "only; this hit is oversold). Pass --level PRICE, or watch it with --setup orb", lines[1])
+        self.assertIn("error: no level for TCS", lines[2])                        # a non-number is no level
+        self.assertNotIn("needs a level", text)
+
+    def test_a_given_level_beats_the_hits(self):
+        self.write([{"symbol": "RELIANCE", "setups": ["breakout"], "level": 1340.0}])
+        code, text, _ = run(["watchlist", "--setup", "level", "--level", "1347", "--offline", "charts", "--now",
+                             "2026-11-13 10:30"])
+        self.assertIn("₹1,347.00", text.splitlines()[1])
+
+    def test_hit_level_reads_only_prices(self):
+        self.assertEqual(entry.hit_level({"level": 1340}), 1340.0)
+        for bad in ({}, {"level": None}, {"level": "1340"}, {"level": 0}, {"level": -5}, {"level": True}):
+            self.assertIsNone(entry.hit_level(bad), bad)
+
+
+class HolidayRefresh(unittest.TestCase):
+    """Review item 25: entry.py refreshes a stale holiday list before it decides whether the NSE is open."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        self.saved = (entry.HOLIDAY_FETCH, entry._open_url, entry._sleep)
+        entry._sleep = lambda s: None
+        self.fetched = []
+        with open(os.path.join(FIX, "nse-alerts", "holiday-master.json"), encoding="utf-8") as fh:
+            m = json.load(fh)
+        m["CM"] = [dict(r, tradingDate=r["tradingDate"].replace("2026", "2027")) for r in m["CM"]]
+        self.master_2027 = m
+        shifted = json.dumps(shift_to(doc(), D(2027, 1, 5)))
+        entry._open_url = lambda url, timeout=20: shifted
+
+    def tearDown(self):
+        entry.HOLIDAY_FETCH, entry._open_url, entry._sleep = self.saved
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def fake_nse(self, doc_or_error):
+        def fetch():
+            self.fetched.append(1)
+            if isinstance(doc_or_error, Exception):
+                raise doc_or_error
+            return doc_or_error
+        entry.HOLIDAY_FETCH = fetch
+
+    def test_an_unknown_year_is_refreshed_and_then_known(self):
+        self.fake_nse(self.master_2027)
+        code, text, err = run(["check", "RELIANCE", "--now", "2027-01-26 10:30"])      # live path: Yahoo is faked
+        self.assertEqual(err, "")
+        self.assertEqual(len(self.fetched), 1)
+        self.assertIn("NSE holiday: Republic Day", text)                            # known only because of the refresh
+        self.assertIn("Holiday list: refreshed NSE's holiday list (NSE's 2027 holiday list is not loaded).", text)
+        self.assertNotIn("holiday list is not loaded (nse-alerts", text)
+        self.assertTrue(os.path.isfile(os.path.join("trader", "state", nc.HOLIDAY_CACHE)))
+        run(["check", "RELIANCE", "--now", "2027-01-26 10:30"])
+        self.assertEqual(len(self.fetched), 1)                                        # now cached and fresh: no refetch
+
+    def test_a_failed_refresh_never_stops_the_check(self):
+        self.fake_nse(nc.HolidayError("could not reach NSE: no network"))
+        code, text, err = run(["check", "RELIANCE", "--now", "2027-01-05 10:05"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("TRIGGERED 10:05", text)
+        self.assertIn("Holiday list: could not refresh NSE's holiday list (NSE's 2027 holiday list is not loaded): "
+                      "could not reach NSE: no network.", text)
+        self.assertIn("NSE's 2027 holiday list is not loaded", text)                 # and the old plain warning stays
+        self.fake_nse(RuntimeError("boom"))                                           # even an unexpected error
+        code, text, err = run(["check", "RELIANCE", "--now", "2027-01-05 10:05"])
+        self.assertEqual((code, err), (0, ""))
+
+    def test_offline_replays_never_touch_the_network(self):
+        self.fake_nse(AssertionError("must not fetch"))
+        code, text, err = run(["check", "RELIANCE", "--offline", R5, "--now", "2027-01-05 10:05"])
+        self.assertEqual(self.fetched, [])
+        self.assertNotIn("Holiday list:", text)
+        code, text, err = run(["watchlist", "--offline", os.path.join(FIX, "nse-entry"), "--watchlist",
+                               os.path.join(self.d, "none.json")])
+        self.assertEqual(self.fetched, [])
+
+    def test_a_known_fresh_year_does_not_fetch(self):
+        self.fake_nse(self.master_2027)
+        run(["check", "RELIANCE", "--now", "2026-11-13 10:05"])
+        self.assertEqual(self.fetched, [])
+
+    def test_watch_and_watchlist_refresh_too(self):
+        self.fake_nse(self.master_2027)
+        code, text, _ = run(["watch", "RELIANCE", "--now", "2027-01-05 09:30", "--every", "30"])
+        self.assertEqual((code, len(self.fetched)), (0, 1))
+        self.assertIn("Holiday list: refreshed", text)
+        os.mkdir("trader") if not os.path.isdir("trader") else None
+        with open(os.path.join("trader", "watchlist.json"), "w") as fh:
+            json.dump({"hits": [{"symbol": "RELIANCE"}]}, fh)
+        os.remove(os.path.join("trader", "state", nc.HOLIDAY_CACHE))
+        self.fetched.clear()
+        run(["watchlist", "--now", "2027-01-05 10:05"])
+        self.assertEqual(len(self.fetched), 1)
+
+
+class TraderHome(unittest.TestCase):
+    """Review item 8: the default files are in the trader folder, and the config used is named."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        self.elsewhere = os.path.join(self.d, "elsewhere")
+        os.mkdir(self.elsewhere)
+        os.chdir(self.elsewhere)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_entry_json_goes_to_the_trader_home_not_the_cwd(self):
+        home = os.path.join(self.d, "home")
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": home}):
+            code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:05", "--write"])
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.isfile(os.path.join(home, "entry.json")))
+            self.assertIn("Wrote %s (status triggered)." % os.path.join(home, "entry.json"), text)
+            self.assertEqual(os.listdir(self.elsewhere), [])
+            code, text, _ = run(["watch", "RELIANCE", "--offline", R5, "--now", "2026-11-13 09:30"])
+            self.assertIn("Wrote %s." % os.path.join(home, "entry.json"), text)
+            code, _, err = run(["watchlist", "--offline", EDIR])
+            self.assertIn("no watchlist at %s" % os.path.join(home, "watchlist.json"), err)     # the real path
+            self.assertEqual(os.listdir(self.elsewhere), [])
+
+    def test_it_says_which_config_it_used(self):
+        home = os.path.join(self.d, "home")
+        os.mkdir(home)
+        cfgfile = os.path.join(home, "config.json")
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": home}):
+            code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:05"])
+            self.assertIn("Config: none at %s, so the built-in defaults are in use." % cfgfile, text)
+            with open(cfgfile, "w") as fh:
+                json.dump({"no_entries_after": "14:00"}, fh)
+            code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:05"])
+            self.assertIn("Config: %s." % cfgfile, text)
+            code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:05", "--json"])
+            self.assertIn("Config: %s." % cfgfile, json.loads(text)["notes"])
+            code, text, _ = run(["watch", "RELIANCE", "--offline", R5, "--now", "2026-11-13 09:30"])
+            self.assertIn("Config: %s." % cfgfile, text)
+
+    def test_the_nearest_trader_folder_above_the_cwd_is_used(self):
+        os.makedirs(os.path.join(self.d, "trader"))
+        with open(os.path.join(self.d, "trader", "config.json"), "w") as fh:
+            json.dump({"no_entries_after": "10:00"}, fh)
+        code, text, _ = run(["check", "RELIANCE", "--offline", R5, "--now", "2026-11-13 10:05"])   # cwd is d/elsewhere
+        self.assertEqual(code, 1)
+        self.assertIn("EXPIRED", text)                                              # d/trader/config.json was read
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "nse-entry", "SKILL.md"), encoding="utf-8") as fh:
@@ -731,8 +1062,15 @@ class SkillDoc(unittest.TestCase):
         low = " ".join(text.lower().split())
         for must in ("nse", "nifty", "₹", "${claude_skill_dir}", "bar by bar", "can lag", "/nse-exit", "longs only",
                      "in the background", "/loop", "nothing was placed", "10:05", "₹1,334.00", "bar 9",
-                     "not financial advice", "explicit **yes**", "09:15", "pre-open", "14:30", "holiday"):
+                     "not financial advice", "explicit **yes**", "09:15", "pre-open", "14:30", "holiday",
+                     "opening range incomplete: 2 of 3 bars", "triggered_at", "late_by_minutes", "order_tick",
+                     "watchlist --setup level", "hits[].level", "nse_trader_home", "built-in defaults",
+                     "--allow-late"):
             self.assertIn(must, low)
+        desc = " ".join(fm.split("description: >-")[1].split("argument-hint:")[0].split())
+        self.assertLess(len(desc), 600)                       # review item 27
+        for phrase in ("tell me when to get in", "watch reliance", "has it broken out", "check my watchlist"):
+            self.assertIn(phrase, desc.lower())
         for never in ("\u2014", "$", "dollar", "nyse", "new york", "tick " + "by tick", "real " + "time",
                       "pro" + "fit"):
             self.assertNotIn(never, low.replace("${claude_skill_dir}", ""))

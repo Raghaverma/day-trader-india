@@ -10,9 +10,11 @@ import json
 import os
 import shutil
 import tempfile
+import re
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 from _load import load, ROOT, FIX
 
@@ -55,13 +57,26 @@ def master_doc():
         return json.load(fh)
 
 
+def _no_network(req, timeout=None):
+    raise urllib.error.URLError("no network in tests")
+
+
 class TempDir(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
         self.state_dir = os.path.join(self.d, "state")
         self.cfg = os.path.join(self.d, "config.json")      # absent unless a test writes it
+        # clock and holidays refresh a stale holiday list on their own: never let a test reach NSE
+        self._saved_net = (alerts._urlopen, alerts._sleep)
+        alerts._urlopen, alerts._sleep = _no_network, lambda s: None
+        # a default path (no --rules / --state / --write) must land in a scratch trader folder, never in the
+        # repo's working folder or ~/.day-trader-india
+        self._home = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": os.path.join(self.d, "trader-home")})
+        self._home.start()
 
     def tearDown(self):
+        self._home.stop()
+        alerts._urlopen, alerts._sleep = self._saved_net
         shutil.rmtree(self.d)
 
     def cal(self):
@@ -544,12 +559,14 @@ class Cli(TempDir):
                     "--offline", QDIR, "--now", now] + self.cal())
 
     def test_the_worked_example_from_the_plan(self):
+        # The rules are added at 10:50. The fixture is the whole day's real bars, which include a 10:10 high above
+        # the target and a 09:20 low below the stop: bars from before the rules existed must not ring them.
         code, text, _ = run(["add", "--from-plan", "--plan", PLAN, "--rules", self.rules, "--state", self.state,
-                             "--config", self.cfg])
+                             "--config", self.cfg, "--now", "2026-11-13 10:50"])
         self.assertEqual(code, 0)
         self.assertIn("Added reliance-flat-by", text)
         self.assertIn("cancel the stop, then sell", text)
-        self.assertEqual(run(["add", "--rules", self.rules, "--opening-bell"])[0], 0)
+        self.assertEqual(run(["add", "--rules", self.rules, "--state", self.state, "--opening-bell"])[0], 0)
 
         code, text, _ = self.check("2026-11-13 09:16")
         self.assertEqual(code, 0)
@@ -584,17 +601,17 @@ class Cli(TempDir):
             self.assertNotIn("reliance-flat-by", json.load(fh)["rung"])
 
     def test_check_on_a_holiday(self):
-        run(["add", "--rules", self.rules, "--opening-bell"])
-        run(["add", "--rules", self.rules, "--at", "15:10", "--label", "flat by", "--symbol", "RELIANCE"])
+        run(["add", "--rules", self.rules, "--state", self.state, "--opening-bell"])
+        run(["add", "--rules", self.rules, "--state", self.state, "--at", "15:10", "--label", "flat by", "--symbol", "RELIANCE"])
         code, text, _ = self.check("2026-11-24 15:15")
         self.assertEqual(code, 1)
         self.assertIn("NSE closed (2026-11-24 15:15 IST, NSE holiday: %s)." % GURU_NANAK, text)
 
     def test_add_time_and_target(self):
-        code, text, _ = run(["add", "--rules", self.rules, "--at", "15:10", "--label", "flat by", "--before-close",
+        code, text, _ = run(["add", "--rules", self.rules, "--state", self.state, "--at", "15:10", "--label", "flat by", "--before-close",
                              "--symbol", "reliance"])
         self.assertEqual(code, 0)
-        code, text, _ = run(["add", "--rules", self.rules, "--symbol", "RELIANCE", "--target", "1344.40",
+        code, text, _ = run(["add", "--rules", self.rules, "--state", self.state, "--symbol", "RELIANCE", "--target", "1344.40",
                              "--date", "2026-11-13"])
         self.assertEqual(code, 0)
         self.assertIn("cancel the stop, then sell", text)
@@ -604,18 +621,18 @@ class Cli(TempDir):
                                     "symbol": "RELIANCE", "before_close": True})
         self.assertEqual(rules[1], {"id": "reliance-target-1344.40", "symbol": "RELIANCE", "type": "target",
                                     "price": 1344.4, "date": "2026-11-13"})
-        code, _, err = run(["add", "--rules", self.rules, "--symbol", "RELIANCE", "--target", "1344.40",
+        code, _, err = run(["add", "--rules", self.rules, "--state", self.state, "--symbol", "RELIANCE", "--target", "1344.40",
                             "--date", "2026-11-13"])
         self.assertIn("already exists", err)
-        self.assertEqual(run(["add", "--rules", self.rules, "--at", "3pm"])[0], 1)
-        code, _, err = run(["add", "--rules", self.rules, "--from-plan", "--plan", os.path.join(self.d, "none")])
+        self.assertEqual(run(["add", "--rules", self.rules, "--state", self.state, "--at", "3pm"])[0], 1)
+        code, _, err = run(["add", "--rules", self.rules, "--state", self.state, "--from-plan", "--plan", os.path.join(self.d, "none")])
         self.assertEqual(code, 1)
         self.assertIn("no plan", err)
-        code, _, err = run(["add", "--rules", self.rules, "--symbol", "^NSEI", "--above", "24000"])
+        code, _, err = run(["add", "--rules", self.rules, "--state", self.state, "--symbol", "^NSEI", "--above", "24000"])
         self.assertIn("not an NSE symbol", err)
 
     def test_list_and_reset(self):
-        run(["add", "--rules", self.rules, "--opening-bell"])
+        run(["add", "--rules", self.rules, "--state", self.state, "--opening-bell"])
         self.check("2026-11-13 09:20")
         code, text, _ = run(["list", "--rules", self.rules, "--state", self.state])
         self.assertIn("(rang 2026-11-13T03:50:00Z)", text)
@@ -657,21 +674,332 @@ class Cli(TempDir):
         self.assertEqual(run([])[0], 1)
 
 
+class Bars(unittest.TestCase):
+    """Review item 10. The fixture is the day's real 5-minute RELIANCE bars: the last price (1,339.70) is
+    below the 1,344.40 target and above the 1,328.80 stop, yet the 10:10 bar's high was 1,347.90 and the
+    09:20 bar's low 1,324.30. A check that only compares the last price never rings either."""
+
+    def setUp(self):
+        self.q, _ = alerts.get_quotes(["RELIANCE"], QDIR)
+        self.target = [{"id": "t", "symbol": "RELIANCE", "type": "target", "price": 1344.4}]
+        self.stop = [{"id": "s", "symbol": "RELIANCE", "type": "stop", "price": 1328.8}]
+
+    def at(self, text, rules, state=None, price=None, quotes=None):
+        q = json.loads(json.dumps(self.q if quotes is None else quotes))
+        if price is not None:
+            q["RELIANCE"]["price"] = price
+        return alerts.evaluate(rules, q, status(text), state or {}, ist(text))
+
+    def test_the_fixture_is_what_the_tests_say(self):
+        bars = {b["t"]: b for b in self.q["RELIANCE"]["bars"]}
+        self.assertEqual(self.q["RELIANCE"]["bar_seconds"], 300)
+        self.assertEqual(len(bars), 74)                                     # the 15:20 hole is skipped
+        self.assertAlmostEqual(bars["2026-11-13T04:40:00Z"]["high"], 1347.9)    # 10:10 IST
+        self.assertAlmostEqual(bars["2026-11-13T03:50:00Z"]["low"], 1324.3)     # 09:20 IST
+        self.assertEqual(sorted(bars["2026-11-13T04:40:00Z"]), ["high", "low", "t"])
+        self.assertLess(self.q["RELIANCE"]["price"], 1344.4)
+
+    def test_a_spike_through_the_target_between_checks_rings(self):
+        rings, st = self.at("2026-11-13 10:00", self.target, price=1334.0)      # first check: last price only
+        self.assertEqual(rings, [])
+        self.assertEqual((st["quoted"]["RELIANCE"], st["armed"]["t"]), ("2026-11-13T04:30:00Z",) * 2)
+        rings, st = self.at("2026-11-13 10:20", self.target, st)                # the last price is 1,339.70
+        self.assertEqual(len(rings), 1)
+        msg = rings[0]["message"]
+        self.assertIn("RELIANCE traded at ₹1,347.90 in the 10:10 IST 5-minute bar (bar high, not the last price): "
+                      "at or above your target ₹1,344.40.", msg)
+        self.assertIn("The last price is ₹1,339.70", msg)
+        self.assertIn("Kite has no OCO for MIS: cancel the stop, then sell.", msg)
+        self.assertEqual((rings[0]["source"], rings[0]["bar_time"]), ("bar", "2026-11-13T04:40:00Z"))
+        self.assertEqual(self.at("2026-11-13 10:40", self.target, st)[0], [])    # rings once
+        self.assertIn("t", st["rung"])
+
+    def test_a_spike_through_the_stop_between_checks_rings(self):
+        rings, st = self.at("2026-11-13 09:16", self.stop)
+        self.assertEqual(rings, [])
+        rings, st = self.at("2026-11-13 09:31", self.stop, st)
+        self.assertEqual(len(rings), 1)
+        msg = rings[0]["message"]
+        # the 09:15 bar (low 1,326.40) started before the rule did: the first bar that counts is 09:20
+        self.assertIn("RELIANCE traded at ₹1,324.30 in the 09:20 IST 5-minute bar (bar low, not the last price): "
+                      "at or below your stop ₹1,328.80.", msg)
+        self.assertIn("SL sell should trigger", msg)
+        self.assertEqual(self.at("2026-11-13 09:45", self.stop, st)[0], [])
+
+    def test_the_last_price_still_rings_first_with_its_old_message(self):
+        rings, _ = self.at("2026-11-13 10:53", self.target, price=1344.4)
+        self.assertEqual(rings[0]["message"], "RELIANCE is ₹1,344.40: at or above your target ₹1,344.40. "
+                                              "Kite has no OCO for MIS: cancel the stop, then sell.")
+        self.assertNotIn("source", rings[0])
+
+    def test_bars_from_before_the_rule_existed_never_ring(self):
+        # the first check ever looks at the last price only
+        self.assertEqual(self.at("2026-11-13 15:10", self.target + self.stop)[0], [])
+        # armed at 10:50: the 10:10 spike and the 09:20 low are older than the rule
+        state = {"armed": {"t": "2026-11-13T05:20:00Z", "s": "2026-11-13T05:20:00Z"},
+                 "quoted": {"RELIANCE": "2026-11-13T03:46:00Z"}}
+        self.assertEqual(self.at("2026-11-13 15:10", self.target + self.stop, state)[0], [])
+
+    def test_a_bar_still_forming_is_never_used(self):
+        state = {"armed": {"t": "2026-11-13T04:30:00Z"}, "quoted": {"RELIANCE": "2026-11-13T04:30:00Z"}}
+        self.assertEqual(self.at("2026-11-13 10:12", self.target, state)[0], [])       # the 10:10 bar ends 10:15
+        self.assertEqual(self.at("2026-11-13 10:14", self.target, state)[0], [])
+        rings, _ = self.at("2026-11-13 10:15", self.target, state)
+        self.assertIn("10:10 IST 5-minute bar", rings[0]["message"])
+
+    def test_a_bar_the_previous_check_already_covered_is_not_looked_at_again(self):
+        high = [{"id": "t", "symbol": "RELIANCE", "type": "target", "price": 1350.0}]      # only the 10:15 bar (1,350.50)
+        armed = {"t": "2026-11-13T04:30:00Z"}
+        seen = {"armed": armed, "quoted": {"RELIANCE": "2026-11-13T04:50:00Z"}}            # last quote 10:20: bar ended 10:20
+        self.assertEqual(self.at("2026-11-13 10:40", high, seen)[0], [])
+        missed = {"armed": armed, "quoted": {"RELIANCE": "2026-11-13T04:45:00Z"}}          # last quote 10:15: not yet seen
+        rings, _ = self.at("2026-11-13 10:40", high, missed)
+        self.assertIn("₹1,350.50 in the 10:15 IST 5-minute bar", rings[0]["message"])
+
+    def test_a_failed_quote_does_not_move_the_window(self):
+        state = {"armed": {"t": "2026-11-13T04:30:00Z"}, "quoted": {"RELIANCE": "2026-11-13T04:30:00Z"}}
+        _, st = self.at("2026-11-13 10:20", [{"id": "t", "symbol": "RELIANCE", "type": "target", "price": 9999.0}],
+                        state, quotes={})
+        self.assertEqual(st["quoted"]["RELIANCE"], "2026-11-13T04:30:00Z")       # no quote, so no new "last looked"
+        self.assertIsNotNone(self.at("2026-11-13 10:40", self.target, st)[0])
+
+    def test_rearm_counts_only_bars_after_the_rearm(self):
+        rule = [{"id": "t", "symbol": "RELIANCE", "type": "target", "price": 1350.0, "rearm": True}]
+        _, st = self.at("2026-11-13 10:00", rule, price=1334.0)
+        rings, st = self.at("2026-11-13 10:20", rule, st)               # the 10:15 bar's high
+        self.assertEqual(len(rings), 1)
+        rings, st = self.at("2026-11-13 10:40", rule, st)               # nothing reached 1,350 since: re-armed
+        self.assertEqual((rings, st["rung"], st["armed"]["t"]), ([], {}, "2026-11-13T05:10:00Z"))
+        self.assertEqual(self.at("2026-11-13 11:00", rule, st)[0], [])  # the old spike does not come back
+        later = json.loads(json.dumps(self.q))
+        later["RELIANCE"]["bars"].append({"t": "2026-11-13T05:35:00Z", "high": 1351.0, "low": 1339.0})   # 11:05 IST
+        rings, _ = self.at("2026-11-13 11:15", rule, st, quotes=later)
+        self.assertIn("₹1,351.00 in the 11:05 IST 5-minute bar", rings[0]["message"])
+
+    def test_an_old_state_file_without_the_new_keys_still_works(self):
+        rings, st = self.at("2026-11-13 10:53", self.target, {"rung": {}, "last_check": "2026-11-13T05:00:00Z"})
+        self.assertEqual(rings, [])
+        self.assertEqual(sorted(st), ["armed", "last_check", "quoted", "rung"])
+
+    def test_parse_yahoo_keeps_the_bars_and_prices_json_does_not(self):
+        with open(os.path.join(QDIR, "yahoo-RELIANCE.json"), encoding="utf-8") as fh:
+            q = alerts.parse_yahoo(fh.read(), "RELIANCE")
+        self.assertEqual((len(q["bars"]), q["bar_seconds"]), (74, 300))
+        self.assertEqual(q["bars"][0]["t"], "2026-11-13T03:45:00Z")
+        d = tempfile.mkdtemp()
+        try:
+            doc = alerts.write_prices(os.path.join(d, "prices.json"), {"RELIANCE": q}, ist("2026-11-13 10:00"))
+            self.assertNotIn("bars", json.dumps(doc))
+        finally:
+            shutil.rmtree(d)
+
+
+class BarsCli(Cli):
+    def test_a_spike_between_two_check_runs(self):
+        run(["add", "--from-plan", "--plan", PLAN, "--rules", self.rules, "--state", self.state,
+             "--config", self.cfg, "--now", "2026-11-13 10:00"])
+        with open(self.state, encoding="utf-8") as fh:
+            st = json.load(fh)
+        self.assertEqual(set(st["armed"]), {"reliance-plan-stop", "reliance-plan-target", "reliance-flat-by"})
+        self.assertEqual(st["armed"]["reliance-plan-stop"], "2026-11-13T04:30:00Z")
+        code, text, _ = self.check("2026-11-13 10:05")
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing hit.", text)
+        code, text, _ = self.check("2026-11-13 10:40")         # the last price is 1,339.70: below the target
+        self.assertEqual(code, 0)
+        self.assertIn("ALERT RELIANCE traded at ₹1,347.90 in the 10:10 IST 5-minute bar (bar high, not the last "
+                      "price)", text)
+        self.assertNotIn("your stop", text)
+        self.assertEqual(self.check("2026-11-13 10:45")[0], 1)    # once only
+        with open(self.state, encoding="utf-8") as fh:
+            st = json.load(fh)
+        self.assertEqual((st["quoted"]["RELIANCE"], "reliance-plan-target" in st["rung"]),
+                         ("2026-11-13T05:15:00Z", True))
+
+    def test_json_says_it_was_a_bar(self):
+        run(["add", "--rules", self.rules, "--state", self.state, "--symbol", "RELIANCE", "--above", "1344.4", "--now", "2026-11-13 10:00"])
+        self.check("2026-11-13 10:05")
+        code, text, _ = run(["check", "--rules", self.rules, "--state", self.state, "--prices-out", self.prices,
+                             "--offline", QDIR, "--now", "2026-11-13 10:40", "--json"] + self.cal())
+        ring = json.loads(text)["rings"][0]
+        self.assertEqual((code, ring["source"], ring["bar_time"], ring["bar_price"]),
+                         (0, "bar", "2026-11-13T04:40:00Z", 1347.9))
+
+    def test_reset_starts_counting_again_from_now(self):
+        run(["add", "--rules", self.rules, "--state", self.state, "--symbol", "RELIANCE", "--target", "1344.4", "--now", "2026-11-13 10:00"])
+        self.check("2026-11-13 10:05")
+        self.assertEqual(self.check("2026-11-13 10:40")[0], 0)
+        self.assertEqual(run(["reset", "reliance-target-1344.40", "--state", self.state, "--now", "2026-11-13 10:45"])[0], 0)
+        with open(self.state, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["armed"]["reliance-target-1344.40"], "2026-11-13T05:15:00Z")
+        self.assertEqual(self.check("2026-11-13 10:50")[0], 1)    # the 10:10 spike is not counted again
+
+
+class HolidayRefresh(HolidayNetwork):
+    """Review item 25: alerts.py shares nse_common's holiday code and refreshes a stale list on its own."""
+
+    def master_2027(self):
+        doc = master_doc()
+        doc["CM"] = [dict(r, tradingDate=r["tradingDate"].replace("2026", "2027")) for r in doc["CM"]]
+        return gzip.compress(json.dumps(doc).encode("utf-8"))
+
+    def cache_at(self, text):
+        alerts.refresh_holidays(master_doc(), self.state_dir, ist(text))
+
+    def test_the_functions_are_thin_wrappers_over_nse_common(self):
+        with mock.patch.object(nc, "fetch_holiday_master", side_effect=nc.HolidayError("NSE answered HTTP 500 "
+                                                                                    "for its holiday list")) as m:
+            with self.assertRaises(alerts.AlertError) as cm:
+                alerts.fetch_holiday_master()
+        self.assertEqual(m.call_count, 1)
+        self.assertIn("NSE answered HTTP 500 for its holiday list", str(cm.exception))
+        with mock.patch.object(nc, "update_holiday_cache", return_value=({"years": [2026]}, [2026])) as m:
+            self.assertEqual(alerts.refresh_holidays({"CM": []}, "/x", ist("2026-11-14 11:00"), "src"),
+                             ({"years": [2026]}, [2026]))
+        self.assertEqual(m.call_args[0][1:], ("/x", ist("2026-11-14 11:00"), "src"))
+        with mock.patch.object(nc, "update_holiday_cache", side_effect=nc.HolidayError("bad list")):
+            with self.assertRaises(alerts.AlertError):
+                alerts.refresh_holidays({}, "/x", ist("2026-11-14 11:00"))
+
+    def test_if_stale_is_silent_when_the_list_is_fresh(self):
+        self.cache_at("2026-11-14 11:00")
+        f = self.net(first=200)
+        code, text, err = run(["holidays", "--refresh", "--if-stale", "--now", "2026-11-20 10:00"] + self.cal())
+        self.assertEqual((code, text, err, f.calls), (0, "", "", []))
+
+    def test_if_stale_refreshes_an_old_cache_in_one_line(self):
+        self.cache_at("2026-09-01 10:00")
+        f = self.net(first=200)
+        code, text, err = run(["holidays", "--refresh", "--if-stale", "--now", "2026-11-14 11:00"] + self.cal())
+        self.assertEqual((code, err, len(f.calls)), (0, "", 1))
+        self.assertEqual(len(text.strip().splitlines()), 1)
+        self.assertIn("Refreshed NSE's holiday list (the holiday cache is older than 30 days)", text)
+        with open(os.path.join(self.state_dir, nc.HOLIDAY_CACHE), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["fetched_at"], "2026-11-14T05:30:00Z")
+
+    def test_if_stale_exits_0_when_the_network_fails(self):
+        self.cache_at("2026-09-01 10:00")
+        self.net(first=403, then=503)
+        code, text, err = run(["holidays", "--refresh", "--if-stale", "--now", "2026-11-14 11:00"] + self.cal())
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(text.strip().splitlines()), 1)
+        self.assertIn("Could not refresh NSE's holiday list (the holiday cache is older than 30 days): NSE answered "
+                      "HTTP 503", text)
+        code, text, _ = run(["holidays", "--refresh", "--if-stale", "--now", "2027-01-04 11:00"] + self.cal())
+        self.assertEqual(code, 0)                           # 2027 is unknown: stale, the fetch fails again, still 0
+
+    def test_if_stale_in_december_when_next_years_list_is_missing(self):
+        self.cache_at("2026-12-01 10:00")
+        f = self.net(first=200, body=self.master_2027())
+        code, text, _ = run(["holidays", "--refresh", "--if-stale", "--now", "2026-12-10 11:00"] + self.cal())
+        self.assertEqual((code, len(f.calls)), (0, 1))
+        self.assertIn("NSE's 2027 holiday list is not loaded yet", text)
+        self.assertEqual(nc.load_holidays(state_dir=self.state_dir)[1], {2026, 2027})
+
+    def test_clock_refreshes_an_unknown_year_on_its_own(self):
+        f = self.net(first=200, body=self.master_2027())
+        code, text, err = run(["clock", "--now", "2027-01-04 10:00"] + self.cal())
+        self.assertEqual((code, err, len(f.calls)), (0, "", 1))
+        self.assertIn("Holiday list: refreshed NSE's holiday list (NSE's 2027 holiday list is not loaded).", text)
+        self.assertNotIn("not known here yet", text)
+        self.assertIn("Tue 2027-01-26 Republic Day", text)
+        self.assertTrue(os.path.exists(os.path.join(self.state_dir, nc.HOLIDAY_CACHE)))
+
+    def test_clock_and_holidays_survive_a_failed_refresh(self):
+        code, text, err = run(["clock", "--now", "2027-01-04 10:00"] + self.cal())        # _no_network from TempDir
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Holiday list: could not refresh NSE's holiday list (NSE's 2027 holiday list is not loaded)", text)
+        self.assertIn("NSE's 2027 holiday list is not known here yet", text)
+        code, text, err = run(["holidays", "--year", "2027", "--now", "2027-01-04 10:00"] + self.cal())
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("could not refresh NSE's holiday list", text)
+        self.assertNotIn("Traceback", text + err)
+
+    def test_holidays_refreshes_an_unknown_year_and_shows_it(self):
+        self.net(first=200, body=self.master_2027())
+        code, text, _ = run(["holidays", "--year", "2027", "--now", "2027-01-04 10:00"] + self.cal())
+        self.assertEqual(code, 0)
+        self.assertIn("NSE trading holidays 2027 (capital market, fetched 2027-01-04 from NSE's holiday-master):", text)
+
+    def test_a_fresh_known_year_does_not_touch_the_network(self):
+        f = self.net(first=200)
+        for argv in (["clock", "--now", "2026-11-14 11:00"], ["holidays", "--now", "2026-11-14 11:00"]):
+            code, text, _ = run(argv + self.cal())
+            self.assertNotIn("Holiday list:", text)
+        self.assertEqual(f.calls, [])
+
+
+class TraderHome(TempDir):
+    """Review item 8: every default path is in the trader folder, and the config used is named."""
+
+    def test_defaults_follow_the_trader_home_not_the_cwd(self):
+        home = os.path.join(self.d, "home")
+        os.makedirs(home)
+        elsewhere = os.path.join(self.d, "elsewhere")
+        os.makedirs(elsewhere)
+        old = os.getcwd()
+        try:
+            os.chdir(elsewhere)
+            with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": home}):
+                self.assertEqual(run(["add", "--symbol", "RELIANCE", "--above", "1300"])[0], 0)
+                self.assertTrue(os.path.isfile(os.path.join(home, "alerts.json")))
+                self.assertTrue(os.path.isfile(os.path.join(home, "state", "alerts.json")))   # the rule's armed stamp
+                code, text, _ = run(["check", "--offline", QDIR, "--now", "2026-11-13 10:53"])
+                self.assertEqual(code, 0)
+                self.assertTrue(os.path.isfile(os.path.join(home, "prices.json")))
+                self.assertIn("ALERT RELIANCE is ₹1,339.70", text)
+                self.assertEqual(run(["quote", "TCS", "--offline", QDIR, "--write"])[0], 0)
+                with open(os.path.join(home, "prices.json"), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                self.assertEqual(sorted(doc["prices"]), ["RELIANCE", "TCS"])
+                self.assertIn("fetched", doc["detail"]["TCS"])
+                self.assertIn("time", doc["detail"]["TCS"])
+                self.assertEqual(os.listdir(elsewhere), [])             # nothing was written in the cwd
+        finally:
+            os.chdir(old)
+
+    def test_it_says_which_config_it_used(self):
+        home = os.path.join(self.d, "home")
+        os.makedirs(home)
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": home}):
+            code, text, _ = run(["clock", "--now", "2026-11-13 10:05"])
+            self.assertIn("Config: none at %s, so the built-in defaults are in use." % os.path.join(home, "config.json"),
+                          text)
+            with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as fh:
+                json.dump({"flat_by": "15:00"}, fh)
+            code, text, _ = run(["clock", "--now", "2026-11-13 10:05"])
+            self.assertIn("Config: %s." % os.path.join(home, "config.json"), text)
+            self.assertEqual(json.loads(run(["clock", "--now", "2026-11-13 10:05", "--json"])[1])["config"],
+                             os.path.join(home, "config.json"))
+            code, text, _ = run(["holidays", "--now", "2026-11-13 10:05"])
+            self.assertIn("Config: %s." % os.path.join(home, "config.json"), text)
+            self.assertEqual(run(["add", "--opening-bell"])[0], 0)
+            code, text, _ = run(["check", "--offline", QDIR, "--now", "2026-11-13 09:20"])
+            self.assertIn("Config: %s." % os.path.join(home, "config.json"), text)
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "nse-alerts", "SKILL.md"), encoding="utf-8") as fh:
             text = fh.read()
         self.assertTrue(text.startswith("---\nname: nse-alerts\ndescription: >-\n"))
         head = text.split("---")[1]
-        desc = head.split("description: >-")[1].split("argument-hint:")[0]
-        self.assertGreater(len(" ".join(desc.split())), 200)
+        desc = " ".join(head.split("description: >-")[1].split("argument-hint:")[0].split())
+        self.assertGreater(len(desc), 200)
+        self.assertLess(len(desc), 600)                   # review item 27: long descriptions
+        for phrase in ("alert me when reliance hits", "watch my stop", "is the nse open", "nse holidays"):
+            self.assertIn(phrase, desc.lower())           # the trigger phrases a user says survive the trim
         self.assertGreater(len(text.splitlines()), 60)
         low = " ".join(text.lower().split())
         for must in ("not financial advice", "**yes**", "${claude_skill_dir}", "cancel the stop, then sell",
-                     "holidays --refresh", "09:15", "15:10", "guru nanak", "nse-holidays.json", "kite", ".ns"):
+                     "holidays --refresh", "09:15", "15:10", "guru nanak", "nse-holidays.json", "kite", ".ns",
+                     "holidays --refresh --if-stale", "alerts.py quote symbol --write", "nse-risk",
+                     "more than 5 minutes old", "5-minute bar", "$nse_trader_home", "built-in defaults"):
             self.assertIn(must, low)
-        for never in ("—", "stooq", "nyse", "new york", "dollar", "trader-"):
+        for never in ("—", "stooq", "nyse", "new york", "dollar"):
             self.assertNotIn(never, low)
+        # no leftover names from the US edition (/trader-exit, trader-risk): "day-trader-india" is this repo
+        self.assertIsNone(re.search(r"(?<!day-)trader-", low))
 
 
 if __name__ == "__main__":

@@ -1,19 +1,14 @@
 ---
 name: nse-news
 description: >-
-  News Monitor for Indian stocks on NSE. Tracks every stock you watch or hold
-  and flags what moves it: NSE corporate announcements (the official exchange
-  filings: results, board meetings, order wins, acquisitions, credit ratings,
-  pledges, resignations), Google News headlines searched by company name, the
-  board meetings and results dates coming up on NSE's event calendar, and how
-  far each stock is from its previous close in ₹. Shows only what is new since
-  the last check, newest first, in IST, tags each item (results, order win,
-  deal/merger, SEBI/RBI regulatory, promoter pledge, block deal, credit
-  rating, circuit/halt, macro...) and never repeats one. Use when the user
-  says "any news on RELIANCE", "why is TCS moving", "what's the news on my
-  watchlist", "morning briefing before the Nifty opens", "pre-open news",
-  "check the NSE filings", "did anything break", "when does Infosys report",
-  or after /nse-scanner finds setups.
+  News Monitor for Indian stocks on NSE. Tracks the stocks you watch or hold:
+  NSE corporate announcements (results, board meetings, order wins, deals,
+  ratings, pledges), Google News headlines by company name, results dates from
+  NSE's calendar, and each stock's move from its previous close in ₹. Shows
+  only what is new, newest first, in IST, tagged, and says plainly when a
+  source failed. Use when the user says "any news on RELIANCE", "why is TCS
+  moving", "morning briefing", "pre-open news", "check the NSE filings", "did
+  anything break", "when does Infosys report", or after /nse-scanner.
 argument-hint: "[NSE symbols]"
 ---
 
@@ -46,11 +41,19 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers INFY --all --hours 168
 | Google News RSS | `https://news.google.com/rss/search?q="Reliance Industries" when:3d&hl=en-IN&gl=IN&ceid=IN:en` (personal, non-commercial use) |
 | NSE event calendar | `https://www.nseindia.com/api/event-calendar?index=equities`: upcoming board meetings and their purpose |
 | Yahoo Finance chart | 5 daily bars of `RELIANCE.NS`: the last price against the previous session's close (unofficial, can lag) |
-| `trader/cache/EQUITY_L-<date>.csv` | NSE's list of every listed equity, for company names, cached for the day |
-| `trader/state/news.json` | what has been shown (kept 30 days) and each symbol's company name |
+| `trader/cache/EQUITY_L-<date>.csv` | NSE's list of every listed equity, for company names, cached for the day. `nse-scanner` reads the same file, so it is only written whole and only when it is the real CSV (the SYMBOL, NAME OF COMPANY and SERIES columns, 1,000+ companies): a web page or a cut-off download is never cached, and a bad file left for today is deleted. When NSE fails, the newest earlier good file gives the names. |
+| `trader/state/news.json` | what has been shown (kept 30 days), each symbol's company name, and when each symbol's NSE filings and headlines were last read in full |
 
-Google News is searched by the company's name, which comes from NSE itself
-(`sm_name` in the announcements, else `EQUITY_L.csv`). Headlines whose title
+`trader/` is the one trader folder `nse_common` finds (`$NSE_TRADER_HOME`,
+else the nearest `trader/` with a `config.json` above the working folder, else
+`~/.day-trader-india`), so the check reads the same files wherever Claude Code
+was started. A watchlist, plan or portfolio file that is there but broken is a
+`note:` line, never a silent skip of the stocks in it.
+
+Google News is searched by the company's name. It comes from the watchlist hit
+when `nse-scanner` wrote one, else from NSE itself (`sm_name` in the
+announcements, else the `EQUITY_L` cache above); with no name anywhere the
+search uses the symbol and a `note:` says so. Headlines whose title
 does not name the company (by symbol, name, a distinctive first word such as
 "Reliance", or initials such as "RIL"), and price-quote or "share price
 prediction" pages, are dropped; `--json` counts both.
@@ -81,16 +84,33 @@ prediction" pages, are dropped; `--json` counts both.
 - **MOVING** marks a stock 3 % or more from its previous close
   (`--move-pct`). A move with no filing and no headline is worth saying out
   loud too. On a weekend or holiday the line shows the last session.
+- **A source that failed is not "nothing new".** Every run is tracked per
+  source (NSE filings, Google News, the NSE calendar, Yahoo prices) and per
+  symbol. If one failed, a line right under the moves says which:
+  `checked: NSE filings ok; Google News failed; NSE calendar ok.` Say that to
+  the user: "no news from Google" means Google was not read. A failed source's
+  items are never marked seen, so they show on the first run that reaches it.
+  If NSE filings and Google News both failed, the output starts
+  `News check FAILED: could not reach NSE or Google News: nothing was checked.`
+  and the exit code is 3: tell the user nothing was checked, never "no news".
+  A block page (HTML where JSON or RSS should be), an error object or an empty
+  calendar counts as a failure, not as an empty feed.
 - **No predictions.** Report what was published and how far the price is from
   the previous close. Never say what the stock will do next.
 
 ## Steps
 
-1. Run the check: `python3 "${CLAUDE_SKILL_DIR}/news.py"`. Exit code 1 means
-   nothing new, 2 means no symbols or every source failed. `--all` shows
-   items already seen, `--json` gives everything machine readable,
-   `--dry-run` leaves the state alone, `--hours` sets the window (default 72,
-   so a Monday pre-open check still sees Friday evening's filings).
+1. Run the check: `python3 "${CLAUDE_SKILL_DIR}/news.py"`. Exit codes: 0
+   something new, 1 nothing new in what could be checked (read the `checked:`
+   line), 2 usage (no symbols, a bad symbol or `--now`), 3 both news feeds
+   failed so nothing was checked. `--all` shows items already seen, `--json`
+   gives everything machine readable (`status`, `checked_line`, `failure` and
+   per-source `sources` are in it), `--dry-run` leaves the state alone.
+   The window is 72 hours, so a Monday pre-open check still sees Friday
+   evening's filings, and further back when a symbol's feed was last read in
+   full longer ago than that (a long weekend, a few days of failures: the run
+   says `looking back N hours`). `--hours N` is used exactly as given and is
+   capped at 720 unless `--all`.
 2. Read the items that matter: every `!` filing, anything tagged results,
    circuit/halt, regulatory, promoter/pledge/stake or credit rating, and every
    MOVING symbol first. Open the PDF link of each filing you mention.

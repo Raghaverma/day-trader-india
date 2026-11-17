@@ -18,6 +18,13 @@
   "product": "MIS",
   "stop_order_type": "SL",
   "stop_limit_buffer_pct": 0.5,
+  "loss_basis": "limit",
+  "tick_band_pct": 10,
+  "risk_pass_minutes": 5,
+  "price_fresh_minutes": 5,
+  "order_max_age_minutes": 120,
+  "trigger_max_age_minutes": 30,
+  "holiday_refresh_days": 30,
   "allowed_series": [
     "EQ"
   ],

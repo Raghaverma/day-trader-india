@@ -16,6 +16,9 @@ results date coming up on NSE's event calendar.
 Your symbols, when --tickers is not given: every hit in trader/watchlist.json
 (nse-scanner), the symbol in trader/plan.json (nse-exit) and the positions in
 trader/portfolio.json. Symbols are bare NSE symbols (RELIANCE, never RELIANCE.NS).
+"trader/" is the one trader folder nse_common.trader_home() finds
+($NSE_TRADER_HOME, else the nearest trader/ with a config.json, ...), wherever
+Claude Code was started.
 
 Sources (no keys, no accounts):
   - NSE corporate announcements, the official exchange filings: results,
@@ -33,8 +36,20 @@ Sources (no keys, no accounts):
     price against the previous session's close (5 daily bars of <SYM>.NS).
 
 Times print in IST. State: trader/state/news.json remembers what you have seen
-(30 days) and each symbol's company name, so an item shows once. Offline:
---offline DIR reads nse-announcements-<SYM>.json, gnews-<SYM>.xml,
+(30 days, so --hours is capped at 720 unless --all) and each symbol's company
+name, so an item shows once. Only items inside the window are remembered, and
+nothing is remembered when no news source could be read. The window is 72 hours,
+or further back when a symbol's NSE filings or headlines were last read in full
+longer ago than that (a long weekend, a few days of NSE failures): the run says
+"looking back N hours". An explicit --hours is used exactly and never widened.
+
+Every source is tracked. When one fails (NSE filings, Google News, the NSE
+calendar or Yahoo prices, for some or all symbols) a "checked:" line next to
+the result names it. Exit codes: 0 something new, 1 nothing new in what could
+be checked, 2 usage (no symbols, a bad symbol or --now), 3 every news source
+asked for failed: nothing was checked (never reported as "Nothing new").
+
+Offline: --offline DIR reads nse-announcements-<SYM>.json, gnews-<SYM>.xml,
 chart-<SYM>.json, event-calendar.json and (if there) EQUITY_L.csv from DIR.
 The tests use it.
 
@@ -46,6 +61,7 @@ import argparse
 import csv
 import datetime as _dt
 import email.utils
+import glob
 import gzip
 import hashlib
 import http.client
@@ -72,8 +88,17 @@ NSE_CAL = "https://www.nseindia.com/api/event-calendar?index=equities"
 EQUITY_L = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 GNEWS = "https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en"
 KEEP_DAYS = 30
+MAX_HOURS = KEEP_DAYS * 24  # a wider window could show an item again after its "seen" mark expired
 MOVE_PCT = 3.0      # a stock this far from its previous close is flagged as moving
 HOURS = 72          # Friday evening filings still show at Monday's pre-open
+EQUITY_L_MIN_ROWS = 1000  # NSE lists over 2,000 equities; fewer means a cut-off or wrong file
+EQUITY_L_COLUMNS = ("SYMBOL", "NAME OF COMPANY", "SERIES")  # nse-scanner reads SYMBOL and SERIES
+# Each source a run can read: key -> label in the "checked:" line. NSE filings and Google
+# News are the news; the calendar and Yahoo prices are context.
+SOURCES = (("nse", "NSE filings"), ("google", "Google News"), ("calendar", "NSE calendar"),
+           ("prices", "Yahoo prices"))
+NEWS_FEEDS = ("nse", "google")
+FEED_SHORT = {"nse": "NSE", "google": "Google News", "calendar": "NSE's calendar", "prices": "Yahoo"}
 
 # (tag, case-insensitive phrases, case-sensitive acronyms). Matched on the title and
 # the filing text with SEBI's LODR boilerplate removed (every filing cites it).
@@ -160,15 +185,24 @@ def _sym(text):
     return nc.nse_symbol(text)
 
 
-def watch_from_files(portfolio="trader/portfolio.json", watchlist="trader/watchlist.json",
-                     plan="trader/plan.json"):
-    """{SYMBOL: company name or None}: the scanner's hits, the planned trade and your holdings."""
+def watch_from_files(portfolio=nc.DEFAULT_DIR, watchlist=nc.DEFAULT_DIR, plan=nc.DEFAULT_DIR, problems=None):
+    """{SYMBOL: company name or None}: the scanner's hits, the planned trade and your holdings.
+    Defaults are in the trader folder (nc.tpath); None skips a file; a file that is not there is
+    fine. A file that is there but cannot be read (broken JSON) is not: it goes into `problems`
+    (a list), so a held stock is never dropped from the check without a word. A hit's "name"
+    is used when the scanner wrote one; otherwise company_names() looks it up (NSE's sm_name,
+    then the EQUITY_L cache, else the symbol is used)."""
+    portfolio = nc.tpath("portfolio.json") if portfolio is nc.DEFAULT_DIR else portfolio
+    watchlist = nc.tpath("watchlist.json") if watchlist is nc.DEFAULT_DIR else watchlist
+    plan = nc.tpath("plan.json") if plan is nc.DEFAULT_DIR else plan
     out = {}
     for path, key in ((watchlist, "hits"), (plan, None), (portfolio, "positions")):
         try:
             doc = nc.read_json(path) if path else None
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             doc = None
+            if problems is not None:
+                problems.append("could not read %s, so its symbols are not checked: %s" % (path, exc))
         if not isinstance(doc, dict):
             continue
         rows = [doc] if key is None else doc.get(key) or []
@@ -296,10 +330,19 @@ def _json(data, what):
         raise NewsError("%s is not JSON (NSE may be blocking the request)" % what)
 
 
+def _rows(doc, what):
+    """NSE's list, or {"data": [...]}. Anything else (an error object, {}) is not "no rows"."""
+    if isinstance(doc, list):
+        return doc
+    if isinstance(doc, dict) and isinstance(doc.get("data"), list):
+        return doc["data"]
+    raise NewsError("%s came back in an unexpected shape (%s), not a list" % (
+        what, ", ".join(sorted(doc)[:5]) if isinstance(doc, dict) and doc else type(doc).__name__))
+
+
 def parse_announcements(data, ticker):
     """NSE corporate-announcements JSON -> items (kind "filing")."""
-    doc = _json(data, "NSE announcements for %s" % ticker)
-    rows = doc if isinstance(doc, list) else (doc or {}).get("data") or []
+    rows = _rows(_json(data, "NSE announcements for %s" % ticker), "NSE announcements for %s" % ticker)
     out = []
     for a in rows:
         if not isinstance(a, dict):
@@ -323,6 +366,9 @@ def parse_gnews(data, ticker):
         root = ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
         raise NewsError("Google News for %s is not valid XML: %s" % (ticker, exc))
+    if _local(root.tag) != "rss" or root.find("channel") is None:
+        # a well-formed consent or "unusual traffic" page would otherwise read as "no headlines"
+        raise NewsError("Google News for %s sent <%s>, not the RSS feed" % (ticker, _local(root.tag)))
     out, skipped = [], 0
     for it in root.iter("item"):
         title = _clean(_text(it, "title"))
@@ -354,7 +400,7 @@ def gnews_query(name, symbol, hours):
 def names_from_equity_l(text):
     """EQUITY_L.csv (headers with leading spaces) -> {SYMBOL: NAME OF COMPANY}."""
     out = {}
-    rows = csv.reader(io.StringIO(text))
+    rows = csv.reader(io.StringIO(str(text or "").lstrip("﻿")))
     head = [h.strip().upper() for h in next(rows, [])]
     if "SYMBOL" not in head or "NAME OF COMPANY" not in head:
         return out
@@ -365,29 +411,103 @@ def names_from_equity_l(text):
     return out
 
 
-def equity_list(fetcher, now, cache_dir="trader/cache"):
-    """Every listed equity's name, cached for the IST day under trader/cache/."""
-    day = nc.to_ist(now).date().isoformat()
-    path = os.path.join(cache_dir, "EQUITY_L-%s.csv" % day) if cache_dir else None
-    if not fetcher.offline and path and os.path.isfile(path):
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            return names_from_equity_l(fh.read())
-    data = fetcher.get(EQUITY_L, "EQUITY_L.csv")
-    text = data.decode("utf-8", "replace")
-    if not fetcher.offline and path:
+def check_equity_l(text):
+    """Why `text` is not NSE's EQUITY_L.csv (None when it is): it must have the SYMBOL,
+    NAME OF COMPANY and SERIES columns (nse-scanner needs SYMBOL and SERIES from the same
+    cached file) and at least EQUITY_L_MIN_ROWS companies. A block page, an empty body or a
+    cut-off download fails, so it never lands in the cache the scanner reads all day."""
+    text = str(text or "").lstrip("﻿")
+    if not text.strip():
+        return "it is empty"
+    if text.lstrip()[:1] == "<":
+        return "NSE sent a web page, not the CSV"
+    rows = csv.reader(io.StringIO(text))
+    head = [h.strip().upper() for h in next(rows, [])]
+    missing = [c for c in EQUITY_L_COLUMNS if c not in head]
+    if missing:
+        return "no %s column" % " / ".join(missing)
+    i = head.index("SYMBOL")
+    n = sum(1 for r in rows if len(r) > i and r[i].strip())
+    if n < EQUITY_L_MIN_ROWS:
+        return "only %d companies in it (NSE lists over 2,000)" % n
+    return None
+
+
+def _read_text(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    return data.decode("utf-8", "replace")
+
+
+def _good_cache(paths):
+    """The text of the first file in `paths` that is a usable EQUITY_L.csv, else None."""
+    for p in paths:
         try:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(text)
+            text = _read_text(p)
+        except (OSError, EOFError, ValueError):
+            continue
+        if check_equity_l(text) is None:
+            return text
+    return None
+
+
+def equity_list(fetcher, now, cache_dir=nc.DEFAULT_DIR):
+    """Every listed equity's name, cached for the IST day in the trader folder's cache/
+    (EQUITY_L-<date>.csv, the same file nse-scanner reads). Nothing is cached unless it
+    passes check_equity_l; a bad file for today is deleted and fetched again; when NSE fails
+    or sends something unusable, the newest good earlier day's file is used (names barely
+    change) and that file is left alone."""
+    if cache_dir is nc.DEFAULT_DIR:
+        cache_dir = nc.tpath("cache")
+    if fetcher.offline or not cache_dir:
+        return names_from_equity_l(fetcher.get(EQUITY_L, "EQUITY_L.csv").decode("utf-8", "replace"))
+    day = nc.to_ist(now).date().isoformat()
+    path = os.path.join(cache_dir, "EQUITY_L-%s.csv" % day)
+    if os.path.isfile(path):
+        text = _good_cache([path])
+        if text is not None:
+            return names_from_equity_l(text)
+        try:
+            os.remove(path)  # a block page or a cut-off file: useless to the scanner too
         except OSError:
             pass
+    older = sorted((p for p in glob.glob(os.path.join(cache_dir, "EQUITY_L-*.csv")) if p != path), reverse=True)
+    try:
+        text = fetcher.get(EQUITY_L, "EQUITY_L.csv").decode("utf-8", "replace")
+        bad = check_equity_l(text)
+        if bad:
+            raise NewsError("EQUITY_L.csv is not usable (%s), so it was not cached" % bad)
+    except NewsError:
+        text = _good_cache(older)
+        if text is None:
+            raise
+        return names_from_equity_l(text)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)  # whole file or nothing: the scanner may read it at the same moment
+        for old in older:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
     return names_from_equity_l(text)
 
 
 def parse_calendar(data):
-    """NSE event-calendar JSON -> [{symbol, company, purpose, desc, date}] (date ISO)."""
-    doc = _json(data, "NSE event calendar")
-    rows = doc if isinstance(doc, list) else (doc or {}).get("data") or []
+    """NSE event-calendar JSON -> [{symbol, company, purpose, desc, date}] (date ISO).
+    Raises NewsError when it is not the calendar or lists nothing at all: NSE's calendar
+    always has the coming weeks' board meetings, so empty means it did not answer properly,
+    not that no company has a results date."""
+    rows = _rows(_json(data, "NSE event calendar"), "NSE event calendar")
+    if not rows:
+        raise NewsError("NSE's event calendar came back empty, so results dates are unknown")
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -399,6 +519,10 @@ def parse_calendar(data):
         out.append({"symbol": _sym(r.get("symbol")), "company": _clean(r.get("company")),
                     "purpose": _clean(r.get("purpose")), "desc": _clean(r.get("bm_desc")),
                     "date": d.isoformat()})
+    if not out:
+        # a new date format would otherwise read as "no board meeting for any of your stocks"
+        raise NewsError("none of the %d rows in NSE's event calendar had a readable date, so results "
+                        "dates are unknown" % len(rows))
     return out
 
 
@@ -446,8 +570,20 @@ def parse_chart(data, ticker):
             "time": nc.to_utc(nc.ist_from_epoch(when)) if when else None}
 
 
-def collect_moves(fetcher, watch, errors=None):
+def _source(stats, key):
+    """stats["sources"][key]: {"ok": [symbols or "all"], "failed": {symbol or "all": why}}."""
+    return stats.setdefault("sources", {}).setdefault(key, {"ok": [], "failed": {}})
+
+
+def _offline_missing(fetcher, exc):
+    """Offline, a fixture that is not there means "not asked", not a failure."""
+    return bool(fetcher.offline) and "no file" in str(exc)
+
+
+def collect_moves(fetcher, watch, errors=None, stats=None):
     errors = [] if errors is None else errors
+    stats = {} if stats is None else stats
+    src = _source(stats, "prices")
     out = []
     for t in sorted(watch):
         name = "chart-%s.json" % t
@@ -459,9 +595,11 @@ def collect_moves(fetcher, watch, errors=None):
                     raise
                 data = fetcher.get(nc.yahoo_chart_url(t, "5d", "1d", host="query1"), name)
             out.append(parse_chart(data, t))
+            src["ok"].append(t)
         except NewsError as exc:
-            if not (fetcher.offline and "no file" in str(exc)):
+            if not _offline_missing(fetcher, exc):
                 errors.append("price for %s: %s" % (t, exc))
+                src["failed"][t] = str(exc)
     return out
 
 
@@ -568,7 +706,9 @@ def fingerprint(item_id):
 # ---------------------------------------------------------------- the check
 
 def company_names(fetcher, watch, state, now, errors, need):
-    """Fill in names for Google News: watchlist, the state cache, then EQUITY_L.csv."""
+    """Every symbol's company name: the watchlist's "name" when the scanner wrote one, the
+    state cache (NSE's sm_name from earlier runs), then EQUITY_L.csv (the day's cache, else
+    NSE). A symbol with none stays None: search and tagging fall back to the symbol."""
     names = state.setdefault("names", {})
     missing = [t for t in need if not (watch.get(t) or names.get(t))]
     if missing:
@@ -576,7 +716,7 @@ def company_names(fetcher, watch, state, now, errors, need):
             listed = equity_list(fetcher, now)
         except NewsError as exc:
             listed = {}
-            if not (fetcher.offline and "no file" in str(exc)):
+            if not _offline_missing(fetcher, exc):
                 errors.append("NSE equity list: %s" % exc)
         for t in missing:
             if listed.get(t):
@@ -585,28 +725,34 @@ def company_names(fetcher, watch, state, now, errors, need):
 
 
 def collect(fetcher, watch, state, now, hours=HOURS, nse=True, google=True, errors=None, stats=None):
+    """Items from NSE filings and Google News. Every symbol's result per feed goes into
+    stats["sources"] (see _source), the names used into stats["names"]."""
     errors = [] if errors is None else errors
     stats = {} if stats is None else stats
     items = []
     names = state.setdefault("names", {})
     start = nc.to_ist(now - _dt.timedelta(hours=hours)).strftime("%d-%m-%Y")
     end = nc.to_ist(now).strftime("%d-%m-%Y")
-    for t in sorted(watch):
-        if not nse:
-            break
-        try:
-            got = parse_announcements(fetcher.get(NSE_ANN % (urllib.parse.quote(t), start, end),
-                                                  "nse-announcements-%s.json" % t, nse=True), t)
+    if nse:
+        src = _source(stats, "nse")
+        for t in sorted(watch):
+            try:
+                got = parse_announcements(fetcher.get(NSE_ANN % (urllib.parse.quote(t), start, end),
+                                                      "nse-announcements-%s.json" % t, nse=True), t)
+            except NewsError as exc:
+                errors.append("NSE filings for %s: %s" % (t, exc))
+                src["failed"][t] = str(exc)
+                continue
             items += got
-            stats["ok"] = stats.get("ok", 0) + 1
+            src["ok"].append(t)
             for it in got:
                 if it.get("company") and it["ticker"] == t:
                     names[t] = it["company"]
                     break
-        except NewsError as exc:
-            errors.append("NSE filings for %s: %s" % (t, exc))
+    found = company_names(fetcher, watch, state, now, errors, sorted(watch))
+    stats["names"] = found
     if google:
-        found = company_names(fetcher, watch, state, now, errors, sorted(watch))
+        src = _source(stats, "google")
         skipped = off = 0
         for t in sorted(watch):
             if not found.get(t):
@@ -614,37 +760,48 @@ def collect(fetcher, watch, state, now, hours=HOURS, nse=True, google=True, erro
             about = mention_patterns({t: found.get(t)})[t]
             try:
                 got, sk = parse_gnews(fetcher.get(gnews_query(found.get(t), t, hours), "gnews-%s.xml" % t), t)
-                keep = [it for it in got if about.search(it["title"])]
-                items += keep
-                skipped += sk
-                off += len(got) - len(keep)
-                stats["ok"] = stats.get("ok", 0) + 1
             except NewsError as exc:
                 errors.append("headlines for %s: %s" % (t, exc))
+                src["failed"][t] = str(exc)
+                continue
+            keep = [it for it in got if about.search(it["title"])]
+            items += keep
+            skipped += sk
+            off += len(got) - len(keep)
+            src["ok"].append(t)
         stats["quote_pages_skipped"] = skipped
         stats["off_topic_skipped"] = off
     return items
 
 
-def calendar(fetcher, watch, now, errors=None):
+def calendar(fetcher, watch, now, errors=None, stats=None):
     errors = [] if errors is None else errors
+    src = _source({} if stats is None else stats, "calendar")
     try:
         events = parse_calendar(fetcher.get(NSE_CAL, "event-calendar.json", nse=True))
     except NewsError as exc:
-        if not (fetcher.offline and "no file" in str(exc)):
+        if not _offline_missing(fetcher, exc):
             errors.append("NSE event calendar: %s" % exc)
+            src["failed"]["all"] = str(exc)
         return []
+    src["ok"].append("all")
     return upcoming(events, watch, now)
+
+
+def in_window(it, now, hours=HOURS):
+    """Inside the last `hours` up to now (10 minutes of clock slack; with a pinned --now,
+    nothing from after it). An item with no time counts as inside."""
+    if it["time"] is None:
+        return True
+    return now - _dt.timedelta(hours=hours) <= it["time"] <= now + _dt.timedelta(minutes=10)
 
 
 def select(items, state, now, hours=HOURS, show_all=False):
     """Items within the window; only unseen ones unless show_all."""
     seen = state.setdefault("seen", {})
-    cutoff = now - _dt.timedelta(hours=hours)
-    ahead = now + _dt.timedelta(minutes=10)  # a pinned --now: nothing from after it
     out = []
     for it in items:
-        if it["time"] is not None and (it["time"] < cutoff or it["time"] > ahead):
+        if not in_window(it, now, hours):
             continue
         it["new"] = fingerprint(it["id"]) not in seen
         if it["new"] or show_all:
@@ -653,15 +810,99 @@ def select(items, state, now, hours=HOURS, show_all=False):
     return out
 
 
-def remember(items, state, now):
+def remember(items, state, now, hours=None):
+    """Mark items seen. With `hours`, only items inside that window (the ones select could
+    show): an item stamped after a pinned --now, or a clock slip, is not marked seen
+    without ever having been shown."""
     seen = state.setdefault("seen", {})
     stamp = nc.utc_iso(now)
     for it in items:
+        if hours is not None and not in_window(it, now, hours):
+            continue
         for i in [it["id"]] + it.get("also", []):
             seen.setdefault(fingerprint(i), stamp)
     cutoff = nc.utc_iso(now - _dt.timedelta(days=KEEP_DAYS))
     state["seen"] = {k: v for k, v in seen.items() if v >= cutoff}
     state["last_check"] = stamp
+
+
+def _stamp_time(text):
+    try:
+        return _dt.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def window_hours(state, now, symbols, feeds, default=HOURS):
+    """How far back to look. At least `default` (72 h: Friday evening's filings still show at
+    Monday's pre-open), and far enough to reach back to the last time each of `symbols` was
+    read in full from each of `feeds` (state["checked"]), so a long weekend, a holiday week or a
+    few days of NSE failures cannot push a filing out of the window before it was ever shown.
+    Never more than MAX_HOURS (the "seen" marks are kept that long)."""
+    checked = state.get("checked") if isinstance(state.get("checked"), dict) else {}
+    need = default
+    for t in symbols:
+        per = checked.get(t) if isinstance(checked.get(t), dict) else {}
+        for f in feeds:
+            last = _stamp_time(per.get(f))
+            if last is not None and last < now:
+                need = max(need, int(math.ceil((now - last).total_seconds() / 3600.0)) + 1)
+    return min(need, MAX_HOURS)
+
+
+def mark_checked(state, stats, now, feeds):
+    """Record, per symbol and feed, that this run read the feed in full (a symbol whose fetch
+    failed keeps its older mark, so the next run reaches back to it)."""
+    stamp = nc.utc_iso(now)
+    checked = state.get("checked") if isinstance(state.get("checked"), dict) else {}
+    for f in feeds:
+        for t in ((stats.get("sources") or {}).get(f) or {}).get("ok", []):
+            if t != "all":
+                checked.setdefault(t, {})[f] = stamp
+    cutoff = nc.utc_iso(now - _dt.timedelta(days=KEEP_DAYS))
+    state["checked"] = {t: {f: v for f, v in per.items() if v >= cutoff}
+                        for t, per in checked.items() if isinstance(per, dict)}
+    state["checked"] = {t: per for t, per in state["checked"].items() if per}
+
+
+def _status_of(src):
+    if not src or (not src["ok"] and not src["failed"]):
+        return "skipped"  # not asked, or offline with no file for it
+    if src["failed"] and not src["ok"]:
+        return "failed"
+    return "partial" if src["failed"] else "ok"
+
+
+def run_status(stats, asked):
+    """How the run went, per source. asked: the source keys this run tried, in SOURCES order.
+    -> {"status": "ok" | "partial" | "failed", "line": "checked: ...", "headline": "...",
+        "sources": {key: {"label", "status", "ok", "failed"}}}.
+    "failed" means every news feed asked for (NSE filings, Google News) failed for every
+    symbol, so nothing was checked; with no news feed asked, every source that was tried."""
+    srcs = stats.get("sources") or {}
+    labels = dict(SOURCES)
+    per = {k: _status_of(srcs.get(k)) for k in asked}
+    news = [k for k in asked if k in NEWS_FEEDS]
+    tried = [k for k in asked if per[k] != "skipped"]
+    if news:
+        failed = all(per[k] == "failed" for k in news)
+        dead = news
+    else:
+        failed = bool(tried) and all(per[k] == "failed" for k in tried)
+        dead = tried
+    bits = []
+    for k in tried:
+        s = srcs[k]
+        if per[k] == "partial":
+            bits.append("%s failed for %s (ok for %s)" % (labels[k], ", ".join(sorted(s["failed"])),
+                                                          ", ".join(sorted(s["ok"]))))
+        else:
+            bits.append("%s %s" % (labels[k], per[k]))
+    status = "failed" if failed else ("ok" if all(per[k] in ("ok", "skipped") for k in asked) else "partial")
+    return {"status": status, "line": "checked: " + "; ".join(bits) if bits else "",
+            "headline": "could not reach %s: nothing was checked" % " or ".join(FEED_SHORT[k] for k in dead),
+            "sources": {k: {"label": labels[k], "status": per[k], "ok": list((srcs.get(k) or {}).get("ok", [])),
+                            "failed": dict((srcs.get(k) or {}).get("failed", {}))} for k in asked}}
 
 
 # ---------------------------------------------------------------- output
@@ -711,17 +952,25 @@ def _short(text, n):
     return text if len(text) <= n else text[:n - 3].rstrip() + "..."
 
 
-def render(items, errors, now, moves=None, events=None, move_pct=MOVE_PCT):
-    out = render_moves(moves or [], now, move_pct)
-    if out:
-        out.append("")
+def render(items, errors, now, moves=None, events=None, move_pct=MOVE_PCT, status=None):
+    """The text report. `status` (run_status): when every news feed failed the first line
+    says nothing was checked (never "Nothing new."); when a source failed the "checked:"
+    line next to the result names it."""
+    state = (status or {}).get("status", "ok")
+    out = []
+    if state == "failed":
+        out += ["News check FAILED: %s." % status["headline"], ""]
+    moves_out = render_moves(moves or [], now, move_pct)
+    out += moves_out + ([""] if moves_out else [])
     cal = render_calendar(events or [])
     if cal:
         out.append("Coming up (NSE event calendar):")
         out += ["  " + l for l in cal]
         out.append("")
-    if not items:
-        out.append("Nothing new.")
+    if state == "partial" and status.get("line"):
+        out.append(status["line"] + ".")
+    if not items and state != "failed":
+        out.append("Nothing new in what could be checked." if state == "partial" else "Nothing new.")
     for it in items:
         when = nc.ist_text(it["time"]) if it["time"] else "time unknown"
         mark = "!" if it.get("important") else " "
@@ -756,11 +1005,13 @@ def main(argv=None):
     nc.utf8_stdout()
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--tickers", nargs="*", help="NSE symbols; default: watchlist + plan + portfolio")
-    ap.add_argument("--portfolio", default="trader/portfolio.json")
-    ap.add_argument("--watchlist", default="trader/watchlist.json")
-    ap.add_argument("--plan", default="trader/plan.json")
-    ap.add_argument("--state", default="trader/state/news.json")
-    ap.add_argument("--hours", type=float, default=HOURS, help="ignore items older than this (default 72)")
+    ap.add_argument("--portfolio", default=nc.tpath("portfolio.json"))
+    ap.add_argument("--watchlist", default=nc.tpath("watchlist.json"))
+    ap.add_argument("--plan", default=nc.tpath("plan.json"))
+    ap.add_argument("--state", default=nc.tpath("state", "news.json"))
+    ap.add_argument("--hours", type=float, default=None,
+                    help="ignore items older than this (default 72, or back to the last full check when "
+                         "that was longer ago; at most 720 unless --all)")
     ap.add_argument("--all", action="store_true", help="show seen items too")
     ap.add_argument("--no-nse", action="store_true", help="skip NSE filings (headlines only)")
     ap.add_argument("--no-google", action="store_true", help="skip Google News (NSE filings only)")
@@ -773,19 +1024,23 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    errors, stats = [], {}
     if args.tickers:
         watch = {_sym(t): None for t in args.tickers if _sym(t)}
-        known = watch_from_files(args.portfolio, args.watchlist, args.plan)
+        known = watch_from_files(args.portfolio, args.watchlist, args.plan, errors)
         watch.update({t: known[t] for t in watch if known.get(t)})
     else:
-        watch = watch_from_files(args.portfolio, args.watchlist, args.plan)
+        watch = watch_from_files(args.portfolio, args.watchlist, args.plan, errors)
     bad = [t for t in watch if not nc.is_nse_symbol(t)]
     if bad:
         print("news: not an NSE symbol: %s" % ", ".join(sorted(bad)), file=sys.stderr)
         return 2
     if not watch:
-        print("news: no symbols. Pass --tickers, or run /nse-scanner first (it writes "
-              "trader/watchlist.json).", file=sys.stderr)
+        print("news: no symbols. Pass --tickers, or run /nse-scanner first (it writes %s; none there "
+              "with hits, and nothing in %s or %s)." % (args.watchlist, args.plan, args.portfolio),
+              file=sys.stderr)
+        for e in errors:
+            print("news: %s" % e, file=sys.stderr)
         return 2
     try:
         now = nc.parse_now(args.now)
@@ -794,34 +1049,64 @@ def main(argv=None):
         return 2
     try:
         state = nc.read_json(args.state, {}) or {}
-    except (OSError, ValueError):
+        if not isinstance(state, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        # not silently: with the seen marks gone, everything in the window shows as new again
+        errors.append("could not read %s (%s): starting with nothing marked as seen, so items shown before "
+                      "may show again" % (args.state, exc))
         state = {}
-    errors, stats = [], {}
+    asked = [k for k, off in (("nse", args.no_nse), ("google", args.no_google), ("calendar", args.no_calendar),
+                              ("prices", args.no_moves)) if not off]
+    feeds = [k for k in asked if k in NEWS_FEEDS]
+    explicit = args.hours is not None
+    if explicit:
+        if args.hours > MAX_HOURS and not args.all:
+            errors.append("--hours %g is capped at %d: seen items are kept %d days, so a wider window could "
+                          "show one again (--all shows older items, seen or not)" % (args.hours, MAX_HOURS,
+                                                                                   KEEP_DAYS))
+            args.hours = MAX_HOURS
+    else:
+        args.hours = window_hours(state, now, sorted(watch), feeds)
+        if args.hours > HOURS:
+            errors.append("looking back %d hours (not %d): the last full check of some feed was that long ago"
+                          % (args.hours, HOURS))
     fetcher = Fetcher(offline=args.offline)
     items = collect(fetcher, watch, state, now, hours=args.hours, nse=not args.no_nse,
                     google=not args.no_google, errors=errors, stats=stats)
-    items = dedupe(tag(items, watch))
+    # a hit with no "name" (nse-scanner may not write one) is tagged by the name NSE gives
+    # (sm_name, EQUITY_L), else by its symbol alone
+    named = {t: watch.get(t) or (stats.get("names") or {}).get(t) for t in watch}
+    items = dedupe(tag(items, named))
     shown = select(items, state, now, hours=args.hours, show_all=args.all)
-    events = [] if args.no_calendar else calendar(fetcher, watch, now, errors)
-    moves = [] if args.no_moves else collect_moves(fetcher, watch, errors)
+    events = [] if args.no_calendar else calendar(fetcher, watch, now, errors, stats)
+    moves = [] if args.no_moves else collect_moves(fetcher, watch, errors, stats)
+    status = run_status(stats, asked)
     if args.json:
         mv = [dict(m, time=nc.utc_iso(m["time"]) if m.get("time") else None,
                    moving=abs(m["pct"]) >= args.move_pct) for m in moves]
-        print(json.dumps({"checked": nc.utc_iso(now), "checked_ist": nc.ist_text(now), "moves": mv,
+        print(json.dumps({"checked": nc.utc_iso(now), "checked_ist": nc.ist_text(now),
+                          "status": status["status"], "checked_line": status["line"],
+                          "failure": status["headline"] if status["status"] == "failed" else None,
+                          "sources": status["sources"], "names": named, "moves": mv,
                           "calendar": events, "items": _json_ready(shown), "notes": errors,
                           "quote_pages_skipped": stats.get("quote_pages_skipped", 0),
                           "off_topic_skipped": stats.get("off_topic_skipped", 0)},
                          indent=2, ensure_ascii=False))
     else:
-        sys.stdout.write(render(shown, errors, now, moves, events, args.move_pct))
+        sys.stdout.write(render(shown, errors, now, moves, events, args.move_pct, status))
+    if status["status"] == "failed":
+        # nothing was checked: leave the state (seen items, last_check) as it was, and say so
+        # with its own exit code rather than "nothing new"
+        return 3
     if not args.dry_run:
-        remember(items, state, now)
+        remember(items, state, now, args.hours)
+        if not explicit:
+            mark_checked(state, stats, now, feeds)  # an explicit --hours may not reach back far enough
         try:
             nc.write_json(args.state, state)
         except OSError as exc:
             print("news: could not save %s: %s" % (args.state, exc), file=sys.stderr)
-    if errors and not stats.get("ok") and not moves and not events:
-        return 2  # every source failed: say so with a non-zero exit, not "nothing new"
     return 0 if any(i["new"] for i in shown) else 1
 
 

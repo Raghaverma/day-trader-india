@@ -1,21 +1,14 @@
 ---
 name: nse-scanner
 description: >-
-  Chart Scanner for the Indian cash market (NSE). Scans hundreds of NSE
-  charts for setups: opening-range breakouts from 09:15 IST, bull flags,
-  20-day closing-high breakouts, oversold bounces. Builds the universe from
-  NSE's own archives (Nifty 50, Nifty 500, the F&O stock list, or every EQ
-  stock), drops what is not fit for intraday using NSE's sec_list.csv (BE/BZ
-  trade-for-trade series, 2% and 5% circuit bands, GSM surveillance), runs a
-  pre-market scan of daily closes with rupee liquidity floors (price in ₹,
-  traded value in ₹ crore) and an intraday 15-minute opening-range breakout
-  scan on 5-minute bars, then writes trader/watchlist.json for nse-news and
-  nse-entry. Free Yahoo .NS data, bar by bar. Use when the user says "scan
-  the market", "scan Nifty 50", "scan Nifty 500", "find me setups on NSE",
-  "what is breaking out", "opening range breakouts", "ORB scan", "bull flags
-  in F&O stocks", "oversold stocks India", "pre-market scan", "build my
-  watchlist", "what should I trade on Zerodha today", or at the start of an
-  Indian trading day before /nse-news.
+  Chart Scanner for NSE. Scans hundreds of charts for setups: opening-range
+  breakouts from 09:15 IST, bull flags, 20-day breakouts, oversold bounces.
+  Builds the universe from NSE's archives (Nifty 50, Nifty 500, F&O), drops
+  what is not fit for intraday (sec_list.csv), applies rupee liquidity floors,
+  writes trader/watchlist.json for nse-news and nse-entry. Use when
+  the user says "scan the market", "scan Nifty 50", "find me setups on NSE",
+  "what is breaking out", "ORB scan", "oversold stocks India", "pre-market
+  scan", "build my watchlist", or at the start of the day before /nse-news.
 argument-hint: "[universe [nifty50|nifty500|fno|all] | daily | orb] [--universe NAME] [--at HH:MM]"
 ---
 
@@ -49,17 +42,33 @@ Flags: `--universe nifty50|nifty500|fno|all|FILE` (default nifty500),
 `no_entries_after`, 14:30), `--now "2026-11-13 10:05"` (IST) to pin the
 clock, `--offline PATH` to read saved Yahoo files, `--lists DIR` or
 `--sec-list FILE` to read saved NSE files, `--refresh` to download the NSE
-files again, `--no-write`, `--show N`, `--json`. Exit code 0 when the scan
-found something, 1 when it found nothing or could not run (the reason is one
-plain line).
+files again, `--no-write`, `--show N`, `--json`.
+
+Exit codes: **0** the scan found something. **1** it ran and found nothing
+("No setups"), or could not start (a bad flag, no list; the reason is one plain
+line). **3** the scan FAILED to read prices: more than half of the symbols (or,
+in the orb scan's stage 2, of the candidate charts) could not be fetched. That
+is not "no setups". It prints `scan failed: could not read prices (N of M
+symbols failed)` with the first few reasons, **leaves the existing
+`trader/watchlist.json` exactly as it was and writes nothing**. Tell the user
+Yahoo could not be read and to try again in a few minutes; never describe an
+exit 3 as an empty market. (Before this, a Yahoo outage overwrote the watchlist
+with `hits: []` and exited 1, the same as a genuine empty scan.)
+
+Every file lives in the trader folder, the same one for all the skills: the
+`NSE_TRADER_HOME` environment variable if set, else the nearest `trader/` folder
+with a `config.json` above where Claude Code was started, else
+`~/.day-trader-india`, else `./trader`. Each run ends with a line saying which
+`config.json` it used, or that none was found at that path and the built-in
+defaults are in use (this skill does not guard money, so it runs without one).
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/cache/` | NSE's list files and sec_list.csv for the day, named by date (`sec_list-2026-11-14.csv`) |
+| `trader/cache/` | NSE's list files and sec_list.csv for the day, named by date (`sec_list-2026-11-14.csv`, `EQUITY_L-2026-11-14.csv`); nse-news shares the same `EQUITY_L-<date>.csv` |
 | `trader/universe.txt` | written by `universe`: one `SYMBOL\|Name` a line; `--universe trader/universe.txt` reads it back |
-| `trader/watchlist.json` | written by `daily` and `orb`: `mode`, `as_of`, `universe`, `scanned`, `failed`, `dropped`, `hits[]`. nse-news, nse-entry and nse-deals read `hits[].symbol` (bare NSE symbols: `RELIANCE`, `M&M`) |
+| `trader/watchlist.json` | written by `daily` and `orb`: `mode`, `as_of`, `universe`, `scanned`, `failed`, `errors` (symbols that could not be read) with up to five reasons in `error_samples`, `dropped`, `hits[]`. nse-news, nse-entry and nse-deals read `hits[].symbol` (bare NSE symbols: `RELIANCE`, `M&M`). A hit also carries `name` when the company name is known (nse-news searches the news by it) and, on a `breakout_20d` hit, `level` (below). A hit whose liquidity could not be checked carries `"value_checked": false` |
 | `trader/config.json` | `allowed_series` (EQ), `min_circuit_band_pct` (10), `block_surveillance` (true), `no_entries_after` (14:30), `special_sessions`, `extra_holidays` |
 | `trader/state/nse-holidays.json` | holiday years beyond 2026, written by nse-alerts |
 
@@ -92,10 +101,27 @@ and 26 are under GSM, so 2,244 are kept.
 Yahoo's spark endpoint returns daily closes for 20 symbols a request, so the
 Nifty 500 takes 25 requests. Liquidity, in rupees: the last close at least
 `--min-price` (₹20), and the traded value at least `--min-value-cr` crore
-(₹10 crore). Spark has no volume history, so the traded value is the last
-session's price times volume from the spark meta (with a saved v8 chart that
-has daily volumes, the 20-session average). Run it before the open or after
-the close: today's daily bar is left out until 15:30 IST.
+(₹10 crore). The traded value is measured on COMPLETE sessions only. Spark
+has no volume history, so the traded value is the last session's price times
+volume from the spark meta (with a v8 chart that has daily volumes, the average
+of the last 20 complete sessions). Before 09:15, after 15:30 and on a day the
+NSE is closed that meta volume is the last complete session's, so run the
+daily scan then: today's daily bar is left out until 15:30 IST. While the
+session is running the meta volume is only today's partial count, and a liquid
+stock would fail the floor early in the day. So during the session the floor is
+checked on each hit's own daily chart (one extra request per hit, complete
+sessions only) and the output says so; a hit whose chart cannot be read is kept
+with `"value_checked": false`, never dropped for a partial volume.
+
+`name` and `level`. Every hit carries `name`, the company name, when it is
+known: from `EQUITY_L.csv` when the scanner has it (the `--lists` folder, or
+today's `cache/EQUITY_L-<date>.csv`; it is never downloaded just for this),
+else the universe list's own name, else sec_list's. A `breakout_20d` hit also
+carries `level`, the prior 20-day closing high (the close the last close just
+beat, rounded to the paisa, a number). nse-entry reads it:
+`entry.py watchlist --setup level` watches each hit for a first close above its
+own `level`. Hits of the other setups have no `level`; nse-entry says so for
+that row and suggests `--level PRICE` or `--setup orb`.
 
 | setup | the rule on closes |
 | --- | --- |
@@ -166,8 +192,10 @@ Nifty 50: BAJFINANCE, BSE and MAXHEALTH a 20-day breakout and a bull flag,
 - Yahoo's chart and spark endpoints (`RELIANCE.NS`, `M%26M.NS`) are free,
   unofficial and can lag. Bars are 5-minute bars, bar by bar. A 429 or 5xx
   goes to the other host, with one retry after a 5-second wait on a 429.
-- Partial results are said as partial: "Fetched 50 of 494 charts (444 failed
-  or had no data)". Never round a partial scan up to "the whole market".
+- Partial results are said as partial: "Fetched 50 of 80 charts (30 failed or
+  had no data)", and `errors` in the watchlist says how many. Never round a
+  partial scan up to "the whole market". More than half unread is not partial,
+  it is a failed scan (exit 3, nothing written).
 - NSE's 2026 holidays are built in (nse_common). For another year the scan
   says the list is not loaded and treats weekdays as trading days; nse-alerts
   `holidays --refresh` fetches it.

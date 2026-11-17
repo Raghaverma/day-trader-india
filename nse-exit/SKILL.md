@@ -1,21 +1,15 @@
 ---
 name: nse-exit
 description: >-
-  Exit Planner for the Indian cash market (NSE). Sets your stop and your
-  target before you enter, so you know when to get out of an intraday (MIS)
-  trade. Reads the entry from nse-entry (or a price you give), puts the stop
-  at the opening-range midpoint by default (or the range low, your price, a
-  percent, or a multiple of the ATR), rounds it down to the NSE tick (₹0.10
-  for a ₹1,334 stock), sets the target at 2R on the tick grid, shows the
-  Zerodha charges a share, the reward:risk after charges and the break-even
-  price, and sets flat-by 15:10 IST before Zerodha's 15:25 MIS square-off.
-  Refuses a stop at or above the entry, a target at or below it, or a stop
-  too tight to survive the spread, and says why. Writes trader/plan.json for
-  the Time Machine, the Budget Manager and Price Alerts. Long side only. Use
+  Exit Planner for the Indian cash market (NSE). Sets your stop and target
+  before you enter an intraday (MIS) trade. Reads nse-entry's trigger (or a
+  price you give), stops at the opening-range midpoint by default (or a price,
+  percent or ATR multiple) on the NSE tick, target 2R, and shows Zerodha
+  charges, reward:risk after charges, break-even and flat-by 15:10 IST.
+  Refuses an old trigger or bad stop. Writes trader/plan.json. Long only. Use
   when the user says "where's my stop", "set my stop and target", "plan the
-  exit", "stop loss for RELIANCE", "what's my R", "risk reward after
-  charges", "break-even on Zerodha", "Kite stop loss", "Nifty stock exit
-  plan", or right after /nse-entry triggers, before /nse-timemachine.
+  exit", "what's my R", "break-even on Zerodha", or right after /nse-entry
+  triggers.
 argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X] [--qty N]"
 ---
 
@@ -38,23 +32,32 @@ python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/ent
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo .NS or --offline)
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol RELIANCE --entry 1334 --or-high 1333.40 --or-low 1324.30
-python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --qty 56 --spread 0.10   # charges on 56 shares, a ₹0.10 spread
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --qty 37 --spread 0.10   # charges on 37 shares, a ₹0.10 spread
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --entry 1336.50          # an old trigger: plan from the price now
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --allow-late             # an old trigger: plan from its old price anyway
 python3 "${CLAUDE_SKILL_DIR}/exit.py" show                          # the current trader/plan.json
 ```
 
 Other flags: `--flat-by 15:10`, `--json`, `--now "2026-11-13 10:05"` (IST),
 `--entry PRICE` with a waiting entry.json to plan ahead, `--setup level`,
-`--offline FILE` (a saved Yahoo chart JSON for an ATR stop), `--config PATH`.
+`--offline FILE` (a saved Yahoo chart JSON for an ATR stop), `--config PATH`,
+`--portfolio PATH` (default: the portfolio.json next to the config).
+
+The trader folder (`entry.json`, `config.json`, `plan.json`, `state/`) is the
+same wherever Claude Code was started: the `NSE_TRADER_HOME` environment
+variable, else the nearest `trader/` folder that has a `config.json` in the
+working folder or above, else `~/.day-trader-india`.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/entry.json` | the trigger from nse-entry: symbol, entry price, time (IST), bar, opening range |
-| `trader/config.json` | `flat_by` (15:10), `min_reward_risk` (1.0: a note here, nse-risk enforces it), `charges`, `tick_sizes`, `special_sessions`, and the caps that size the charges estimate (`budget`, `max_position_pct`, `max_order_inr`, `max_loss_per_trade_inr`) |
+| `trader/entry.json` | the trigger from nse-entry: symbol, entry price, `triggered_at` (UTC; else its date and time in IST), bar, opening range |
+| `trader/config.json` | `flat_by` (15:10), `min_reward_risk` (1.0: a note here, nse-risk enforces it), `trigger_max_age_minutes` (30), `loss_basis`, `stop_limit_buffer_pct`, `tick_band_pct`, `charges`, `tick_sizes`, `special_sessions`, and the rules that size the share estimate (`budget`, `max_position_pct`, `max_order_inr`, `max_loss_per_trade_inr`, `cash_buffer_pct`) |
+| `trader/portfolio.json` | optional: a real account smaller than the budget shrinks the share estimate |
 | `trader/state/nse-holidays.json` | NSE holidays fetched by nse-alerts, to warn about a plan on a closed day |
 | Yahoo chart API | only for an `atr:K` stop: the session's bars for SYMBOL.NS up to the entry bar, free and unofficial |
-| `trader/plan.json` | with `--write`: the original exit planner's fields (entry, stop and its rule, target and its R, risk a share, reward:risk, flat by) plus `"exchange": "NSE"` and `"tick": "0.10"`. nse-timemachine, nse-budget and nse-alerts read it |
+| `trader/plan.json` | with `--write`: the original exit planner's fields (entry, stop and its rule, target and its R, risk a share, reward:risk, flat by) plus `"exchange": "NSE"`, `"tick": "0.10"`, `quantity` (the share count your rules allow, an estimate: nse-budget sizes the real order; 0 when nothing fits), `risk_per_share_worst` and `worst_exit` (the entry minus the stop leg's SL limit, and that limit). nse-timemachine, nse-budget and nse-alerts read it |
 
 ## Stops and targets
 
@@ -72,11 +75,12 @@ A level setup has no opening range to lean on, so it needs a stop you name.
 
 - **Ticks.** NSE cash-market ticks since 15 Apr 2025: under ₹250 ₹0.01,
   ₹250 to 1,000 ₹0.05, ₹1,000 to 5,000 ₹0.10, ₹5,000 to 10,000 ₹0.50,
-  ₹10,000 to 20,000 ₹1.00, above ₹5.00. The stop rounds DOWN to the tick for
-  its own price (away from the entry). The entry and the target round half up
-  to the tick. A price on a slab edge takes the coarser tick, which is on the
-  finer grid too. `tick_sizes` in the config overrides a symbol, since NSE
-  reviews ticks monthly.
+  ₹10,000 to 20,000 ₹1.00, above ₹5.00. NSE sets a stock's tick from an
+  earlier close, not today's price, so every price takes the coarsest tick
+  within `tick_band_pct` (10%) of it: a stop at 997.97 goes DOWN to 997.90,
+  valid on the 0.05 and on the 0.10 grid (997.95 would be rejected on 0.10).
+  The entry and the target round half up to the same tick. `tick_sizes` in
+  the config overrides a symbol, since NSE reviews ticks monthly.
 - **Too tight.** The stop must sit at least 0.05% of the price and at least
   three spreads under the entry. A spread is one tick unless `--spread X`
   says what Kite's market depth shows. Closer than that is refused: in on the
@@ -84,8 +88,23 @@ A level setup has no opening range to lean on, so it needs a stop you name.
 - **Charges.** Zerodha's intraday equity rates (brokerage 0.03% or ₹20 an
   order, STT 0.025% on the sell, NSE transaction 0.00307%, SEBI, stamp duty
   0.003% on the buy, GST 18%) from `nse_common.intraday_charges`, on `--qty`
-  shares or the size your config's caps allow. It prints the charges a share,
-  the reward:risk after charges and the break-even sell price on the tick.
+  shares or the size your rules allow (`nse_common.size_qty`, the same
+  function nse-budget and nse-timemachine use, with the portfolio.json next to
+  the config; at least one share for the estimate). It prints the charges a
+  share, the reward:risk after charges (to the stop trigger, the figure
+  nse-budget and nse-risk use) and the break-even sell price on the tick.
+- **Worst fill.** The stop leg is an SL order whose limit sits
+  `stop_limit_buffer_pct` (0.5%) under its trigger, so a gap can fill there.
+  The plan prints that price, the loss at it with charges, and the reward:risk
+  if it fills there. The share estimate is sized on that worst fill, which is
+  why it is smaller than a trigger-only calculation would say. If your rules
+  fit no whole share, the plan says so now and nse-budget will refuse it.
+- **Old triggers.** A trigger from entry.json older than
+  `trigger_max_age_minutes` (30) is refused: the price has probably moved, so
+  the plan would size and stop the wrong trade. It says how old it is and what
+  to do: `--entry PRICE` to plan from the price now (the user's own price, no
+  age check), or `--allow-late` to plan from the old trigger price anyway (a
+  note says so). An entry.json that cannot be dated is refused the same way.
 - **Flat by.** 15:10 IST by default (or `flat_by` in the config). Zerodha
   squares off MIS at 15:25 and charges ₹50 + GST an order for it; a flat-by
   after 15:20 gets a note. On a special session (Muhurat trading in
@@ -99,17 +118,21 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   `holidays --refresh`).
 - **Refused, with the reason.** A stop at or above the entry. A target at or
   below it. A stop too tight to survive the spread. An entry.json that has
-  not triggered (unless you give `--entry`). A short: longs only.
+  not triggered (unless you give `--entry`), or triggered too long ago (see
+  above). A short: longs only.
 
 ## Steps
 
-1. Run it right after `/nse-entry` triggers. Before that, `--entry PRICE`
-   plans ahead at the level you expect.
+1. Run it right after `/nse-entry` triggers, within 30 minutes. If the
+   trigger is older, say how old it is and that the price has probably moved,
+   then plan from the price now with `--entry PRICE` (ask the user for it, or
+   read it from nse-alerts); use `--allow-late` only if the user says so.
+   Before the trigger, `--entry PRICE` plans ahead at the level you expect.
 2. Use the default stop for an opening-range breakout unless the user names
    another. A level setup needs one: ask.
 3. Run `exit.py plan --write`. Read back the entry, the stop and its rule,
    the target and its rule, the risk a share in rupees and ticks, reward:risk
-   before and after charges, the break-even and flat by.
+   before and after charges, the worst fill, the break-even and flat by.
 4. If it refuses, say the reason and the fix (a wider stop, a farther
    target). Never loosen anything on your own.
 5. Say once that the stop is a plan, not a guarantee.
@@ -129,15 +152,21 @@ Exit plan: RELIANCE long on NSE, Fri 2026-11-13, opening-range breakout on 5-min
   Stop          ₹1,328.80  opening-range midpoint: (₹1,333.40 + ₹1,324.30) / 2 = ₹1,328.85, rounded down to the ₹0.10 tick
   Target        ₹1,344.40  2R (two times the risk)
   Risk a share  ₹5.20 (0.39% of the entry, 52 ticks of ₹0.10)
-  Reward:risk   2.0 (1.39 after charges)
-  Charges       about ₹1.32 a share at the target, ₹1.31 at the stop (₹73.87 and ₹73.62 a round trip on 56 shares, Zerodha intraday rates)
-  Break-even    ₹1,335.40: the sell price that pays back the charges on 56 shares
+  Reward:risk   2.0 (1.36 after charges)
+  Worst fill    the SL limit ₹1,322.10, ₹11.90 a share under the entry: ₹492.48 on 37 shares with charges (reward:risk 0.67 after charges if it fills there)
+  Charges       about ₹1.42 a share at the target, ₹1.41 at the stop (₹52.71 and ₹52.33 a round trip on 37 shares, Zerodha intraday rates)
+  Break-even    ₹1,335.50: the sell price that pays back the charges on 37 shares (sized from your config's caps; nse-budget sets the real size)
   Flat by       15:10 IST, win or lose: no overnight hold (Zerodha squares off MIS at 15:25 for ₹50 + GST)
 ```
 
-The 56 shares come from the default caps (75% of a ₹1,00,000 budget at
-₹1,334). Charges cost about 0.25R a side here, which is why the reward:risk
-falls from 2.0 to 1.39. A 1R target would be ₹1,339.20.
+The 37 shares are what the default rules allow (`nse_common.size_qty`): the
+max loss at the stop leg's worst fill, ₹1,322.10, caps it at 37 (₹492.48 with
+charges against a ₹500 limit); the 75% position cap alone would say 56.
+plan.json records `"quantity": 37`, `"risk_per_share_worst": 11.9` and
+`"worst_exit": 1322.1`. Charges cost about 0.27R a side here, which is why the
+reward:risk falls from 2.0 to 1.36. A 1R target would be ₹1,339.20. Run at
+10:50 IST instead, with the 10:05 trigger 45 minutes old, the same command
+refuses and says to give `--entry PRICE` or `--allow-late`.
 
 ## Rules
 
@@ -153,7 +182,8 @@ falls from 2.0 to 1.39. A 1R target would be ₹1,339.20.
 
 It never places an order, never sizes the real position (the quantity is an
 estimate for the charges; nse-budget sizes), never widens a stop to make a
-plan pass, and never calls a stop a guarantee.
+plan pass, never plans from a stale trigger without being told to, and never
+calls a stop a guarantee.
 
 ## Safety
 

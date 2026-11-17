@@ -4,6 +4,7 @@
     python3 alerts.py clock                          # NSE open, pre-open or closed; next open; holidays
     python3 alerts.py holidays                       # this year's NSE trading holidays, with names
     python3 alerts.py holidays --refresh             # fetch NSE's holiday-master -> trader/state/nse-holidays.json
+    python3 alerts.py holidays --refresh --if-stale  # only when the list is stale; silent when fresh, always exit 0
     python3 alerts.py holidays --year 2027           # says so plainly when a year's list is not known
     python3 alerts.py quote RELIANCE --write         # quotes -> trader/prices.json
     python3 alerts.py quote --holdings --write       # every symbol in your portfolio and plan
@@ -37,18 +38,40 @@ the plan's day only). An above / below alert rings ONCE and then stays quiet
 until you reset it, unless the rule has "rearm": true (it re-arms when the
 price crosses back). A pct_move alert rings at most once per day.
 
+Between two checks: a price can spike through a level and come back before the
+next check. So an above / target alert also rings when the high of any
+completed 5-minute bar since the previous check reached it, and a below / stop
+alert when a bar's low did; the message then names the bar and its IST time
+and says it was a bar high / low, not the last price (the ring in --json has
+"source": "bar"). A bar counts when it has ended by now, ended after the
+symbol's previous quote, and started after the rule was added (`add` stamps
+it) or re-armed (`reset`, or a "rearm" rule that fell back), so a morning low
+from before the trade never rings its stop. A rule first seen by `check` with
+no stamp starts counting from that check, and with no previous quote and no
+stamp the last price alone decides. trader/state/alerts.json keeps the last
+check time ("last_check", and per symbol in "quoted") and when each rule was
+armed ("armed").
+
 Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
   https://query2.finance.yahoo.com/v8/finance/chart/RELIANCE.NS?range=1d&interval=5m
   (falls back to query1 on a 429 or a 5xx; one retry with a pause on a 429; one
   request per symbol, half a second apart). --offline DIR reads
   DIR/yahoo-<SYMBOL>.json (or .json.gz) instead.
 
+Files live in the trader folder (nse_common.trader_home: $NSE_TRADER_HOME, else
+the nearest trader/ with a config.json, else ~/.day-trader-india, else
+./trader). Every command that reads the config says which file it used, or that
+the built-in defaults are in use.
+
 The NSE clock: normal market 09:15-15:30 IST, pre-open 09:00-09:15 (orders
 09:00-09:08), closed on weekends and NSE trading holidays. The 2026 list is
 built in (nse_common.NSE_HOLIDAYS). Other years come from
 `holidays --refresh` (https://www.nseindia.com/api/holiday-master?type=trading,
-segment CM) or "extra_holidays" in trader/config.json. A year with no list is
-reported, never guessed: weekdays then count as trading days.
+segment CM) or "extra_holidays" in trader/config.json. `clock` and `holidays`
+refresh the list on their own when it is stale (a year not loaded, next year's
+list missing in December, or a cache older than "holiday_refresh_days", 30);
+that is best effort and never stops them. A year with no list is reported,
+never guessed: weekdays then count as trading days.
 """
 
 import argparse
@@ -69,14 +92,22 @@ import nse_common as nc  # noqa: E402
 PAUSE = 0.5    # seconds between requests: be polite to free endpoints
 BACKOFF = 2.0  # seconds to wait before the one retry after a 429
 YAHOO_HOSTS = ("query2", "query1")
-HOLIDAY_URL = "https://www.nseindia.com/api/holiday-master?type=trading"
-NSE_HOME = "https://www.nseindia.com/"
+HOLIDAY_URL = nc.HOLIDAY_URL
+NSE_HOME = nc.NSE_HOME_URL
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 UPCOMING_DAYS = 60
 SQUARE_OFF = "15:25"   # Zerodha's MIS auto square-off
-STATE_DIR = os.path.join("trader", "state")
-CONFIG = os.path.join("trader", "config.json")
 NORMAL = ("09:15", "15:30")
+BAR_SECONDS = {"1m": 60, "2m": 120, "5m": 300, "15m": 900}
+
+
+def config_path():
+    """trader/config.json in the trader folder (nse_common.trader_home), found at run time."""
+    return nc.tpath("config.json")
+
+
+def state_dir():
+    return nc.tpath("state")
 
 
 class AlertError(Exception):
@@ -93,6 +124,14 @@ def parse_now(text):
         raise AlertError(str(e))
 
 
+def _utc(text):
+    """A stored UTC stamp "2026-11-13T04:35:00Z" -> naive UTC, or None."""
+    try:
+        return datetime.datetime.strptime(str(text or "")[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
 def load_cfg(path):
     try:
         return nc.load_config(path)
@@ -100,11 +139,42 @@ def load_cfg(path):
         raise AlertError("%s is not a usable config: %s" % (path, e))
 
 
+def config_line(path):
+    """Which config this run used: the skills that do not guard money run on the defaults
+    without one, and say so."""
+    if path and os.path.isfile(path):
+        return "Config: %s." % path
+    return "Config: none at %s, so the built-in defaults are in use." % path
+
+
 def calendar(a):
     """(cfg, holidays, known years) from the config and the holiday cache."""
-    cfg = load_cfg(getattr(a, "config", None) or CONFIG)
-    hol, years = nc.load_holidays(cfg, getattr(a, "state_dir", None) or STATE_DIR)
+    cfg = load_cfg(getattr(a, "config", None) or config_path())
+    hol, years = nc.load_holidays(cfg, getattr(a, "state_dir", None) or state_dir())
     return cfg, hol, years
+
+
+def _holiday_fetch():
+    """fetch_holiday_master for nse_common.ensure_holidays: a failure comes back as the
+    HolidayError it expects (it never stops clock or holidays)."""
+    try:
+        return fetch_holiday_master()
+    except AlertError as e:
+        raise nc.HolidayError(str(e))
+
+
+def ensured_calendar(a, now_utc):
+    """calendar(), but NSE's holiday list is refreshed first when it is stale (a year not
+    loaded, next year's list missing in December, or an old cache). Best effort: returns
+    (cfg, holidays, years, note) and never raises for the network."""
+    cfg = load_cfg(getattr(a, "config", None) or config_path())
+    sdir = getattr(a, "state_dir", None) or state_dir()
+    try:
+        hol, years, note = nc.ensure_holidays(cfg, sdir, nc.to_ist(now_utc).date(), now_utc, fetch=_holiday_fetch)
+    except Exception as e:     # never let the refresh stop the clock
+        hol, years = nc.load_holidays(cfg, sdir)
+        note = "could not refresh NSE's holiday list: %s" % e
+    return cfg, hol, years, note
 
 
 def phase_words(st):
@@ -192,48 +262,38 @@ def _get(url, timeout=20, headers=None, opener=None):
 
 # ---------------------------------------------------------------- NSE holidays
 
+HOLIDAY_ADVICE = ": try again in a few minutes, or add the dates to \"extra_holidays\" in trader/config.json"
+
+
 def fetch_holiday_master(timeout=20):
-    """NSE's holiday-master JSON. On a 401 or 403 it visits nseindia.com once
-    with a cookie jar (what a browser does first) and asks again."""
-    code, body = _get(HOLIDAY_URL, timeout, nc.nse_headers())
-    if code in (401, 403):
-        opener = _build_opener()
-        _get(NSE_HOME, timeout, nc.nse_headers({"Accept": "text/html,application/xhtml+xml,*/*"}), opener)
-        _sleep(PAUSE)
-        code, body = _get(HOLIDAY_URL, timeout, nc.nse_headers(), opener)
-    if code != 200:
-        raise AlertError("NSE answered HTTP %d for its holiday list: try again in a few minutes, or add the dates "
-                         "to \"extra_holidays\" in trader/config.json" % code)
+    """NSE's holiday-master JSON, via nse_common.fetch_holiday_master (a 401 or 403 makes it
+    visit nseindia.com once with a cookie jar and ask again). The requests go through this
+    module's _get, _sleep and _build_opener, so a network failure is an AlertError and the
+    three can be swapped in tests. A refusal from NSE is an AlertError too."""
+    jar = {}
+
+    def get(url, tmo, headers, opener=None):
+        if opener is None:
+            return _get(url, tmo, headers)
+        if "opener" not in jar:
+            jar["opener"] = _build_opener()     # nse_common's own opener is not used
+        if url == HOLIDAY_URL:
+            _sleep(PAUSE)                       # a pause between the home page and the retry
+        return _get(url, tmo, headers, jar["opener"])
     try:
-        return json.loads(body)
-    except ValueError:
-        raise AlertError("NSE's holiday list came back as something other than JSON (NSE may be blocking "
-                         "scripts right now): try again later")
+        return nc.fetch_holiday_master(timeout, get=get)
+    except nc.HolidayError as e:
+        raise AlertError(str(e) + HOLIDAY_ADVICE)
 
 
 def refresh_holidays(doc, state_dir, now_utc, source=HOLIDAY_URL):
     """holiday-master JSON -> trader/state/nse-holidays.json, merged with the years
-    already there: {"fetched_at", "source", "holidays": {iso: name}, "years": [...]}."""
-    if not isinstance(doc, dict):
-        raise AlertError("NSE's holiday list is not the holiday-master shape")
-    hol, years = nc.parse_holiday_master(doc, "CM")
-    if not hol:
-        raise AlertError("NSE's holiday list has no capital-market (CM) dates")
-    path = os.path.join(state_dir, nc.HOLIDAY_CACHE)
+    already there: {"fetched_at", "source", "holidays": {iso: name}, "years": [...]}.
+    A thin wrapper over nse_common.update_holiday_cache (a bad list is an AlertError)."""
     try:
-        old = nc.read_json(path, {}) or {}
-    except ValueError:
-        old = {}
-    if not isinstance(old, dict):
-        old = {}
-    merged = {k: v for k, v in (old.get("holidays") or {}).items() if str(k)[:4].isdigit()
-              and int(str(k)[:4]) not in years}
-    merged.update(hol)
-    all_years = sorted({int(y) for y in (old.get("years") or []) if str(y).isdigit()} | set(years))
-    cache = {"fetched_at": nc.utc_iso(now_utc), "source": source,
-             "holidays": dict(sorted(merged.items())), "years": all_years}
-    nc.write_json(path, cache)
-    return cache, years
+        return nc.update_holiday_cache(doc, state_dir, now_utc, source)
+    except nc.HolidayError as e:
+        raise AlertError(str(e))
 
 
 # ---------------------------------------------------------------- quotes (Yahoo .NS)
@@ -265,7 +325,25 @@ def parse_yahoo(text, sym):
     return {"symbol": sym, "price": float(price), "open": opens[0] if opens else None,
             "high": m.get("regularMarketDayHigh"), "low": m.get("regularMarketDayLow"),
             "prev_close": m.get("previousClose") or m.get("chartPreviousClose"), "time": when,
-            "currency": m.get("currency"), "source": "yahoo"}
+            "currency": m.get("currency"), "source": "yahoo",
+            "bar_seconds": BAR_SECONDS.get(m.get("dataGranularity"), 300),
+            "bars": parse_bars(res[0].get("timestamp"), q)}
+
+
+def parse_bars(stamps, q):
+    """Yahoo's 5-minute bars -> [{"t": UTC start "2026-11-13T04:45:00Z", "high", "low"}]. A bar
+    with no high or low (Yahoo leaves holes) is skipped. The last bar may still be forming:
+    evaluate only counts a bar once it has ended."""
+    out = []
+    highs, lows = q.get("high") or [], q.get("low") or []
+    for i, ts in enumerate(stamps or []):
+        try:
+            hi, lo = round(float(highs[i]), 4), round(float(lows[i]), 4)     # float32 noise off
+            start = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=int(ts))
+        except (IndexError, TypeError, ValueError, OverflowError):
+            continue
+        out.append({"t": nc.utc_iso(start), "high": hi, "low": lo})
+    return out
 
 
 def fetch_yahoo(sym, timeout=20):
@@ -422,10 +500,42 @@ def rs(x):
     return nc.inr(round(float(x), 2), keep_zeros=True)
 
 
+def bar_touch(q, price, above, now_utc, prev_quoted, armed):
+    """The first 5-minute bar that reached `price` (its high for an above / target rule, its low
+    for a below / stop rule) and that nobody looked at yet, else None. A bar counts when it has
+    ended by now (a forming bar is never used), ended after the previous quote of the symbol
+    (that check already saw anything earlier) and started after the rule was armed (so a low
+    from before the trade never rings its stop). With no previous quote and no armed time
+    there is nothing to look back to: the last price alone decides."""
+    if armed is None:
+        return None
+    secs = int(q.get("bar_seconds") or 300)
+    for b in q.get("bars") or []:
+        start = _utc(b.get("t"))
+        if start is None:
+            continue
+        end = start + datetime.timedelta(seconds=secs)
+        if end > now_utc or start < armed or (prev_quoted is not None and end <= prev_quoted):
+            continue
+        v = b.get("high") if above else b.get("low")
+        if isinstance(v, (int, float)) and (v >= price if above else v <= price):
+            return b
+    return None
+
+
 def evaluate(rules, quotes, status, state, now_utc):
-    """Pure function. Returns (rings, new_state). Each ring: {id, symbol, message}."""
+    """Pure function. Returns (rings, new_state). Each ring: {id, symbol, message}.
+
+    state: {"rung": {id: when it rang}, "armed": {id: when the rule started to count},
+    "quoted": {SYMBOL: when its quote was last read}, "last_check"}. An above / target rule
+    also rings on a completed bar's high since the previous quote of its symbol, and a below /
+    stop rule on a bar's low (see bar_touch); the ring then has "source": "bar" and the bar's
+    "bar_time"."""
     state = json.loads(json.dumps(state or {}))
     rung = state.setdefault("rung", {})
+    armed_at = state.setdefault("armed", {})
+    quoted = state.setdefault("quoted", {})
+    prev_quoted = {s: _utc(t) for s, t in quoted.items()}
     today = status["date"]
     local = nc.to_ist(now_utc)
     stamp = nc.utc_iso(now_utc)
@@ -469,20 +579,36 @@ def evaluate(rules, quotes, status, state, now_utc):
             continue
         p = q["price"]
         if typ in ("above", "below"):
-            hit = p >= r["price"] if typ == "above" else p <= r["price"]
-            if hit and rid not in rung:
-                word = "at or above" if typ == "above" else "at or below"
+            above = typ == "above"
+            armed = _utc(armed_at.setdefault(rid, stamp))
+            hit = p >= r["price"] if above else p <= r["price"]
+            bar = None if hit else bar_touch(q, r["price"], above, now_utc, prev_quoted.get(sym), armed)
+            if (hit or bar) and rid not in rung:
+                word = "at or above" if above else "at or below"
                 label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
-                msg = "%s %s %s: %s your %s %s%s." % (sym, "is" if status["open"] else "last", rs(p), word, label,
-                                                       rs(r["price"]), (" (" + r["note"] + ")") if r.get("note") else "")
+                note = (" (" + r["note"] + ")") if r.get("note") else ""
+                if bar:
+                    mins = int(q.get("bar_seconds") or 300) // 60
+                    when = nc.to_ist(_utc(bar["t"])).strftime("%H:%M")
+                    msg = "%s traded at %s in the %s IST %d-minute bar (bar %s, not the last price): %s your %s %s%s. " \
+                          "The last price is %s: check the live quote." % (
+                              sym, rs(bar["high" if above else "low"]), when, mins, "high" if above else "low",
+                              word, label, rs(r["price"]), note, rs(p))
+                else:
+                    msg = "%s %s %s: %s your %s %s%s." % (sym, "is" if status["open"] else "last", rs(p), word,
+                                                           label, rs(r["price"]), note)
                 if r["type"] == "target":
                     msg += " Kite has no OCO for MIS: cancel the stop, then sell."
                 elif r["type"] == "stop":
                     msg += " Your SL sell should trigger here: check the order book and record the fill."
-                rings.append({"id": rid, "symbol": sym, "message": msg})
+                ring = {"id": rid, "symbol": sym, "message": msg}
+                if bar:
+                    ring.update(source="bar", bar_time=bar["t"], bar_price=bar["high" if above else "low"])
+                rings.append(ring)
                 rung[rid] = stamp
-            elif not hit and rid in rung and r.get("rearm"):
+            elif not (hit or bar) and rid in rung and r.get("rearm"):
                 del rung[rid]
+                armed_at[rid] = stamp       # only bars from now on count for the next ring
         elif typ == "pct_move":
             ref = r.get("ref") or q.get("prev_close") or q.get("open")
             if not ref:
@@ -494,6 +620,8 @@ def evaluate(rules, quotes, status, state, now_utc):
                 rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to %s (from %s)."
                               % (sym, move, rs(p), rs(ref))})
                 rung[rid] = stamp
+    for sym in quotes:
+        quoted[sym] = stamp
     state["last_check"] = stamp
     return rings, state
 
@@ -542,13 +670,15 @@ def holdings(a):
 
 
 def cmd_clock(a):
-    cfg, hol, years = calendar(a)
     now = parse_now(a.now)
+    cfg, hol, years, note = ensured_calendar(a, now)
     st = nc.market_status(now, cfg, hol, years)
     today = datetime.date.fromisoformat(st["date"])
     up, unknown = upcoming(today, hol, years)
+    cfgfile = getattr(a, "config", None) or config_path()
     if a.json:
-        print(json.dumps(dict(st, upcoming_holidays=up, known_years=sorted(years), unknown_years=unknown),
+        print(json.dumps(dict(st, upcoming_holidays=up, known_years=sorted(years), unknown_years=unknown,
+                              holiday_note=note, config=cfgfile if os.path.isfile(cfgfile) else None),
                          indent=2, ensure_ascii=False))
         return 0 if st["open"] else 1
     word = {"open": "OPEN", "pre-open": "PRE-OPEN"}.get(st["phase"], "closed")
@@ -566,12 +696,39 @@ def cmd_clock(a):
         print("No %sNSE holidays on a weekday in the next %d days." % ("known " if unknown else "", UPCOMING_DAYS))
     if unknown:
         print(unknown_line(unknown))
+    if note:
+        print("Holiday list: %s." % note)
+    print(config_line(cfgfile))
     return 0 if st["open"] else 1
+
+
+def holidays_if_stale(a, now, sdir):
+    """holidays --refresh --if-stale: refresh NSE's list only when nse_common.holidays_stale says
+    so. Silent when it is fresh. One line when it refreshed or could not. Always exit 0."""
+    cfg = load_cfg(getattr(a, "config", None) or config_path())
+    stale, why = nc.holidays_stale(sdir, nc.to_ist(now).date(), cfg, now)
+    if not stale:
+        return 0
+    try:
+        if a.offline:
+            doc, source = _read(a.offline, None), a.offline
+        else:
+            doc, source = fetch_holiday_master(), HOLIDAY_URL
+        cache, got = refresh_holidays(doc, sdir, now, source)
+        print("Refreshed NSE's holiday list (%s): %s, wrote %s." % (
+            why, " and ".join(str(y) for y in got), os.path.join(sdir, nc.HOLIDAY_CACHE)))
+    except AlertError as e:
+        print("Could not refresh NSE's holiday list (%s): %s" % (why, e))
+    return 0
 
 
 def cmd_holidays(a):
     now = parse_now(a.now)
-    state_dir = a.state_dir or STATE_DIR
+    sdir = a.state_dir or state_dir()
+    cfgfile = a.config or config_path()
+    if a.if_stale:
+        return holidays_if_stale(a, now, sdir)
+    note = ""
     if a.refresh:
         if a.offline:
             try:
@@ -583,22 +740,27 @@ def cmd_holidays(a):
         else:
             doc = fetch_holiday_master()
             source = HOLIDAY_URL
-        cache, got = refresh_holidays(doc, state_dir, now, source)
-        path = os.path.join(state_dir, nc.HOLIDAY_CACHE)
+        cache, got = refresh_holidays(doc, sdir, now, source)
+        path = os.path.join(sdir, nc.HOLIDAY_CACHE)
         print("Fetched NSE's capital-market holiday list for %s: %d date(s). Wrote %s." % (
             " and ".join(str(y) for y in got), sum(1 for k in cache["holidays"] if int(k[:4]) in got), path))
-    cfg, hol, years = calendar(a)
+        cfg, hol, years = calendar(a)
+    else:
+        cfg, hol, years, note = ensured_calendar(a, now)
     want = a.year or nc.to_ist(now).year
     try:
-        cache = nc.read_json(os.path.join(state_dir, nc.HOLIDAY_CACHE), {}) or {}
+        cache = nc.read_json(os.path.join(sdir, nc.HOLIDAY_CACHE), {}) or {}
     except ValueError:
         cache = {}
     rows = [(k, v) for k, v in sorted(hol.items()) if k[:4] == str(want)]
     known = want in years
     if a.json:
-        print(json.dumps({"year": want, "known": known, "holidays": dict(rows), "known_years": sorted(years)},
+        print(json.dumps({"year": want, "known": known, "holidays": dict(rows), "known_years": sorted(years),
+                          "holiday_note": note, "config": cfgfile if os.path.isfile(cfgfile) else None},
                          indent=2, ensure_ascii=False))
         return 0 if known else 1
+    if note:
+        print("Holiday list: %s." % note)
     if not known:
         print("NSE's %d holiday list is not known here yet. NSE publishes the next year's list around December: "
               "run alerts.py holidays --refresh then, or put the dates in \"extra_holidays\" and the year in "
@@ -606,6 +768,7 @@ def cmd_holidays(a):
               "Until then every weekday of %d counts as a trading day." % (want, want))
         for k, v in rows:
             print("  %s  %s  (from extra_holidays)" % (day_words(k), v))
+        print(config_line(cfgfile))
         return 1
     if isinstance(cache, dict) and want in (cache.get("years") or []):
         where = "fetched %s from NSE's holiday-master" % str(cache.get("fetched_at") or "")[:10]
@@ -619,6 +782,7 @@ def cmd_holidays(a):
         print("  %s  %s%s" % (day_words(k), v, "  (a weekend: closed anyway)" if d.weekday() >= 5 else ""))
     print("Weekends are closed too. Special sessions (Muhurat trading) come from \"special_sessions\" in "
           "trader/config.json.")
+    print(config_line(cfgfile))
     return 0
 
 
@@ -631,7 +795,8 @@ def cmd_quote(a):
     if a.write and quotes:
         write_prices(a.write, quotes, now)
     if a.json:
-        print(json.dumps({"quotes": quotes, "errors": errors}, indent=2, ensure_ascii=False))
+        slim = {s: {k: v for k, v in q.items() if k != "bars"} for s, q in quotes.items()}   # the bars are long
+        print(json.dumps({"quotes": slim, "errors": errors}, indent=2, ensure_ascii=False))
     else:
         for s in syms:
             q = quotes.get(s)
@@ -666,14 +831,18 @@ def cmd_check(a):
                 syms.append(s)
     quotes, errors = (get_quotes(syms, a.offline) if syms else ({}, []))
     state = _read(a.state, {})
+    if not isinstance(state, dict):
+        state = {}
     rings, state = evaluate(rules, quotes, status, state, now)
     if not a.no_write:
         nc.write_json(a.state, state)
         if quotes:
             write_prices(a.prices_out, quotes, now)
     if a.json:
+        cfgfile = getattr(a, "config", None) or config_path()
         print(json.dumps({"market": status, "rings": rings, "errors": errors,
-                          "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2, ensure_ascii=False))
+                          "quotes": {s: q["price"] for s, q in quotes.items()},
+                          "config": cfgfile if os.path.isfile(cfgfile) else None}, indent=2, ensure_ascii=False))
     else:
         word = {"open": "OPEN", "pre-open": "PRE-OPEN"}.get(status["phase"], "closed")
         print("NSE %s (%s IST, %s)." % (word, status["now_ist"], phase_words(status)))
@@ -685,6 +854,7 @@ def cmd_check(a):
                 if quotes else ""))
         for e in errors:
             print("error: " + e)
+        print(config_line(getattr(a, "config", None) or config_path()))
         if rings:
             print("An alert is information, not an order. On Kite the stop is a resting SL sell and the target is "
                   "only this alert (no OCO for MIS): at the target, cancel the stop, then sell. Record any fill "
@@ -696,25 +866,36 @@ def cmd_check(a):
 def cmd_add(a):
     doc = _read(a.rules, {"rules": []})
     doc.setdefault("rules", [])
+    stamp = nc.utc_iso(parse_now(a.now))
+
+    def arm(ids):
+        """Rules count bars from the moment they are added (evaluate's "armed")."""
+        state = _read(a.state, {})
+        if not isinstance(state, dict):
+            state = {}
+        for i in ids:
+            state.setdefault("rung", {}).pop(i, None)
+            state.setdefault("armed", {})[i] = stamp
+        nc.write_json(a.state, state)
+
     if a.from_plan:
         plan = _read(a.plan, None)
         if plan is None:
             raise AlertError("no plan at %s (run nse-exit first)" % a.plan)
-        cfg = load_cfg(a.config) if a.config else {}
+        cfg = load_cfg(a.config)
         new = rules_from_plan(plan, (cfg or {}).get("flat_by"))
         ids = {r["id"] for r in new}
         doc["rules"] = [r for r in doc["rules"] if r.get("id") not in ids] + new
-        state = _read(a.state, {})
-        if state.get("rung"):
-            for i in ids:
-                state["rung"].pop(i, None)
-            nc.write_json(a.state, state)
+        arm(ids)
         nc.write_json(a.rules, doc)
         for r in new:
             print("Added %s: %s" % (r["id"], json.dumps(r, ensure_ascii=False)))
         print("The target alert is the exit order's trigger: Kite has no OCO for MIS, so when it rings, cancel "
               "the stop, then sell. Run alerts.py check every few minutes while the trade is open (a scheduled "
-              "task or /loop). Free quotes are delayed; the SL order at the broker is what actually stops you out.")
+              "task or /loop): a check also looks at the 5-minute bars since the previous one, so a spike "
+              "through the stop or the target between two checks still rings. Free quotes are delayed; the SL "
+              "order at the broker is what actually stops you out.")
+        print(config_line(a.config))
         return 0
     if a.opening_bell:
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}
@@ -758,6 +939,7 @@ def cmd_add(a):
         raise AlertError("a rule with id %s already exists" % rule["id"])
     doc["rules"].append(rule)
     nc.write_json(a.rules, doc)
+    arm([rule["id"]])
     print("Added %s: %s" % (rule["id"], json.dumps(rule, ensure_ascii=False)))
     if rule["type"] == "target":
         print("When it rings: Kite has no OCO for MIS, so cancel the stop, then sell.")
@@ -784,6 +966,7 @@ def cmd_reset(a):
         print("%s has not rung (nothing to reset)." % a.id)
         return 1
     del state["rung"][a.id]
+    state.setdefault("armed", {})[a.id] = nc.utc_iso(parse_now(a.now))     # bars from now on only
     nc.write_json(a.state, state)
     print("Re-armed %s." % a.id)
     return 0
@@ -794,9 +977,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Price alerts and the NSE clock (nse-alerts).")
     sub = ap.add_subparsers(dest="cmd")
 
+    rules_default = nc.tpath("alerts.json")                 # one trader folder, wherever Claude Code started
+    state_default = nc.tpath("state", "alerts.json")
+    prices_default = nc.tpath("prices.json")
+
     def cal(p):
-        p.add_argument("--config", default=CONFIG, help="special_sessions and extra_holidays")
-        p.add_argument("--state-dir", default=STATE_DIR, help="where nse-holidays.json lives")
+        p.add_argument("--config", default=nc.tpath("config.json"),
+                       help="special_sessions and extra_holidays (default: the trader folder's config.json)")
+        p.add_argument("--state-dir", default=nc.tpath("state"),
+                       help="where nse-holidays.json lives (default: the trader folder's state/)")
 
     def net(p):
         p.add_argument("--offline", metavar="DIR", help="read yahoo-<SYMBOL>.json files, no network")
@@ -810,6 +999,8 @@ def main(argv=None):
     p = sub.add_parser("holidays", help="NSE trading holidays; --refresh fetches NSE's list")
     cal(p)
     p.add_argument("--refresh", action="store_true", help="fetch NSE's holiday-master into the cache")
+    p.add_argument("--if-stale", action="store_true",
+                   help="with --refresh: only when the list is stale; silent when fresh; always exit 0")
     p.add_argument("--offline", metavar="FILE", help="a saved holiday-master JSON instead of the network")
     p.add_argument("--year", type=int)
     p.add_argument("--now")
@@ -818,20 +1009,21 @@ def main(argv=None):
     net(p)
     p.add_argument("symbols", nargs="*")
     p.add_argument("--holdings", action="store_true", help="add symbols from your portfolio and plan")
-    p.add_argument("--portfolio", default=os.path.join("trader", "portfolio.json"))
-    p.add_argument("--plan", default=os.path.join("trader", "plan.json"))
-    p.add_argument("--write", nargs="?", const=os.path.join("trader", "prices.json"), metavar="PATH",
-                   help="save to prices.json (default trader/prices.json)")
+    p.add_argument("--portfolio", default=nc.tpath("portfolio.json"))
+    p.add_argument("--plan", default=nc.tpath("plan.json"))
+    p.add_argument("--write", nargs="?", const=prices_default, metavar="PATH",
+                   help="save to prices.json (default: the trader folder's prices.json)")
     p = sub.add_parser("check", help="check every rule, ring what hit")
     net(p)
     cal(p)
-    p.add_argument("--rules", default=os.path.join("trader", "alerts.json"))
-    p.add_argument("--state", default=os.path.join("trader", "state", "alerts.json"))
-    p.add_argument("--prices-out", default=os.path.join("trader", "prices.json"))
+    p.add_argument("--rules", default=rules_default)
+    p.add_argument("--state", default=state_default)
+    p.add_argument("--prices-out", default=prices_default)
     p.add_argument("--no-write", action="store_true")
     p = sub.add_parser("add", help="add a rule")
-    p.add_argument("--rules", default=os.path.join("trader", "alerts.json"))
-    p.add_argument("--state", default=os.path.join("trader", "state", "alerts.json"))
+    p.add_argument("--rules", default=rules_default)
+    p.add_argument("--state", default=state_default)
+    p.add_argument("--now", help="the time the rule starts to count bars from (default: the real clock)")
     p.add_argument("--symbol")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--above", type=float)
@@ -842,8 +1034,8 @@ def main(argv=None):
     g.add_argument("--opening-bell", action="store_true")
     g.add_argument("--at", metavar="HH:MM", help="a time alert, IST")
     g.add_argument("--from-plan", action="store_true", help="stop, target and flat-by from the plan")
-    p.add_argument("--plan", default=os.path.join("trader", "plan.json"))
-    p.add_argument("--config", default=CONFIG, help="flat_by when the plan has none")
+    p.add_argument("--plan", default=nc.tpath("plan.json"))
+    p.add_argument("--config", default=nc.tpath("config.json"), help="flat_by when the plan has none")
     p.add_argument("--label", help="what a time alert says, e.g. \"flat by\"")
     p.add_argument("--before-close", action="store_true",
                    help="a time alert that keeps its distance before the close on a special session")
@@ -853,11 +1045,12 @@ def main(argv=None):
     p.add_argument("--note")
     p.add_argument("--id")
     p = sub.add_parser("list", help="list the rules")
-    p.add_argument("--rules", default=os.path.join("trader", "alerts.json"))
-    p.add_argument("--state", default=os.path.join("trader", "state", "alerts.json"))
+    p.add_argument("--rules", default=rules_default)
+    p.add_argument("--state", default=state_default)
     p = sub.add_parser("reset", help="re-arm a rule that rang")
     p.add_argument("id")
-    p.add_argument("--state", default=os.path.join("trader", "state", "alerts.json"))
+    p.add_argument("--state", default=state_default)
+    p.add_argument("--now", help="the time the rule starts to count bars from (default: the real clock)")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

@@ -1,18 +1,14 @@
 ---
 name: nse-analyst
 description: >-
-  The Results Analyst for Indian companies on NSE. Reads a company's quarterly
-  results straight from the XBRL it files with NSE (Integrated Filing -
-  Financials, consolidated or standalone) and sums up what changed in ₹ crore:
-  revenue from operations, total income, expenses, EBITDA, PBT, net profit to
-  owners, diluted EPS and margins, each quarter against the same quarter a year
-  earlier and the quarter before, with the last four quarters. Banks get
-  interest earned, NII, provisions and gross/net NPA %. Says when the next
-  board meeting is on NSE's calendar. Use when the user says "how were
-  Reliance's results", "analyse TCS's Q2", "what changed this quarter", "is
-  HDFC Bank's NII growing", "check the NPA", "compare margins", "sum up the
-  con call", "does it report this week", "when are Infosys results", or before
-  trading a Nifty stock around its results.
+  Results Analyst for Indian companies on NSE. Reads quarterly results from
+  the XBRL a company files with NSE (consolidated or standalone) and sums up
+  what changed in ₹ crore: revenue, EBITDA, PBT, net profit, EPS and margins
+  against the year-earlier quarter and the quarter before. Banks get NII and
+  NPA %. Gives the next board meeting and says when a quarter could not be
+  read. Use when the user says "how were Reliance's results", "analyse TCS's
+  Q2", "what changed this quarter", "is HDFC Bank's NII growing", "check the
+  NPA", "compare margins", "does it report this week".
 argument-hint: "[NSE symbols] [--standalone]"
 ---
 
@@ -37,7 +33,10 @@ python3 "${CLAUDE_SKILL_DIR}/results.py" RELIANCE TCS INFY --metrics trader/metr
 No SEC-style user agent or account is needed. It is polite to NSE: one list
 request per symbol, one XBRL per quarter (cached for good under
 `trader/cache/nse-xbrl/`, since a filing never changes), a pause between
-calls, and one calendar request a run.
+calls, and one calendar request a run. `trader/` is the one trader folder
+`nse_common` finds (`$NSE_TRADER_HOME`, else the nearest `trader/` with a
+`config.json` above the working folder, else `~/.day-trader-india`), so the
+cache is the same wherever Claude Code was started.
 
 ## What it reads and writes
 
@@ -45,7 +44,10 @@ calls, and one calendar request a run.
   (`/api/integrated-filing-results?index=equities&symbol=RELIANCE&type=Integrated%20Filing-%20Financials`):
   every quarter since March 2025, consolidated and standalone, each with its
   XBRL and the human-readable iXBRL page.
-- Reads each quarter's XBRL (about 50 to 100 KB). Context `OneD` is the
+- Reads each quarter's XBRL (about 50 to 100 KB). Only a body that parses as
+  an XBRL instance is cached: an HTML block page, an empty body or an error
+  page is not (the quarter is reported as unreadable instead), and a cached
+  file that fails the same check is deleted and fetched again. Context `OneD` is the
   quarter, `FourD` the year to date. Companies: `RevenueFromOperations`,
   `Income`, `Expenses`, `FinanceCosts`, `DepreciationDepletionAndAmortisationExpense`,
   `OtherIncome`, `ProfitBeforeExceptionalItemsAndTax`, `ProfitBeforeTax`,
@@ -81,6 +83,14 @@ calls, and one calendar request a run.
   fifth of PBT, are called out: part of the profit is not from operations.
 - **Banks have no EBITDA.** NPA ratios are reported in the standalone filing;
   a consolidated bank filing carries zeros there, shown blank, not zero.
+- **Say what could not be read.** A quarter whose XBRL is unreadable (a block
+  page, an empty body, an instance with none of the numbers the tool reads) is
+  named in a `NOTE:` line and is never shown as a row of dashes. If it is the
+  newest quarter, the NOTE says the table starts at an older one: do not call
+  that the latest results. NSE's filing list or event calendar coming back in
+  another shape, empty or with no readable date is a NOTE too, so "no board
+  meeting on NSE's calendar" is only ever said when the calendar was read.
+  Exit codes: 0 every symbol read, 1 some failed, 2 none (or a usage error).
 - **Know the deadlines.** SEBI LODR Regulation 33: quarterly results within
   45 days of the quarter's end, the March quarter (audited, with the year)
   within 60. The tool prints the next due date, and a NOTE when a quarter is

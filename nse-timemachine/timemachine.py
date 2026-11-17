@@ -40,13 +40,16 @@ How the replays work (the original US time machine's method, same random draws):
   5. Charges: every replay and every history trade also gets its R net of the
      round trip's charges (nse_common.intraday_charges, Zerodha intraday
      rates) on --qty shares (default: the plan's quantity, else the size your
-     trader/config.json caps allow). Indian round-trip costs are material.
+     rules allow, nse_common.size_qty, the same arithmetic nse-exit and
+     nse-budget use, with the portfolio.json next to the config when there is
+     one; at least one share). Indian round-trip costs are material.
   6. The price at --until: median and the 5th to 95th percentile of all
      replays (pct(a, q) = sorted a at index int(q * n)). The fan chart uses a
      second run of 2,000 paths with the same seed. The histogram has 24 bins
      between the 1st and 99th percentile.
   7. History: the plan's own rule (an opening-range breakout with the same
-     opening range, stop rule and target R, prices on the NSE tick) re-run on
+     opening range, stop rule and target R, prices on nse_common.order_tick, the
+     coarsest tick within tick_band_pct of the price) re-run on
      every one of those past sessions, first close beyond the range = entry,
      same stop-first rule, flat at --until.
 
@@ -442,15 +445,16 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
 # ---------------------------------------------------------------- stop rules and the history replay
 
 def tick_away(x, long, sym=None, cfg=None):
-    """A stop on the NSE tick for its price, away from the entry: down for a buy, up for a sell."""
+    """A stop on the order tick (nse_common.order_tick: valid near a slab edge too), away from the
+    entry: down for a buy, up for a sell."""
     v = round(x, 6)
-    return float(nc.round_to_tick(v, nc.tick_size(v, sym, cfg), "down" if long else "up"))
+    return float(nc.round_to_tick(v, nc.order_tick(v, sym, cfg), "down" if long else "up"))
 
 
 def tick_near(x, sym=None, cfg=None):
-    """An entry or a target on the NSE tick for its price, half up."""
+    """An entry or a target on the order tick, half up."""
     v = round(x, 6)
-    return float(nc.round_to_tick(v, nc.tick_size(v, sym, cfg), "nearest"))
+    return float(nc.round_to_tick(v, nc.order_tick(v, sym, cfg), "nearest"))
 
 
 def opening_range(D, n):
@@ -668,21 +672,38 @@ def resolve_rule(plan, entry_day, cfg=None):
 
 # ---------------------------------------------------------------- charges
 
-def default_qty(entry, risk, cfg):
-    """A size for the charges, from the config's caps the way nse-budget sizes:
-    max loss per trade / risk, max order, and the budget's max position."""
-    caps = []
+def account_files(config_path, portfolio_path=None):
+    """(cash, portfolio total, note) from the portfolio.json next to the config, holdings valued at the
+    prices.json next to it when there is one (nse_common.portfolio_total, as nse-budget and nse-risk do).
+    (None, None, "") when there is no portfolio; an unreadable one is ignored with a note."""
+    home = os.path.dirname(config_path or "") or "."
+    pf_path = portfolio_path or os.path.join(home, "portfolio.json")
+    if not os.path.isfile(pf_path):
+        return None, None, ""
     try:
-        if cfg.get("max_loss_per_trade_inr") and risk > 0:
-            caps.append(math.floor(float(cfg["max_loss_per_trade_inr"]) / risk + 1e-9))
-        if cfg.get("max_order_inr"):
-            caps.append(math.floor(float(cfg["max_order_inr"]) / entry + 1e-9))
-        if cfg.get("budget") and cfg.get("max_position_pct"):
-            caps.append(math.floor(float(cfg["budget"]) * float(cfg["max_position_pct"]) / 100.0 / entry + 1e-9))
-    except (TypeError, ValueError):
-        raise TMError("trader/config.json has a non-number in budget, max_position_pct, max_order_inr or "
-                      "max_loss_per_trade_inr")
-    return max(1, min(caps)) if caps else 1
+        pf = nc.read_json(pf_path)
+        prices = {}
+        pp = os.path.join(home, "prices.json")
+        if os.path.isfile(pp):
+            doc = nc.read_json(pp) or {}
+            prices = {nc.nse_symbol(k): v for k, v in (doc.get("prices") or {}).items()}
+        total = nc.portfolio_total(pf, prices)
+        if total is None:
+            raise ValueError("no \"cash\" number")
+        return float(pf["cash"]), total, ""
+    except (ValueError, TypeError, AttributeError, OSError) as e:
+        return None, None, "%s could not be read (%s): the share estimate ignores it" % (pf_path, e)
+
+
+def estimate_qty(plan, cfg, cash=None, total=None):
+    """Whole shares your rules allow for this plan: nse_common.size_qty, the same arithmetic as nse-exit
+    and nse-budget. May be 0."""
+    try:
+        return nc.size_qty(plan["entry"], plan["stop"], plan["symbol"], cfg, cash=cash, portfolio_total=total,
+                           long=plan["side"] == "buy")
+    except (TypeError, ValueError, ArithmeticError):
+        raise TMError("the config has a non-number in budget, cash_buffer_pct, max_position_pct, max_order_inr "
+                      "or max_loss_per_trade_inr")
 
 
 def cost_fn(qty, cfg, long=True):
@@ -770,8 +791,9 @@ def verdict_notes(mc):
 
 
 def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", qty=None,
-                 cfg=None, holidays=None):
-    """Chart JSON text + a normalized plan -> the timemachine.json document."""
+                 cfg=None, holidays=None, cash=None, total=None):
+    """Chart JSON text + a normalized plan -> the timemachine.json document. cash and total are the
+    portfolio.json cash and value (None without one): they only size the charges estimate."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
     if not 0 <= window <= 10:
@@ -825,8 +847,10 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                          MIN_SESSIONS))
     long = plan["side"] == "buy"
     if qty is None:
-        qty = plan.get("quantity") or default_qty(plan["entry"], plan["risk_per_share"], cfg)
-        qty_from = "plan" if plan.get("quantity") else "config caps"
+        if plan.get("quantity"):
+            qty, qty_from = plan["quantity"], "plan"
+        else:
+            qty, qty_from = max(1, estimate_qty(plan, cfg, cash, total)), "config caps"
     else:
         if qty < 1:
             raise TMError("--qty must be 1 or more")
@@ -997,12 +1021,16 @@ def compute(a):
     except ValueError as e:
         raise TMError("%s is not a usable config: %s" % (a.config, e))
     holidays, _ = nc.load_holidays(cfg, os.path.join(os.path.dirname(a.config or "") or ".", "state"))
+    cash, total, note = account_files(a.config, a.portfolio)
+    if note:
+        print("timemachine.py: note: %s." % note, file=sys.stderr)
     plan = load_plan(a, now)
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.qty, cfg, holidays)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.qty, cfg, holidays,
+                        cash, total)
 
 
 def cmd_run(a):
@@ -1043,7 +1071,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def common(p):
-        p.add_argument("--plan", default=os.path.join("trader", "plan.json"), help="the plan from nse-exit")
+        p.add_argument("--plan", default=nc.tpath("plan.json"), help="the plan from nse-exit (default trader/plan.json)")
         p.add_argument("--symbol", help="or give the plan as flags: NSE symbol")
         p.add_argument("--side", default="buy", choices=["buy", "sell"])
         p.add_argument("--date", help="the plan's day, YYYY-MM-DD (default today, IST)")
@@ -1058,19 +1086,21 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this IST time (default: the plan's flat_by, 15:10)")
-        p.add_argument("--qty", type=int, help="shares for the charges (default: the plan's, else your config's caps)")
-        p.add_argument("--config", default=os.path.join("trader", "config.json"))
+        p.add_argument("--qty", type=int, help="shares for the charges (default: the plan's, else what your rules "
+                                               "allow)")
+        p.add_argument("--portfolio", help="portfolio.json for the share estimate (default: the one next to the config)")
+        p.add_argument("--config", default=nc.tpath("config.json"), help="your rules (default trader/config.json)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this IST time ("2026-11-13 10:05", or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)
     p.add_argument("--json", action="store_true")
-    p.add_argument("--write", nargs="?", const=os.path.join("trader", "timemachine.json"), metavar="PATH",
+    p.add_argument("--write", nargs="?", const=nc.tpath("timemachine.json"), metavar="PATH",
                    help="save the result (default trader/timemachine.json)")
     p = sub.add_parser("chart", help="ASCII fan chart of the replays")
     common(p)
-    p.add_argument("--from", dest="from_file", nargs="?", const=os.path.join("trader", "timemachine.json"),
+    p.add_argument("--from", dest="from_file", nargs="?", const=nc.tpath("timemachine.json"),
                    metavar="PATH", help="draw a saved result instead of running again")
     a = ap.parse_args(argv)
     if not a.cmd:

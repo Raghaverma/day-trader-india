@@ -21,8 +21,11 @@ Sources (no keys; NSE's /api/ with nc.nse_headers()):
       every quarter's filing (consolidated and standalone) with its XBRL link
   https://nsearchives.nseindia.in/corporate/xbrl/INTEGRATED_FILING_..._WEB.xml
       one quarter: context OneD is the quarter, FourD the year to date.
-      Cached under trader/cache/nse-xbrl/ (a filing never changes; a revision
-      gets a new file).
+      Cached under trader/cache/nse-xbrl/ in the trader folder nse_common finds
+      (a filing never changes; a revision gets a new file). Only a body that
+      parses as an XBRL instance is cached: an HTML block page, an empty body
+      or an error page is not, and a cached file that fails the same check is
+      deleted and fetched again.
   https://www.nseindia.com/api/event-calendar?index=equities
       upcoming board meetings: does it report this week?
   Yahoo Finance fundamentals-timeseries (unofficial, consolidated, has gaps):
@@ -45,9 +48,20 @@ How the quarters are built:
     ratios in the standalone filing), so it is shown blank.
 
 --metrics FILE merges one row per symbol into a JSON file (TTM revenue, net
-profit and EPS, margins, growth). Offline: --offline DIR reads
-integrated-filing-<SYM>.json, xbrl-<SYM>-<DD-MON-YYYY>-<consolidated|standalone>.xml[.gz],
-yahoo-timeseries-<SYM>.json and event-calendar.json from DIR (or --calendar FILE).
+profit and EPS, margins, growth).
+
+When something could not be read the report says so, it never fills the gap:
+  - exit codes: 0 every symbol read, 1 some symbols failed, 2 none (or a usage error);
+  - a quarter whose XBRL is unreadable (an HTML block page, an empty body, XML
+    that is not an XBRL instance, an instance with none of the numbers we read)
+    is named in a NOTE, is never cached, and when it is the newest quarter the
+    NOTE says the table starts at an older one;
+  - NSE's filing list or event calendar coming back in another shape, empty or
+    with no readable date is a NOTE, never "no filings" or "no board meeting".
+
+Offline: --offline DIR reads integrated-filing-<SYM>.json,
+xbrl-<SYM>-<DD-MON-YYYY>-<consolidated|standalone>.xml[.gz], yahoo-timeseries-<SYM>.json
+and event-calendar.json from DIR (or --calendar FILE).
 
 Numbers only: this tool never says whether a stock is a buy.
 """
@@ -66,6 +80,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nse_common as nc  # noqa: E402
@@ -78,7 +93,7 @@ YAHOO_URL = ("https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/fin
              "?type=%s&period1=%d&period2=%d")
 YAHOO_TYPES = ("quarterlyTotalRevenue", "quarterlyNetIncome", "quarterlyDilutedEPS", "quarterlyOperatingIncome",
                "quarterlyGrossProfit", "quarterlyBasicEPS")
-XBRL_CACHE = os.path.join("trader", "cache", "nse-xbrl")
+XBRL_CACHE = ("cache", "nse-xbrl")  # inside the trader folder: nc.tpath(*XBRL_CACHE)
 SRC_NSE = "NSE XBRL"
 SRC_YAHOO = "Yahoo"
 
@@ -133,8 +148,36 @@ class ResultsError(Exception):
 
 # ---------------------------------------------------------------- fetching
 
+def _local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def check_xbrl(data):
+    """Why `data` is not an XBRL instance (None when it is): it must parse as XML, its root
+    must be <xbrl> (xbrli:xbrl) and it must hold at least one context. NSE's or Akamai's HTML
+    block page, an empty body and an error page all fail."""
+    if not data or not data.strip():
+        return "empty"
+    head = data.lstrip()[:300].lower()
+    if head.startswith((b"<!doctype html", b"<html")) or b"<html" in head:
+        return "an HTML page, not XBRL (NSE may be blocking the request)"
+    try:
+        root = ElementTree.fromstring(data)
+    except ElementTree.ParseError as exc:
+        return "not valid XML (%s)" % exc
+    if _local_name(root.tag) != "xbrl":
+        return "XML whose root is <%s>, not an XBRL instance" % _local_name(root.tag)
+    if not any(_local_name(c.tag) == "context" for c in root):
+        return "an XBRL instance with no reporting period"
+    return None
+
+
 class Fetcher(object):
-    def __init__(self, offline=None, pause=0.6, cache_dir=XBRL_CACHE):
+    def __init__(self, offline=None, pause=0.6, cache_dir=nc.DEFAULT_DIR):
+        """cache_dir: where XBRL files are kept (default the trader folder's cache/nse-xbrl;
+        None caches nothing)."""
+        if cache_dir is nc.DEFAULT_DIR:
+            cache_dir = nc.tpath(*XBRL_CACHE)
         self.offline, self.pause, self.cache_dir = offline, pause, cache_dir
         self._last, self._primed = 0.0, False
         self._opener = urllib.request.build_opener(
@@ -180,7 +223,10 @@ class Fetcher(object):
             raise ResultsError("could not reach %s: %s" % (url.split("?")[0], getattr(exc, "reason", exc)))
 
     def xbrl(self, url, name):
-        """An XBRL file, from the cache when we have it (filings never change)."""
+        """An XBRL file, from the cache when we have it (filings never change). Only a body
+        that passes check_xbrl is cached; a cached file that fails it (a block page cached by
+        an older version, a cut-off write) is deleted and fetched again. A bad body raises
+        ResultsError, so the quarter is reported as unreadable, never cached as a filing."""
         if self.offline:
             return self.get(url, name)
         cached = os.path.join(self.cache_dir, os.path.basename(urllib.parse.urlparse(url).path) + ".gz") \
@@ -188,16 +234,28 @@ class Fetcher(object):
         if cached and os.path.isfile(cached):
             try:
                 with gzip.open(cached, "rb") as fh:
-                    return fh.read()
-            except (OSError, EOFError):
+                    data = fh.read()
+            except (OSError, EOFError, zlib.error):
+                data = None
+            if data is not None and check_xbrl(data) is None:
+                return data
+            try:
+                os.remove(cached)
+            except OSError:
                 pass
         data = self.get(url, name)
-        if cached and data.lstrip()[:1] == b"<":
+        bad = check_xbrl(data)
+        if bad:
+            raise ResultsError("%s is %s; not cached" % (os.path.basename(urllib.parse.urlparse(url).path)
+                                                          or "the XBRL", bad))
+        if cached:
+            tmp = cached + ".tmp"
             try:
                 os.makedirs(self.cache_dir, exist_ok=True)
-                with open(cached, "wb") as raw:
+                with open(tmp, "wb") as raw:
                     with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
                         gz.write(data)
+                os.replace(tmp, cached)  # whole file or nothing
             except OSError:
                 pass
         return data
@@ -228,10 +286,13 @@ def _broadcast(text):
 
 
 def parse_filings(doc):
-    """integrated-filing-results JSON -> [{end, basis, audited, broadcast, xbrl, ixbrl, name, qe}]."""
-    rows = (doc or {}).get("data") if isinstance(doc, dict) else doc
+    """integrated-filing-results JSON -> [{end, basis, audited, broadcast, xbrl, ixbrl, name, qe}].
+    An error object or any other shape raises: it is not "no filings"."""
+    rows = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise ResultsError("NSE's filing list came back in an unexpected shape (no data list)")
     out = []
-    for r in rows or []:
+    for r in rows:
         if not isinstance(r, dict):
             continue
         end = _qe_date(r.get("qe_Date"))
@@ -243,6 +304,10 @@ def parse_filings(doc):
                     "xbrl": str(r["xbrl"]).strip(), "ixbrl": str(r.get("ixbrl") or "").strip() or None,
                     "name": str(r.get("smName") or r.get("cmName") or "").strip() or None,
                     "revision": str(r.get("type_Sub") or "").strip()})
+    if rows and not out:
+        # NSE renamed a field, say: not the same as a company with no filings
+        raise ResultsError("none of the %d rows in NSE's filing list had a quarter date, a "
+                           "consolidated/standalone flag and an XBRL link" % len(rows))
     return out
 
 
@@ -492,6 +557,13 @@ def report(fetcher, symbol, quarters=5, basis="consolidated", now=None, notes=No
         except ResultsError as exc:
             missing.append((f, str(exc)))
             continue
+        q = x["q"]
+        if all(q.get(k) is None for k in ("revenue", "total_income", "interest_earned")) and \
+                q.get("profit") is None and q.get("profit_owners") is None:
+            # it parsed, but none of the tags we read are in it (a new taxonomy, a different
+            # form): a row of dashes would read as a complete quarter
+            missing.append((f, "the XBRL has none of the expected numbers (revenue, income, profit)"))
+            continue
         bank = bank or x["bank"]
         name = name or f.get("name") or x["meta"].get("NameOfTheCompany") or x["meta"].get("NameOfBank")
         rows.append(build_row(x["end"], x["start"], x["q"], SRC_NSE, x["bank"], f["basis"],
@@ -518,6 +590,11 @@ def report(fetcher, symbol, quarters=5, basis="consolidated", now=None, notes=No
                 rows.append(build_row(end, None, yq[end], SRC_YAHOO, bank, "consolidated", fiscal_label(end)))
     if not rows:
         raise ResultsError(nse_error or "no quarter could be read")
+    if picked and picked[0]["end"] not in {r["end"] for r in rows}:
+        # the numbers that follow are an older quarter's: say so before anyone reads them as "the latest"
+        notes.append("%s: the newest filing on NSE (quarter ending %s) could not be read, so the figures below "
+                     "start at the quarter ending %s, not at the latest results"
+                     % (symbol, picked[0]["end"], max(r["end"] for r in rows)))
     result = analyse(rows, quarters)
     latest = picked[0] if picked else None
     return {"symbol": symbol, "name": name or (latest or {}).get("name"), "basis": used, "bank": bank,
@@ -528,7 +605,14 @@ def report(fetcher, symbol, quarters=5, basis="consolidated", now=None, notes=No
 # ---------------------------------------------------------------- calendar and due dates
 
 def parse_calendar(doc):
-    rows = doc if isinstance(doc, list) else (doc or {}).get("data") or []
+    """NSE event-calendar JSON -> [{symbol, purpose, desc, date}]. Raises ResultsError when
+    it is not the calendar or lists nothing at all: NSE's calendar always holds the coming
+    weeks' board meetings, so an empty one must not read as "no board meeting"."""
+    rows = doc if isinstance(doc, list) else (doc.get("data") if isinstance(doc, dict) else None)
+    if not isinstance(rows, list):
+        raise ResultsError("NSE's event calendar came back in an unexpected shape")
+    if not rows:
+        raise ResultsError("NSE's event calendar came back empty, so the next board meeting is unknown")
     out = []
     for r in rows:
         if not isinstance(r, dict):
@@ -539,6 +623,10 @@ def parse_calendar(doc):
             continue
         out.append({"symbol": nc.nse_symbol(r.get("symbol")), "purpose": str(r.get("purpose") or "").strip(),
                     "desc": re.sub(r"\s+", " ", str(r.get("bm_desc") or "")).strip(), "date": d.isoformat()})
+    if not out:
+        # a new date format would otherwise read as "no board meeting" for every company
+        raise ResultsError("none of the %d rows in NSE's event calendar had a readable date, so the next "
+                           "board meeting is unknown" % len(rows))
     return out
 
 
@@ -849,6 +937,8 @@ def main(argv=None):
         try:
             existing = {}
             doc = nc.read_json(args.metrics, {}) or {}
+            if not isinstance(doc, dict):
+                raise ValueError("%s is not a metrics file (expected a JSON object)" % args.metrics)
             for r in doc.get("companies", []):
                 existing[r.get("symbol") or r.get("ticker")] = r
             for r in rows:

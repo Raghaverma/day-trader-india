@@ -8,6 +8,7 @@ moment to get in. Standard library only. Long side only. It never places an orde
     python3 entry.py check M&M --interval 1m --min-volume-x 1.5 --write
     python3 entry.py watch RELIANCE --every 30 --until 14:30  # one line per closed bar
     python3 entry.py watchlist                                # every hit in trader/watchlist.json
+    python3 entry.py watchlist --setup level                  # each hit's "level" (the prior 20-day closing high)
 
 Setups (long side only):
   orb    opening-range breakout. The range is the high and low of the first
@@ -26,10 +27,22 @@ A trigger's time is the trigger bar's CLOSE time in IST (the 10:00 bar closes at
 live tick, e.g. 10:49:45, is dropped) and a bar counts only once it has closed:
 now >= its start + the interval.
 
+The opening range must be COMPLETE before an orb can trigger: every bar of the
+window (09:15, 09:20 and 09:25 for 15 minutes) has to be there. Yahoo sometimes
+leaves a bar out; with 2 of 3 present the status is waiting, with the reason
+"opening range incomplete: 2 of 3 bars", and it never triggers off a range it
+could not see whole (if the range is still incomplete at the cutoff it expires).
+
+trader/entry.json carries "triggered_at" (UTC, the trigger bar's close, for
+nse-exit, which refuses an old trigger) and "late_by_minutes": 0 on a fresh
+trigger, otherwise how many minutes ago the trigger bar closed (the same late
+entry warning the text output prints: a late entry is a different trade).
+
 The NSE session (nse_common): pre-open 09:00-09:15 IST (orders 09:00-09:08),
 normal market 09:15-15:30 IST, Monday to Friday, minus NSE's trading holidays
 (the 2026 list is built in; other years come from nse-alerts' cache or config
-"extra_holidays"). A special session in config "special_sessions" (Muhurat
+"extra_holidays"; a stale or unknown year is refreshed from NSE first, best
+effort and never an error, unless --offline). A special session in config "special_sessions" (Muhurat
 trading) opens a closed day, and the entry window keeps its distance from that
 session's open and close.
 
@@ -39,6 +52,10 @@ default 14:30 IST); no-data (the NSE is closed today or Yahoo sent no bars).
 
 trader/config.json (optional): "no_entries_before" (09:30) and
 "no_entries_after" (14:30), IST. Defaults come from nse_common.DEFAULT_CONFIG.
+The trader folder is nse_common.trader_home ($NSE_TRADER_HOME, else the nearest
+trader/ with a config.json above the working folder, else ~/.day-trader-india,
+else ./trader); every run says which config file it used, or that the built-in
+defaults are in use.
 
 watch wakes just after each bar closes (bars only change then), re-polls every
 --every seconds (default 30) while Yahoo has not posted the new bar, prints one
@@ -137,11 +154,41 @@ def money(x):
     return nc.inr(x, keep_zeros=True)
 
 
-def calendar(cfg, config_path=None):
-    """(holidays, known years): the 2026 list, nse-alerts' cache next to the config, extra_holidays."""
+HOLIDAY_FETCH = None     # tests swap this for a fake NSE; None means nse_common's own fetch
+
+
+def _state_dir(config_path=None):
     if config_path:
-        return nc.load_holidays(cfg, state_dir=os.path.join(os.path.dirname(config_path) or ".", "state"))
-    return nc.load_holidays(cfg)
+        return os.path.join(os.path.dirname(config_path) or ".", "state")
+    return nc.tpath("state")
+
+
+def calendar(cfg, config_path=None):
+    """(holidays, known years): the 2026 list, nse-alerts' cache next to the config, extra_holidays.
+    Reads only: no network."""
+    return nc.load_holidays(cfg, state_dir=_state_dir(config_path))
+
+
+def ensured_calendar(cfg, config_path, now_utc, refresh=True):
+    """calendar(), after refreshing NSE's holiday list when it is stale for the day being decided
+    (nse_common.ensure_holidays: a year not loaded, December without next year's list, a cache
+    older than holiday_refresh_days). Best effort: it never raises. Returns (holidays, years, note);
+    note is "" or one sentence. refresh=False (offline replays) reads only."""
+    if not refresh:
+        return calendar(cfg, config_path) + ("",)
+    try:
+        return nc.ensure_holidays(cfg, _state_dir(config_path), nc.to_ist(now_utc).date(), now_utc,
+                                  fetch=HOLIDAY_FETCH)
+    except Exception as e:      # a holiday refresh must never stop an entry check
+        return calendar(cfg, config_path) + ("could not refresh NSE's holiday list: %s" % e,)
+
+
+def config_line(path):
+    """Which config this run used: nse-entry does not guard money, so it runs on the built-in defaults
+    without one, and says so."""
+    if path and os.path.isfile(path):
+        return "Config: %s." % path
+    return "Config: none at %s, so the built-in defaults are in use." % path
 
 
 def entry_window(day, cfg):
@@ -404,10 +451,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     or_bars = [b for b in bars if b["slot"] < n_or]
     traded = [b["v"] for b in or_bars if b["v"] > 0]
     avg_vol = (sum(traded) / float(len(traded))) if traded else None
+    # complete = the window has ended AND every bar of it is here (Yahoo leaves holes)
+    or_whole = local >= or_end and len(or_bars) == n_or
     if or_bars:
         res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
-                                "complete": local >= or_end,
+                                "complete": or_whole,
                                 "avg_volume": int(round(avg_vol)) if avg_vol is not None else None}
     if setup == "orb":
         if local < or_end:
@@ -417,11 +466,22 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if not or_bars:
             res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
             return res
+        if not or_whole:
+            # Part of the range is missing (a hole in Yahoo's data, or the last range bar still
+            # settling): a range from the bars that are here is not the range. Never trigger off it.
+            why = "opening range incomplete: %d of %d bars" % (len(or_bars), n_or)
+            if local >= cutoff and not (pending and pending["end"] <= cutoff):
+                res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
+                           reason="%s; no entry by %s, the last time for a new entry" % (why, hm(cutoff)))
+            else:
+                res.update(phase="open", reason=why)
+            return res
         lvl = max(b["h"] for b in or_bars)
     else:
         lvl = float(level)
     res["level"] = r2(lvl)
-    res["tick"] = format(nc.tick_size(lvl, chart["symbol"], cfg), "f")
+    # the tick for ORDER prices: NSE sets a stock's tick from an earlier close, not today's price
+    res["tick"] = format(nc.order_tick(lvl, chart["symbol"], cfg), "f")
 
     first_slot = n_or if setup == "orb" else 0
     trig, thin = None, []
@@ -448,6 +508,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
+        res["late_by_minutes"] = res["minutes_since"] if res["minutes_since"] > step // 60 else 0
+        res["triggered_at"] = res["trigger"]["triggered_at"] = iso(nc.to_utc(trig["end"]))
         if dt and utc_of(dt) < nc.to_utc(trig["end"]):
             res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a tick or two"
                                 % nc.ist_from_epoch(dt).strftime("%H:%M:%S"))
@@ -491,7 +553,9 @@ def entry_doc(res, now_utc):
             "bar_start": t.get("bar_start"), "bar_index": t.get("bar_index"), "price": t.get("price"),
             "level": res.get("level"), "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason"),
+            # additive: nse-exit refuses a trigger older than trigger_max_age_minutes by this stamp
+            "triggered_at": res.get("triggered_at"), "late_by_minutes": res.get("late_by_minutes")}
 
 
 # ---------------------------------------------------------------- words
@@ -523,7 +587,7 @@ def describe(res):
         end = start + datetime.timedelta(minutes=orr["minutes"])
         out.append("Opening range %s-%s: high %s, low %s (%d of %d bars%s)." % (
             hm(start), hm(end), money(orr["high"]), money(orr["low"]), orr["bars"], orr["of"],
-            "" if orr["complete"] else ", still forming"))
+            "" if orr["complete"] else ", still forming" if res["phase"] == "forming" else ", incomplete"))
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
@@ -531,14 +595,14 @@ def describe(res):
             t["time"], money(t["price"]), t["bar_start"], t["bar_index"],
             "the range high" if res["setup"] == "orb" else "the level", money(res["level"]), t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
-        step = INTERVALS[res["interval"]] // 60
-        if res.get("minutes_since", 0) > step and res.get("last"):
-            out.append("That was %d minutes ago; the last close is %s (%s bar). A late entry is a different "
-                       "trade: the price, the stop distance and the odds have moved." % (
-                           res["minutes_since"], money(res["last"]["close"]), res["last"]["bar_start"]))
+        if res.get("late_by_minutes") and res.get("last"):
+            out.append("That was %d minutes ago (late_by_minutes %d); the last close is %s (%s bar). A late entry "
+                       "is a different trade: the price, the stop distance and the odds have moved." % (
+                           res["minutes_since"], res["late_by_minutes"], money(res["last"]["close"]),
+                           res["last"]["bar_start"]))
         if res.get("data_note"):
             out.append(res["data_note"] + ".")
-        if res.get("minutes_since", 0) > step:
+        if res.get("late_by_minutes"):
             out.append("Nothing was placed.")
         else:
             out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
@@ -740,35 +804,45 @@ def _load(a, sym, now):
     return get_chart(sym, a.interval, nc.to_ist(now).date(), a.offline, real_today), now
 
 
-def _setup(a):
+def _setup(a, now=None):
+    """(cfg, opts, notes): the config, the evaluate options and the lines to say about the setup (which
+    config file was used; a holiday refresh). `now` is the moment being decided (None: the real
+    clock). An --offline replay never touches the network, so it never refreshes the holiday list."""
     cfg = read_config(a.config)
-    holidays, years = calendar(cfg, a.config)
-    return cfg, _opts(a, cfg, holidays, years)
+    holidays, years, note = ensured_calendar(cfg, a.config, now or utc_now(), refresh=not a.offline)
+    notes = ["Holiday list: %s." % note] if note else []
+    notes.append(config_line(a.config))
+    return cfg, _opts(a, cfg, holidays, years), notes
 
 
 def cmd_check(a):
-    _, opts = _setup(a)
+    start = parse_now(a.now) if a.now else None
+    _, opts, notes = _setup(a, start)
     sym = _symbol(a.symbol)
-    chart, now = _load(a, sym, parse_now(a.now) if a.now else None)
+    chart, now = _load(a, sym, start)
     res = evaluate(chart, now, **opts)
     if a.write:
         nc.write_json(a.write, entry_doc(res, now))
     if a.json:
-        print(json.dumps(public(res), indent=2, ensure_ascii=False))
+        print(json.dumps(dict(public(res), notes=notes), indent=2, ensure_ascii=False))
     else:
         for line in describe(res):
             print(line)
         if a.write:
             print("Wrote %s (status %s)." % (a.write, res["status"]))
+        for line in notes:
+            print(line)
     return 0 if res["status"] == "triggered" else 1
 
 
 def cmd_watch(a):
-    _, opts = _setup(a)
+    start = parse_now(a.now) if a.now else None
+    _, opts, notes = _setup(a, start)
     sym = _symbol(a.symbol)
     if a.every <= 0:
         raise EntryError("--every must be above 0 seconds")
-    start = parse_now(a.now) if a.now else None
+    for line in notes:
+        print(line, flush=True)
     if a.offline or start is not None:
         if start is None:
             start = _load(a, sym, None)[1]
@@ -798,8 +872,18 @@ def cmd_watch(a):
     return code
 
 
+def hit_level(hit):
+    """The "level" nse-scanner writes on a 20-day-breakout hit (the prior 20-day closing high), or None
+    when the hit has none or it is not a usable price."""
+    v = hit.get("level")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+        return None
+    return float(v)
+
+
 def cmd_watchlist(a):
-    _, opts = _setup(a)
+    now = parse_now(a.now) if a.now else None
+    _, opts, notes = _setup(a, now)
     if not os.path.exists(a.watchlist):
         raise EntryError("no watchlist at %s: run /nse-scanner first (it writes the hits there)" % a.watchlist)
     try:
@@ -812,16 +896,19 @@ def cmd_watchlist(a):
         raise EntryError("no hits in %s: the scanner found nothing to watch" % a.watchlist)
     if a.offline and not os.path.isdir(a.offline):
         raise EntryError("watchlist --offline wants a folder of <SYMBOL>.json files")
-    now = parse_now(a.now) if a.now else None
     rows = []
     for i, h in enumerate(hits):
         sym = nc.nse_symbol(h["symbol"])
         o = dict(opts)
         if a.setup == "level" and o["level"] is None:
-            o["level"] = h.get("level")
+            o["level"] = hit_level(h)
         try:
             if a.setup == "level" and o["level"] is None:
-                raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
+                raise EntryError("no level for %s: its hit in %s has no \"level\" (nse-scanner writes the prior "
+                                 "20-day closing high on 20-day-breakout hits only; this hit is %s). Pass "
+                                 "--level PRICE, or watch it with --setup orb" % (
+                                     sym, a.watchlist, "/".join(str(x) for x in (h.get("setups") or [])) or "a hit "
+                                     "without setups"))
             if i and not a.offline:
                 _sleep(PAUSE)
             chart, when = _load(a, sym, now)
@@ -849,6 +936,8 @@ def cmd_watchlist(a):
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <SYMBOL> --write, and /nse-exit." % (n, len(rows)))
         print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
+        for line in notes:
+            print(line)
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
 
 
@@ -866,23 +955,24 @@ def main(argv=None):
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="buy only")
         p.add_argument("--now", help='pretend it is this IST time, e.g. "2026-11-13 10:05"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
-        p.add_argument("--config", default=os.path.join("trader", "config.json"))
+        p.add_argument("--config", default=nc.tpath("config.json"),
+                       help="default: config.json in the trader folder (nse_common.trader_home)")
 
     p = sub.add_parser("check", help="the setup's status right now")
     p.add_argument("symbol")
     common(p)
-    p.add_argument("--write", nargs="?", const=os.path.join("trader", "entry.json"), metavar="PATH",
-                   help="save the result (default trader/entry.json)")
+    p.add_argument("--write", nargs="?", const=nc.tpath("entry.json"), metavar="PATH",
+                   help="save the result (default: entry.json in the trader folder)")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("watch", help="poll bar by bar until it triggers or expires")
     p.add_argument("symbol")
     common(p)
     p.add_argument("--every", type=float, default=30, help="seconds between polls while Yahoo is behind")
     p.add_argument("--until", help="stop at this IST time (HH:MM)")
-    p.add_argument("--out", default=os.path.join("trader", "entry.json"), help="where a trigger is written")
+    p.add_argument("--out", default=nc.tpath("entry.json"), help="where a trigger is written")
     p = sub.add_parser("watchlist", help="check every hit in trader/watchlist.json")
     common(p)
-    p.add_argument("--watchlist", default=os.path.join("trader", "watchlist.json"))
+    p.add_argument("--watchlist", default=nc.tpath("watchlist.json"))
     p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if not a.cmd:

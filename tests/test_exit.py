@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from decimal import Decimal
+from unittest import mock
 
 from _load import load, FIX, ROOT
 
@@ -30,7 +31,10 @@ REL_PLAN = {"created_by": "nse-exit", "symbol": "RELIANCE", "side": "buy", "date
             "stop": 1328.8, "stop_rule": "or_mid", "stop_label": "opening-range midpoint",
             "target": 1344.4, "target_r": 2.0, "target_label": "2R (two times the risk)",
             "risk_per_share": 5.2, "reward_risk": 2.0, "flat_by": "15:10",
-            "exchange": "NSE", "tick": "0.10"}
+            "exchange": "NSE", "tick": "0.10",
+            # new: the size your rules allow (the max loss at the SL limit decides: 37, not the old 56) and the
+            # risk a share to the worst fill (1,334.00 - the SL limit 1,322.10)
+            "quantity": 37, "quantity_from": "config caps", "risk_per_share_worst": 11.9, "worst_exit": 1322.1}
 ORIGINAL_FIELDS = ("created_by", "symbol", "side", "date", "setup", "entry", "entry_time", "entry_bar", "interval",
                    "opening_range", "stop", "stop_rule", "stop_label", "target", "target_r", "target_label",
                    "risk_per_share", "reward_risk", "flat_by", "stop_detail", "created_at", "note")
@@ -89,31 +93,49 @@ class Math(unittest.TestCase):
         self.assertIn("fewer than 14 so far", p["stop_detail"])
 
     def test_stop_rounds_down_at_every_slab_edge(self):
-        # (entry, raw stop, stop on the NSE tick for the stop's own price)
-        cases = [(260, "250.04", "250.00"),      # 0.05 tick above 250
-                 (255, "249.996", "249.99"),     # 0.01 tick below 250
-                 (1010, "1000.07", "1000.00"),   # 0.10 tick from 1,000
-                 (1010, "999.99", "999.95"),     # 0.05 tick below 1,000
-                 (5100, "5000.4", "5000.00"),    # 0.50 tick from 5,000
-                 (5100, "4999.97", "4999.90"),   # 0.10 tick below 5,000
-                 (10100, "10000.9", "10000.00"),  # 1.00 tick from 10,000
-                 (10100, "9999.9", "9999.50"),   # 0.50 tick below 10,000
-                 (21000, "20003", "20000.00"),   # 5.00 tick from 20,000
-                 (20500, "19999.5", "19999.00")]  # 1.00 tick below 20,000
+        # (entry, raw stop, stop on the ORDER tick: the coarsest tick within 10% of the stop's price, because
+        # NSE sets a stock's tick from an earlier close; the old test put 249.996 on the 0.01 grid, which is
+        # rejected if the stock's tick is 0.05)
+        cases = [(260, "250.04", "250.00"),      # 0.05 above 250
+                 (255, "249.996", "249.95"),     # just under 250: the 0.05 grid, valid under either tick
+                 (1010, "1000.07", "1000.00"),   # 0.10 from 1,000
+                 (1010, "999.99", "999.90"),     # just under 1,000: the 0.10 grid
+                 (5100, "5000.4", "5000.00"),    # 0.50 from 5,000
+                 (5100, "4999.97", "4999.50"),   # just under 5,000: the 0.50 grid
+                 (10100, "10000.9", "10000.00"),  # 1.00 from 10,000
+                 (10100, "9999.9", "9999.00"),   # just under 10,000: the 1.00 grid
+                 (21000, "20003", "20000.00"),   # 5.00 from 20,000
+                 (20500, "19999.5", "19995.00")]  # just under 20,000: the 5.00 grid
         for e, raw, want in cases:
             p = c(e, "price:" + raw, oh=None, ol=None)
             self.assertEqual(p["stop"], Decimal(want), raw)
-            self.assertTrue(nc.on_tick(p["stop"], nc.tick_size(p["stop"])), raw)
-            self.assertTrue(nc.on_tick(p["target"], nc.tick_size(p["target"])), raw)
+            self.assertLessEqual(p["stop"], Decimal(raw), raw)          # always rounded DOWN
+            # on the order grid of the stop, the target and the entry ...
+            for k in ("stop", "target", "entry"):
+                self.assertTrue(nc.on_tick(p[k], nc.order_tick(p[k])), (raw, k))
+                # ... and so on the slab's own grid too (the coarser tick is a multiple of the finer ones)
+                self.assertTrue(nc.on_tick(p[k], nc.tick_size(p[k])), (raw, k))
+
+    def test_near_1000_the_stop_is_valid_under_both_ticks(self):
+        # the review's example: 997.97 on a 0.05 grid is rejected when the stock still trades on the 0.10 tick
+        p = c(1005.0, "price:997.97", oh=None, ol=None)
+        self.assertEqual((p["stop"], p["tick"]), (Decimal("997.90"), Decimal("0.10")))
+        self.assertEqual(p["stop"] % Decimal("0.10"), 0)
+        self.assertEqual(p["stop"] % Decimal("0.05"), 0)
+        self.assertEqual(p["target"] % Decimal("0.10"), 0)
+        # the same raw number on the old per-slab rule would have been 997.95: off the 0.10 grid
+        self.assertNotEqual(nc.round_to_tick(Decimal("997.97"), nc.tick_size(Decimal("997.97")), "down"), p["stop"])
 
     def test_target_on_the_tick_grid_at_an_edge(self):
-        p = c(249.0, "price:248.37", oh=None, ol=None)         # 249 + 2 x 0.63 = 250.26 -> 0.05 tick
-        self.assertEqual((p["stop"], p["risk"], p["target"]), (Decimal("248.37"), Decimal("0.63"), Decimal("250.25")))
+        p = c(249.0, "price:248.37", oh=None, ol=None)         # stop to the 0.05 grid: 248.35, risk 0.65
+        self.assertEqual((p["stop"], p["risk"], p["target"]), (Decimal("248.35"), Decimal("0.65"), Decimal("250.30")))
         p = c(995.0, "price:990", oh=None, ol=None)
         self.assertEqual(p["target"], Decimal("1005.00"))
         p = c(1334.0, "or-mid", "price:1344.43")
         self.assertEqual(p["target"], Decimal("1344.40"))        # half up to the nearest 0.10
         self.assertEqual(p["target_label"], "your price (2.0R)")
+        p = c(249.0, "price:248.35", "price:250.03", oh=None, ol=None)
+        self.assertEqual(p["target"], Decimal("250.05"))         # near the edge: nearest on the 0.05 grid
 
     def test_tick_override_from_config(self):
         p = c(1334.0, "or-mid", sym="RELIANCE", cfg={"tick_sizes": {"RELIANCE": 0.05}})
@@ -212,12 +234,40 @@ class Charges(unittest.TestCase):
         with self.assertRaises(exitp.PlanError):
             exitp.charges_for(p, 0, "--qty")
 
-    def test_default_qty_from_the_config_caps(self):
+    def test_the_worst_fill_numbers(self):
+        # the stop leg is an SL order: the loss is measured at its limit (1,328.80 x 0.995 = 1,322.156 -> 1,322.10)
+        p = c(1334.0, "or-mid")
+        ch = exitp.charges_for(p, 56, "--qty")
+        self.assertEqual((ch["loss_basis"], ch["worst_exit"], ch["risk_per_share_worst"]), ("limit", 1322.1, 11.9))
+        self.assertEqual(ch["max_loss_worst"], 666.4)
+        self.assertEqual(ch["charges_at_worst"], nc.intraday_charges(56, 1334.0, 1322.1)["total"])
+        self.assertEqual(ch["charges_at_worst"], 73.51)
+        self.assertEqual(ch["max_loss_worst_with_charges"], 739.91)     # over the 500 cap: why 56 is not allowed
+        # (56 x 10.40 - 73.87) / 739.91
+        self.assertEqual(ch["reward_risk_after_charges_worst"], 0.69)
+        trig = exitp.charges_for(p, 37, "--qty", cfg={"loss_basis": "trigger"})
+        self.assertEqual((trig["loss_basis"], trig["worst_exit"], trig["risk_per_share_worst"]), ("trigger", 1328.8, 5.2))
+        self.assertEqual(trig["max_loss_worst_with_charges"], trig["max_loss_with_charges"])
+
+    def test_the_default_size_is_the_shared_size_qty(self):
+        # no private caps maths any more: exit asks nse_common.size_qty, the same as nse-budget
+        self.assertFalse(hasattr(exitp, "default_qty"))
+        p = c(1334.0, "or-mid")
         cfg = dict(nc.DEFAULT_CONFIG)
-        # 500 / 5.20 = 96, 80,000 / 1,334 = 59, 75% of 1,00,000 / 1,334 = 56
-        self.assertEqual(exitp.default_qty(Decimal("1334"), Decimal("5.2"), cfg), 56)
-        self.assertEqual(exitp.default_qty(Decimal("1334"), Decimal("20"), dict(cfg, max_loss_per_trade_inr=500)), 25)
-        self.assertEqual(exitp.default_qty(Decimal("150000"), Decimal("500"), cfg), 1)
+        # the max loss at the worst fill decides: 37 shares (492.48 with charges), not 56 (the position cap)
+        self.assertEqual(exitp.estimate_qty(p, "RELIANCE", cfg), 37)
+        self.assertEqual(exitp.estimate_qty(p, "RELIANCE", cfg), nc.size_qty(p["entry"], p["stop"], "RELIANCE", cfg))
+        self.assertEqual(nc.loss_at_stop(37, p["entry"], p["stop"], "RELIANCE", cfg)["total"], Decimal("492.48"))
+        self.assertGreater(nc.loss_at_stop(38, p["entry"], p["stop"], "RELIANCE", cfg)["total"], 500)
+        # "trigger" basis is the old way: 79 shares by max loss, the 75% position cap (56) decides
+        self.assertEqual(exitp.estimate_qty(p, "RELIANCE", dict(cfg, loss_basis="trigger")), 56)
+        # a 20,000 account (portfolio.json): nc.account_base shrinks the position cap to 75% x 20,000 = 15,000
+        # / 1,334 = 11 shares (the budget in the config is 1,00,000, the real account is smaller)
+        self.assertEqual(exitp.estimate_qty(p, "RELIANCE", cfg, cash=20000, total=20000), 11)
+        # a stop so far away that one share breaks the max loss: 0 shares, and a note that nse-budget will refuse
+        far = c(1334.0, "price:800", oh=None, ol=None)
+        self.assertEqual(exitp.estimate_qty(far, "RELIANCE", cfg), 0)
+        self.assertIn("fit no whole share", exitp.no_size_note(far, "RELIANCE", cfg))
 
     def test_a_config_charge_override_flows_through(self):
         p = c(1334.0, "or-mid")
@@ -232,8 +282,12 @@ class Cli(unittest.TestCase):
         os.chdir(self.d)
         os.mkdir("trader")
         shutil.copy(ENTRY, os.path.join("trader", "entry.json"))
+        # every default path (entry.json, config.json, plan.json, state/) is in this temp folder, never the real one
+        self.env = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": os.path.join(self.d, "trader")})
+        self.env.start()
 
     def tearDown(self):
+        self.env.stop()
         os.chdir(self.cwd)
         shutil.rmtree(self.d)
 
@@ -262,10 +316,12 @@ class Cli(unittest.TestCase):
                       "₹1,328.85, rounded down to the ₹0.10 tick", text)
         self.assertIn("Target        ₹1,344.40  2R (two times the risk)", text)
         self.assertIn("Risk a share  ₹5.20 (0.39% of the entry, 52 ticks of ₹0.10)", text)
-        self.assertIn("Reward:risk   2.0 (1.39 after charges)", text)
-        self.assertIn("about ₹1.32 a share at the target, ₹1.31 at the stop (₹73.87 and ₹73.62 a "
-                      "round trip on 56 shares", text)
-        self.assertIn("Break-even    ₹1,335.40", text)
+        self.assertIn("Reward:risk   2.0 (1.36 after charges)", text)
+        self.assertIn("Worst fill    the SL limit ₹1,322.10, ₹11.90 a share under the entry: ₹492.48 on 37 shares "
+                      "with charges (reward:risk 0.67 after charges if it fills there)", text)
+        self.assertIn("about ₹1.42 a share at the target, ₹1.41 at the stop (₹52.71 and ₹52.33 a "
+                      "round trip on 37 shares", text)
+        self.assertIn("Break-even    ₹1,335.50", text)
         self.assertIn("Flat by       15:10 IST", text)
         self.assertIn("cancel the stop, then sell", text)
         self.assertIn("not a guarantee", text)
@@ -295,7 +351,7 @@ class Cli(unittest.TestCase):
         for k, v in REL_PLAN.items():
             self.assertEqual(p[k], v, k)
         self.assertEqual(p["warnings"], [])
-        self.assertEqual((p["charges"]["quantity"], p["charges"]["quantity_from"]), (56, "config caps"))
+        self.assertEqual((p["charges"]["quantity"], p["charges"]["quantity_from"]), (37, "config caps"))
         code, text, _ = self.plan("--symbol", "RELIANCE", "--entry", "1334", "--or-high", "1333.40", "--or-low",
                                   "1324.30", "--date", "2026-11-13", "--qty", "10", "--json")
         self.assertEqual(json.loads(text)["charges"]["quantity"], 10)
@@ -365,7 +421,7 @@ class Cli(unittest.TestCase):
         code, text, _ = self.plan("--json")
         p = json.loads(text)
         self.assertEqual(p["flat_by"], "15:00")
-        self.assertIn("Reward:risk 1.39 after charges is under your min_reward_risk 1.5", p["warnings"][0])
+        self.assertIn("Reward:risk 1.36 after charges is under your min_reward_risk 1.5", p["warnings"][0])
         self.write(os.path.join("trader", "config.json"), {"include_charges": False, "min_reward_risk": 1.5})
         self.assertEqual(json.loads(self.plan("--json")[1])["warnings"], [])     # 2.0 before charges passes
         os.remove(os.path.join("trader", "config.json"))
@@ -416,6 +472,136 @@ class Cli(unittest.TestCase):
         code, text, _ = run(["plan", "--now", "2026-11-14 10:06", "--json"])
         self.assertIn("(Saturday)", json.loads(text)["warnings"][0])
 
+    def test_an_old_trigger_is_not_planned_from(self):
+        # the trigger fired at 10:05 IST. 10:35 is 30 minutes: fine. 10:36 is 31: the price has moved, refuse.
+        code, text, err = self.plan("--write")                              # 10:06, one minute old
+        self.assertEqual(code, 0, err)
+        os.remove(os.path.join("trader", "plan.json"))
+        code, text, err = run(["plan", "--now", "2026-11-13 10:35", "--write"])
+        self.assertEqual(code, 0, err)
+        os.remove(os.path.join("trader", "plan.json"))
+        code, text, err = run(["plan", "--now", "2026-11-13 10:36", "--write"])
+        self.assertEqual(code, 1)
+        self.assertEqual(text, "")
+        self.assertFalse(os.path.exists(os.path.join("trader", "plan.json")))      # nothing written
+        for words in ("RELIANCE trigger is 31 minutes old", "fired at 10:05 IST on 2026-11-13",
+                      "the limit is 30 minutes", "trigger_max_age_minutes", "--entry PRICE", "--allow-late",
+                      "the price has probably moved"):
+            self.assertIn(words, err)
+        self.assertNotIn("Traceback", err)
+        # an hour old, and yesterday's file on a new morning
+        code, _, err = run(["plan", "--now", "2026-11-13 11:20"])
+        self.assertIn("75 minutes old", err)
+        code, _, err = run(["plan", "--now", "2026-11-16 10:06"])
+        self.assertEqual(code, 1)
+        self.assertIn("3 days old", err)
+
+    def test_allow_late_and_an_explicit_entry_override_the_age(self):
+        late = ["plan", "--now", "2026-11-13 11:30", "--json"]
+        code, text, err = run(late + ["--allow-late"])
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["entry"], p["entry_time"]), (1334.0, "10:05"))          # the old trigger's price
+        self.assertTrue(p["warnings"][0].startswith("Planned from a trigger that is 85 minutes old"))
+        self.assertIn("--allow-late", p["warnings"][0])
+        self.assertIn("price has probably moved", p["warnings"][0])
+        # --entry PRICE is the user's own price now: no trigger, no age
+        code, text, err = run(["plan", "--now", "2026-11-13 11:30", "--entry", "1336.5", "--json"])
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["entry"], p["entry_time"]), (1336.5, None))
+        self.assertEqual(p["warnings"], [])
+        # flags are the user's own too
+        code, _, err = run(["plan", "--now", "2026-11-13 11:30", "--symbol", "RELIANCE", "--entry", "1334",
+                            "--or-high", "1333.40", "--or-low", "1324.30", "--date", "2026-11-13"])
+        self.assertEqual(code, 0, err)
+
+    def test_triggered_at_wins_over_date_and_time_and_the_limit_is_the_configs(self):
+        entry = os.path.join("trader", "entry.json")
+        # triggered_at (UTC, the trigger bar's close) says 10:05 IST; the date and time fields are old: fresh
+        self.write(entry, dict(REL_ENTRY, triggered_at="2026-11-13T04:35:00Z", date="2026-11-13", time="09:00"))
+        self.assertEqual(run(["plan", "--now", "2026-11-13 10:20", "--json"])[0], 0)
+        # triggered_at is old though time looks fresh: refused
+        self.write(entry, dict(REL_ENTRY, triggered_at="2026-11-13T03:00:00Z"))
+        code, _, err = run(["plan", "--now", "2026-11-13 10:20"])
+        self.assertEqual(code, 1)
+        self.assertIn("it fired at 08:30 IST", err)
+        self.assertIn("110 minutes old", err)
+        # the limit is trigger_max_age_minutes
+        self.write(entry, REL_ENTRY)
+        self.write(os.path.join("trader", "config.json"), {"trigger_max_age_minutes": 90})
+        self.assertEqual(run(["plan", "--now", "2026-11-13 11:30", "--json"])[0], 0)
+        code, _, err = run(["plan", "--now", "2026-11-13 11:36"])
+        self.assertEqual(code, 1)
+        self.assertIn("the limit is 90 minutes", err)
+
+    def test_a_trigger_that_cannot_be_dated_is_refused(self):
+        entry = os.path.join("trader", "entry.json")
+        undated = {k: v for k, v in REL_ENTRY.items() if k not in ("time", "date", "bar_start")}
+        self.write(entry, undated)
+        code, _, err = self.plan()
+        self.assertEqual(code, 1)
+        self.assertIn("does not say when RELIANCE triggered", err)
+        self.assertIn("--allow-late", err)
+        code, text, err = self.plan("--allow-late", "--date", "2026-11-13", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("age is unknown", json.loads(text)["warnings"][0])
+
+    def test_the_plan_carries_quantity_and_the_worst_fill_risk(self):
+        code, text, err = self.plan("--write")
+        self.assertEqual(code, 0, err)
+        p = self.read_plan()
+        self.assertEqual((p["quantity"], p["quantity_from"]), (37, "config caps"))     # not the old 56
+        self.assertEqual((p["risk_per_share"], p["risk_per_share_worst"], p["worst_exit"]), (5.2, 11.9, 1322.1))
+        self.assertEqual(p["risk_per_share_worst"], round(p["entry"] - float(nc.worst_exit_price(p["stop"], "RELIANCE", None)), 2))
+        for k in ORIGINAL_FIELDS:                                                      # additive: nothing taken away
+            self.assertIn(k, p)
+        # --qty is the user's own number
+        code, text, _ = self.plan("--qty", "10", "--write")
+        self.assertEqual((self.read_plan()["quantity"], self.read_plan()["quantity_from"]), (10, "--qty"))
+        # a smaller real account in portfolio.json shrinks the estimate: 75% of 20,000 / 1,334 = 11 shares
+        self.write(os.path.join("trader", "portfolio.json"), {"cash": 20000, "positions": []})
+        self.plan("--write")
+        self.assertEqual(self.read_plan()["quantity"], 11)
+        # "loss_basis": "trigger" measures the old way: 56 shares (the position cap), worst fill = the trigger
+        os.remove(os.path.join("trader", "portfolio.json"))
+        self.write(os.path.join("trader", "config.json"), {"loss_basis": "trigger"})
+        self.plan("--write")
+        p = self.read_plan()
+        self.assertEqual((p["quantity"], p["risk_per_share_worst"], p["worst_exit"]), (56, 5.2, 1328.8))
+
+    def test_a_plan_your_rules_cannot_size_says_so(self):
+        code, text, err = self.plan("--stop", "price:800", "--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual(p["quantity"], 0)
+        self.assertEqual(p["charges"]["quantity"], 1)                 # the charges estimate still needs a share
+        self.assertIn("fit no whole share of this plan", p["warnings"][0])
+        self.assertIn("nse-budget will refuse it", p["warnings"][0])
+
+    def test_show_uses_the_plans_quantity(self):
+        self.plan("--write")
+        code, text, _ = run(["show", "--now", "2026-11-13 10:20"])
+        self.assertIn("on 37 shares", text)
+        self.assertIn("Worst fill", text)
+        code, text, _ = run(["show", "--now", "2026-11-13 10:20", "--qty", "20"])
+        self.assertIn("on 20 shares", text)
+
+    def test_defaults_live_in_the_trader_folder_wherever_you_run_it(self):
+        elsewhere = tempfile.mkdtemp()
+        try:
+            os.chdir(elsewhere)                                       # not the folder that has trader/
+            code, text, err = self.plan("--write")
+            self.assertEqual(code, 0, err)
+            self.assertTrue(os.path.exists(os.path.join(self.d, "trader", "plan.json")))
+            self.assertIn(os.path.join(self.d, "trader", "plan.json"), text)
+            os.remove(os.path.join(self.d, "trader", "entry.json"))
+            code, _, err = self.plan()
+            self.assertIn(os.path.join(self.d, "trader", "entry.json"), err)        # the real path, not "trader/..."
+        finally:
+            os.chdir(self.d)
+            shutil.rmtree(elsewhere)
+
     def test_show_without_a_plan(self):
         code, text, _ = run(["show"])
         self.assertEqual(code, 1)
@@ -436,11 +622,36 @@ class SkillDoc(unittest.TestCase):
         low = " ".join(text.lower().split())
         for must in ("not financial advice", "**yes**", "${claude_skill_dir}", "before the entry",
                      "a stop is a plan, not a guarantee", "day trading loses most people money", "/nse-timemachine",
-                     "/nse-budget", "longs only", "₹1,328.80", "₹1,344.40", "₹5.20", "₹73.87",
+                     "/nse-budget", "longs only", "₹1,328.80", "₹1,344.40", "₹5.20", "₹52.71",
                      "15:10", "tick", "cancel the stop, then sell", "too tight to survive the spread", "nse", "kite"):
             self.assertIn(must, low)
         for never in ("—", "$", "dollar", "pro" + "fit", "trader-"):
-            self.assertNotIn(never, low.replace("${claude_skill_dir}", ""))
+            self.assertNotIn(never, low.replace("${claude_skill_dir}", "").replace("day-trader-india", ""))
+
+    def test_description_is_short_and_keeps_its_triggers(self):
+        with open(os.path.join(ROOT, "nse-exit", "SKILL.md"), encoding="utf-8") as fh:
+            head = fh.read().split("\n---\n")[0]
+        desc = " ".join(head.split("description: >-")[1].split("argument-hint:")[0].split())
+        self.assertLess(len(desc), 600, len(desc))
+        for phrase in ("where's my stop", "set my stop and target", "plan the exit", "what's my R",
+                       "break-even on Zerodha", "/nse-entry"):
+            self.assertIn(phrase, desc)
+
+    def test_the_worked_example_in_the_doc_is_the_code(self):
+        with open(os.path.join(ROOT, "nse-exit", "SKILL.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        p = c(1334.0, "or-mid")
+        ch = exitp.charges_for(p, 37, "config caps")
+        for want in ("Reward:risk   2.0 (1.36 after charges)",
+                     "Worst fill    the SL limit ₹1,322.10, ₹11.90 a share under the entry: ₹492.48 on 37 shares with "
+                     "charges (reward:risk 0.67 after charges if it fills there)",
+                     "about ₹1.42 a share at the target, ₹1.41 at the stop (₹52.71 and ₹52.33 a round trip on 37 shares",
+                     "Break-even    ₹1,335.50", '"quantity": 37', '"risk_per_share_worst": 11.9', '"worst_exit": 1322.1',
+                     "--allow-late", "trigger_max_age_minutes"):
+            self.assertIn(want, text, want)
+        self.assertEqual((ch["reward_risk_after_charges"], ch["reward_risk_after_charges_worst"], ch["break_even"],
+                          ch["at_target"], ch["at_stop"], ch["max_loss_worst_with_charges"]),
+                         (1.36, 0.67, 1335.5, 52.71, 52.33, 492.48))
 
 
 if __name__ == "__main__":

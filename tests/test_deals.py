@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from _load import FIX, load
 
@@ -57,9 +58,41 @@ class Files(unittest.TestCase):
     def test_bad_files(self):
         with self.assertRaises(deals.DealsError):
             deals.parse_deals("Symbol,Price\nX,1\n", "bulk")
-        self.assertEqual(deals.parse_deals("", "block"), [])
         head = "Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,Trade Price / Wght. Avg. Price\n"
         self.assertEqual(deals.parse_deals(head + "NO RECORDS\n", "block"), [])
+        self.assertEqual(deals.parse_deals(head + "No Records,,,,,,\n", "block"), [])
+        self.assertEqual(deals.parse_deals(head, "block"), [])  # a header and nothing else: a quiet day
+
+    def test_an_empty_body_or_a_web_page_is_not_a_day_with_no_deals(self):
+        # was: parse_deals("") == [], so a failed download read as "no deals today"
+        for body in ("", "   \n", "\ufeff"):
+            with self.assertRaises(deals.DealsError) as cm:
+                deals.parse_deals(body, "block")
+            self.assertIn("came back empty", str(cm.exception))
+        for body in ("<!DOCTYPE html><html>Access Denied</html>", "  <html>blocked</html>"):
+            with self.assertRaises(deals.DealsError) as cm:
+                deals.parse_deals(body, "bulk")
+            self.assertIn("web page", str(cm.exception))
+
+    def test_rows_that_cannot_be_read_are_counted_never_dropped_silently(self):
+        head = "Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,Trade Price / Wght. Avg. Price\n"
+        good = "13-NOV-2026,XYZ,Xyz Ltd,SOME FUND,BUY,100,10.00\n"
+        problems = []
+        got = deals.parse_deals(head + good + "13-NOV-2026,ABC,Abc Ltd,CUT OFF\n"
+                                "13-NOV-2026,DEF,Def Ltd,A FUND,BUY,lots,10.00\n"
+                                "soon,GHI,Ghi Ltd,A FUND,SELL,5,1.00\n", "block", problems)
+        self.assertEqual([d["symbol"] for d in got], ["XYZ"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("block.csv: 3 of 4 rows could not be read and are left out", problems[0])
+        self.assertIn("CUT OFF", problems[0])
+        # every row unreadable: the file failed, it is not "no deals"
+        with self.assertRaises(deals.DealsError) as cm:
+            deals.parse_deals(head + "13-NOV-2026,DEF,Def Ltd,A FUND,BUY,lots,10.00\n", "block")
+        self.assertIn("none of the 1 rows in block.csv could be read", str(cm.exception))
+        # the real files parse with nothing to report
+        problems = []
+        deals.parse_deals(text(BULK), "bulk", problems)
+        self.assertEqual(problems, [])
 
 
 class Clients(unittest.TestCase):
@@ -252,6 +285,224 @@ class Cli(unittest.TestCase):
     def test_prev_session(self):
         self.assertEqual(deals.prev_session(datetime.date(2026, 11, 16)), datetime.date(2026, 11, 13))
         self.assertEqual(deals.prev_session(datetime.date(2026, 11, 25)), datetime.date(2026, 11, 23))
+
+
+# ---------------------------------------------------------------- a file that failed is not "no deals"
+
+HEAD = "Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,Trade Price / Wght. Avg. Price\n"
+
+
+class IsolatedHome(unittest.TestCase):
+    """Own trader folder per test; the real trader/ is never read or written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "trader")
+        os.makedirs(self.home)
+        patcher = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state = os.path.join(self.tmp.name, "state", "deals.json")
+        self.none = os.path.join(self.tmp.name, "none.json")
+
+    def write(self, name, text_):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text_)
+        return path
+
+    def saved(self):
+        with open(self.state, encoding="utf-8") as fh:
+            return json.load(fh)
+
+
+class OneFileFails(IsolatedHome):
+    def args(self, cmd, bulk=BULK, block=None, extra=()):
+        return [cmd, "--bulk", bulk, "--block", block or BLOCK, "--state", self.state, "--now", NOW,
+                "--config", self.none, "--portfolio", self.none, "--watchlist", self.none] + list(extra)
+
+    def test_a_web_page_for_block_csv_says_so_and_exits_3_when_nothing_shows(self):
+        page = self.write("block-blocked.csv", "<!DOCTYPE html><html>Access Denied</html>")
+        code, out, err = run(self.args("show", block=page, extra=["--symbol", "NOSUCH"]))
+        self.assertEqual(code, 3, err)  # nothing matched, but half the data is missing: not "no deals"
+        self.assertIn("(block.csv NOT READ, 136 bulk)", out.splitlines()[0])
+        self.assertIn("INCOMPLETE: block.csv could not be read, so this covers bulk deals only.", out)
+        self.assertIn("note: block deals: NSE sent a web page, not block.csv", out)
+        self.assertNotIn("0 block", out)
+        code, out, _ = run(self.args("show", block=page))
+        self.assertEqual(code, 0)  # bulk deals shown, with the warning on top
+        self.assertIn("INCOMPLETE", out)
+
+    def test_new_with_a_failed_file_does_not_say_nothing_new_or_move_since_forward(self):
+        page = self.write("block-empty.csv", "")
+        code, out, _ = run(self.args("new", block=page, extra=["--symbol", "NOSUCH"]))
+        self.assertEqual(code, 3)
+        self.assertIn("Nothing new in what could be read.", out)
+        self.assertNotIn("\nNothing new.", out)
+        self.assertNotIn("last_check", self.saved())  # "since" must not claim block.csv was checked
+        # the file comes back: the first check really is the first
+        code, out, _ = run(self.args("new", extra=["--symbol", "NOSUCH"]))
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing new.", out)
+        self.assertIn("since the first check", out)
+        self.assertEqual(self.saved()["last_check"], "2026-11-14T04:30:00Z")
+
+    def test_json_says_which_file_failed(self):
+        page = self.write("bulk-cut.csv", "<html>blocked</html>")
+        code, out, err = run(self.args("show", bulk=page, extra=["--json"]))
+        doc = json.loads(out)
+        self.assertEqual((doc["complete"], doc["failed"]), (False, ["bulk"]))
+        self.assertTrue(any("bulk deals: NSE sent a web page" in n for n in doc["notes"]))
+
+    def test_both_files_failing_is_exit_2_with_the_reasons(self):
+        page = self.write("page.csv", "<html>blocked</html>")
+        code, out, err = run(self.args("show", bulk=page, block=page))
+        self.assertEqual(code, 2)
+        self.assertIn("deals: bulk deals: NSE sent a web page", err)
+        self.assertIn("deals: block deals: NSE sent a web page", err)
+        self.assertFalse(os.path.exists(self.state))  # nothing remembered
+
+    def test_a_truncated_row_is_a_note_in_the_report(self):
+        cut = self.write("bulk-cut.csv", HEAD + "13-NOV-2026,XYZ,Xyz Ltd,SOME FUND,BUY,5000000,100.00\n"
+                                         "13-NOV-2026,ABC,Abc Ltd,CUT OFF\n")
+        code, out, err = run(self.args("show", bulk=cut, extra=["--min-value", "0"]))
+        self.assertEqual(code, 0, err)
+        self.assertIn("note: bulk.csv: 1 of 2 rows could not be read and are left out", out)
+
+    def test_an_empty_day_with_both_files_read_is_still_exit_1(self):
+        empty = self.write("empty.csv", HEAD)
+        code, out, err = run(self.args("new", bulk=empty, block=empty))
+        self.assertEqual(code, 1, err)
+        self.assertIn("Nothing new.", out)
+        self.assertNotIn("INCOMPLETE", out)
+
+
+class Since(IsolatedHome):
+    def test_since_is_in_ist_not_utc(self):
+        args = ["new", "--offline", DIR, "--state", self.state, "--config", self.none, "--portfolio", self.none,
+                "--watchlist", self.none]
+        run(args + ["--now", "2026-11-14 10:00"])
+        code, out, _ = run(args + ["--now", "2026-11-14 11:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("New NSE bulk and block deals since 2026-11-14 10:00 IST: 0", out)  # was "2026-11-14T04:30:00Z"
+
+
+class ConfigAndPaths(IsolatedHome):
+    def base(self, cmd="show"):
+        return [cmd, "--offline", DIR, "--now", NOW]
+
+    def test_state_and_config_default_to_the_trader_home(self):
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        with open(os.path.join(self.home, "config.json"), "w") as fh:
+            json.dump({"follow_clients": ["Norges"], "deals_min_value_inr": 0}, fh)
+        cwd = os.getcwd()
+        os.chdir(elsewhere.name)
+        try:
+            code, out, err = run(self.base())
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 0, err)
+        self.assertIn("clients: Norges", out)  # the config in $NSE_TRADER_HOME was found
+        self.assertIn("deals: config " + os.path.join(self.home, "config.json"), err)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "state", "deals.json")))
+        self.assertFalse(os.path.exists(os.path.join(elsewhere.name, "trader")))
+
+    def test_a_missing_config_says_the_defaults_are_in_use(self):
+        code, out, err = run(self.base() + ["--dry-run"])
+        self.assertEqual(code, 0, err)
+        cfg = os.path.join(self.home, "config.json")
+        self.assertIn("deals: no config at %s: built-in defaults (no follow list, ₹1.00 cr minimum)" % cfg, err)
+        self.assertNotIn("config", out)  # stdout stays the report
+        code, out, err = run(self.base() + ["--dry-run", "--json"])
+        self.assertEqual(err, "")
+        self.assertIn("built-in defaults", json.loads(out)["config"])
+
+    def test_a_broken_config_names_the_file(self):
+        cfg = self.write("config.json", "{ nope")
+        code, _, err = run(self.base() + ["--config", cfg])
+        self.assertEqual(code, 2)
+        self.assertIn(cfg, err)
+        self.assertNotIn("Traceback", err)
+        cfg = self.write("config2.json", json.dumps({"deals_min_value_inr": "a lot"}))
+        code, _, err = run(self.base() + ["--config", cfg])
+        self.assertEqual(code, 2)
+        self.assertIn('"deals_min_value_inr"', err)
+
+    def test_follow_clients_as_one_string_is_one_name_not_letters(self):
+        cfg = self.write("config.json", json.dumps({"follow_clients": "Norges", "deals_min_value_inr": 0}))
+        code, out, err = run(self.base() + ["--config", cfg, "--dry-run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 shown. Filters: clients: Norges;", out)
+        cfg = self.write("config3.json", json.dumps({"follow_clients": {"a": 1}}))
+        code, _, err = run(self.base() + ["--config", cfg, "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("follow_clients", err)
+
+    def test_a_broken_state_file_stops_the_run_it_is_not_reset(self):
+        for body in ("{ half", "[1, 2]"):
+            with open(self.write("state.json", body), encoding="utf-8"):
+                pass
+            code, _, err = run(self.base() + ["--state", os.path.join(self.tmp.name, "state.json"),
+                                              "--config", self.none])
+            self.assertEqual(code, 2)
+            self.assertIn("state.json is not", err)
+            self.assertNotIn("Traceback", err)
+        with open(os.path.join(self.tmp.name, "state.json"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "[1, 2]")  # left alone for the user to look at
+
+    def test_an_unreadable_portfolio_is_a_note_not_an_empty_your_stocks(self):
+        pf = self.write("portfolio.json", "{ broken")
+        problems = []
+        self.assertEqual(deals.your_symbols(pf, self.none, problems), {})
+        self.assertIn("could not read %s, so your portfolio is not flagged" % pf, problems[0])
+        code, out, _ = run(self.base() + ["--portfolio", pf, "--mine", "--dry-run"])
+        self.assertIn("note: could not read %s" % pf, out)
+
+
+class HolidaysAreRefreshed(IsolatedHome):
+    """The "are NSE's files the latest session's?" check is a trading-day decision: it uses
+    NSE's own holiday list (refreshed when the year is unknown), not only the built-in 2026 one."""
+
+    def master(self):
+        return {"CM": [{"tradingDate": "26-Jan-2027", "description": "Republic Day"}]}
+
+    def run_online(self, fetch):
+        csv_day = HEAD + "25-JAN-2027,XYZ,Xyz Ltd,SOME FUND,BUY,5000000,100.00\n"
+        with mock.patch.object(deals.Source, "text", lambda self, kind: csv_day), \
+                mock.patch.object(deals, "HOLIDAY_FETCH", fetch):
+            return run(["show", "--state", self.state, "--now", "2027-01-27 10:00", "--config", self.none,
+                        "--portfolio", self.none, "--watchlist", self.none, "--min-value", "0", "--dry-run"])
+
+    def test_republic_day_is_not_mistaken_for_a_session_with_missing_files(self):
+        # Wed 27 Jan 2027, 10:00 IST: yesterday (Tue 26 Jan) was a holiday, so Monday 25 Jan's files are
+        # the latest. With only the built-in 2026 list the tool called them "not updated yet".
+        code, out, err = self.run_online(lambda: self.master())
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("not updated yet", out)
+        self.assertNotIn("holiday list", out)
+        cache = os.path.join(self.tmp.name, "state", "nse-holidays.json")
+        with open(cache, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["holidays"], {"2027-01-26": "Republic Day"})
+
+    def test_when_the_holiday_list_cannot_be_refreshed_it_says_so(self):
+        def down():
+            raise deals.nc.HolidayError("could not reach NSE: timed out")
+
+        code, out, err = self.run_online(down)
+        self.assertEqual(code, 0, err)
+        self.assertIn("note: could not refresh NSE's holiday list", out)
+        self.assertIn("note: NSE's 2027 holiday list is not loaded", out)
+
+    def test_offline_runs_never_fetch_holidays(self):
+        def boom():
+            raise AssertionError("an offline run must not touch the network")
+
+        with mock.patch.object(deals, "HOLIDAY_FETCH", boom):
+            code, out, err = run(["show", "--offline", DIR, "--state", self.state, "--now", NOW, "--config",
+                                  self.none, "--portfolio", self.none, "--watchlist", self.none, "--dry-run"])
+        self.assertEqual(code, 0, err)
 
 
 if __name__ == "__main__":

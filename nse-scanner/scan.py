@@ -43,6 +43,20 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
           Today's daily bar is dropped until the 15:30 IST close.
+          A breakout_20d hit carries "level", the prior 20-day closing high (the
+          close it just beat), and every hit carries "name" when the company
+          name is known (nse-entry's `watchlist --setup level` reads "level";
+          nse-news reads "name"). Names come from EQUITY_L.csv (the --lists
+          folder, or today's cache/EQUITY_L-<IST date>.csv; never downloaded
+          just for this), else the universe list, else sec_list.csv.
+          The traded-value floor needs a COMPLETE session's volume. Before
+          09:15, after 15:30 and on a day the NSE is closed, Yahoo's spark
+          volume is the last complete session's, and the floor uses it. While
+          the session is running that volume is today's partial count, so a
+          liquid stock would fail the floor early in the day: the floor is then
+          checked on each hit's own daily chart (complete sessions only, the
+          average of the last 20) and a hit that cannot be checked is kept and
+          marked "value_checked": false, never dropped for a partial volume.
 
 orb       Opening-range breakouts, 5-minute bars. The range is the first
           --or-minutes (15) of the session: the 09:15, 09:20 and 09:25 bars.
@@ -79,7 +93,19 @@ ind_nifty500list.csv, fo_mktlots.csv, EQUITY_L.csv, sec_list.csv, .gz fine)
 from a folder; --sec-list FILE gives sec_list alone.
 
 A scan is a list of charts that match a rule, not a list of stocks to buy.
-Exit code 0 when the scan found something, 1 when it did not or could not run.
+
+Exit codes: 0 the scan found something; 1 it ran and found nothing, or could not
+start (bad flags, no list); 3 the scan FAILED to read prices: more than half of
+the symbols (or of the stage-2 candidate charts) could not be fetched. That is
+not "no setups": it prints "scan failed: could not read prices (N of M symbols
+failed)", leaves the existing watchlist.json untouched and writes nothing. When
+a scan does write, watchlist.json records "scanned" and "errors" (the symbols
+that could not be read, with up to five reasons in "error_samples").
+
+Files live in the trader folder (nse_common.trader_home: $NSE_TRADER_HOME, else the
+nearest trader/ with a config.json above the working folder, else
+~/.day-trader-india, else ./trader). Each run says which config file it used, or
+that the built-in defaults are in use.
 """
 
 import argparse
@@ -136,6 +162,15 @@ class ScanError(Exception):
     pass
 
 
+class ScanFailed(ScanError):
+    """The scan could not read prices (not "no setups"): exit code 3, nothing written."""
+    exit_code = 3
+
+    def __init__(self, message, failed=0, total=0, samples=None):
+        ScanError.__init__(self, message)
+        self.failed, self.total, self.samples = failed, total, samples or {}
+
+
 # ---------------------------------------------------------------- time (IST)
 
 def parse_now(text):
@@ -171,6 +206,14 @@ def calendar(cfg, config_path=None):
     """(holidays, known years) from nse_common: the 2026 list, nse-alerts' cache, extra_holidays."""
     state = os.path.join(os.path.dirname(config_path) or ".", "state") if config_path else None
     return nc.load_holidays(cfg, state_dir=state) if state else nc.load_holidays(cfg)
+
+
+def config_line(path):
+    """Which config this run used: nse-scanner does not guard money, so it runs on the built-in
+    defaults without one, and says so."""
+    if path and os.path.isfile(path):
+        return "Config: %s." % path
+    return "Config: none at %s, so the built-in defaults are in use." % path
 
 
 # ---------------------------------------------------------------- network
@@ -567,6 +610,56 @@ def load_sec(a):
     return parse_sec_list(_archive_file(SEC_LIST, a)[0])
 
 
+def equity_l_names(text):
+    """EQUITY_L.csv -> {SYMBOL: company name}, every series (the first row of a symbol wins)."""
+    rows, head = _rows(text)
+    if "SYMBOL" not in head or "NAME OF COMPANY" not in head:
+        raise ScanError("not NSE's EQUITY_L.csv (no SYMBOL / NAME OF COMPANY columns)")
+    out = {}
+    for r in rows:
+        sym, name = r.get("SYMBOL", "").upper(), r.get("NAME OF COMPANY", "").strip()
+        if sym and name and sym not in out:
+            out[sym] = name
+    return out
+
+
+def local_equity_l(a):
+    """EQUITY_L.csv text if the scanner already has it, else None. It looks in --lists DIR and in
+    today's cache file (cache/EQUITY_L-<IST date>.csv, the file `universe all` writes and nse-news
+    shares), and never goes to the network for it."""
+    paths = []
+    if getattr(a, "lists", None):
+        paths += [os.path.join(a.lists, "EQUITY_L.csv"), os.path.join(a.lists, "EQUITY_L.csv.gz")]
+    cache = getattr(a, "cache", None)
+    if cache:
+        paths.append(os.path.join(cache, "EQUITY_L-%s.csv" % today_ist().isoformat()))
+    for p in paths:
+        if os.path.isfile(p):
+            try:
+                return read_maybe_gz(p)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def company_names(a, universe_names=None, sec=None):
+    """{SYMBOL: company name}: EQUITY_L.csv when it is on hand, else the universe list's names
+    (Company Name in the index lists, UNDERLYING in fo_mktlots), else sec_list's Security Name."""
+    names = {}
+    for sym, rows in (sec or {}).items():
+        pick = [r for r in rows if r.get("name")]
+        if pick:
+            names[sym] = pick[0]["name"].strip()
+    names.update({k.upper(): v for k, v in (universe_names or {}).items() if v})
+    try:
+        text = local_equity_l(a)
+        if text:
+            names.update(equity_l_names(text))
+    except ScanError:
+        pass        # a broken copy is no reason to lose the other sources
+    return names
+
+
 # ---------------------------------------------------------------- daily setups
 
 def rsi(closes, n=14):
@@ -604,12 +697,28 @@ def daily_closes(series, now_utc, cfg=None, holidays=None, with_volume=False):
     return [(d, c) for d, (c, _) in sorted(out.items())]
 
 
-def traded_value(series, bars):
-    """Rupees traded a session: the average close x volume of the last 20 sessions when the
-    chart has daily volumes, else the last session's price x volume from the spark meta."""
+def session_in_progress(now_utc, cfg=None, holidays=None):
+    """True while today's NSE session is running (09:15 to 15:30 on a trading day). Then Yahoo's
+    meta volume is today's PARTIAL count, not a complete session's."""
+    now = nc.to_ist(now_utc)
+    ok, _ = nc.trading_day(now.date(), holidays, cfg)
+    if not ok:
+        return False
+    o, c = nc.session_times(now.date(), cfg)
+    return o <= now.time() < c
+
+
+def traded_value(series, bars, partial_meta=False):
+    """Rupees traded a session: the average close x volume of the last 20 COMPLETE sessions when
+    the chart has daily volumes (bars come from daily_closes, which drops today's bar until the
+    close), else the last session's price x volume from the spark meta. With partial_meta (the
+    session is running) the meta volume is today's partial count and is never used: the answer is
+    (None, "partial") when there are no complete sessions' volumes to average."""
     vb = [(c, v) for _, c, v in bars[-VALUE_DAYS:] if v]
     if vb:
         return sum(c * v for c, v in vb) / len(vb), "average of %d sessions" % len(vb)
+    if partial_meta:
+        return None, "partial"
     meta = series.get("meta") or {}
     price = meta.get("regularMarketPrice")
     if price is None and bars:
@@ -646,9 +755,22 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_value_cr, cfg=None, holidays=None):
-    """Pure. data = {SYMBOL: series}. Returns (hits, counts, last_date)."""
+def scan_daily(data, symbols, now_utc, min_price, min_value_cr, cfg=None, holidays=None, names=None,
+               volume_of=None):
+    """Pure. data = {SYMBOL: series}. Returns (hits, counts, last_date).
+
+    names: {SYMBOL: company name}, written to each hit that has one. A breakout_20d hit gets "level",
+    the prior 20-day closing high.
+
+    The traded-value floor is measured on complete sessions only. While the session is running
+    Yahoo's spark volume is partial, so a symbol with no complete volumes is not judged in stage 1:
+    its hit goes on to volume_of(symbol) (a daily chart with volumes; None when there is none), and
+    is dropped only when the complete sessions' value is under the floor. A hit that cannot be
+    checked is kept with "value_checked": false."""
     hits, dates, value = [], {}, {}
+    names = names or {}
+    live = session_in_progress(now_utc, cfg, holidays)
+    deferred = {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
     for sym in symbols:
         s = data.get(sym)
@@ -660,8 +782,10 @@ def scan_daily(data, symbols, now_utc, min_price, min_value_cr, cfg=None, holida
         price = meta.get("regularMarketPrice")
         if price is None and bars:
             price = bars[-1][1]
-        val, _ = traded_value(s, bars)
-        if price is None or price < min_price or (min_value_cr > 0 and (val is None or val < min_value_cr * CRORE)):
+        val, how = traded_value(s, bars, partial_meta=live)
+        defer = min_value_cr > 0 and how == "partial"
+        if price is None or price < min_price or (
+                min_value_cr > 0 and not defer and (val is None or val < min_value_cr * CRORE)):
             counts["illiquid"] += 1
             continue
         if len(bars) < MIN_DAILY_BARS:
@@ -676,10 +800,48 @@ def scan_daily(data, symbols, now_utc, min_price, min_value_cr, cfg=None, holida
             vol = meta.get("regularMarketVolume")
             if vol is None and bars[-1][2] is not None:
                 vol = bars[-1][2]
-            value[sym] = val or 0.0
-            hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
-                         "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
-                         "volume": int(vol) if vol is not None else None})
+            order_val = val
+            if order_val is None and price is not None and meta.get("regularMarketVolume") is not None:
+                order_val = float(price) * float(meta["regularMarketVolume"])   # only for the order: "so far"
+            value[sym] = order_val or 0.0
+            hit = {"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
+                   "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
+                   "volume": int(vol) if vol is not None else None}
+            if sym in names:
+                hit["name"] = names[sym]
+            if "breakout_20d" in tags:
+                hit["level"] = round(nums["high20"], 2)    # the prior 20-day closing high it just beat
+            hits.append(hit)
+            if defer:
+                deferred[sym] = hit
+    if deferred:
+        counts["deferred"] = len(deferred)
+        unchecked = 0
+        for sym, hit in list(deferred.items()):
+            s2 = None
+            if volume_of is not None:
+                try:
+                    s2 = volume_of(sym)
+                except ScanError:
+                    s2 = None
+            val2 = None
+            if s2:
+                bars2 = daily_closes(s2, now_utc, cfg, holidays, with_volume=True)
+                val2, _ = traded_value(s2, bars2, partial_meta=True)       # complete sessions only
+            if val2 is None:
+                hit["value_checked"] = False
+                unchecked += 1
+            elif val2 < min_value_cr * CRORE:
+                hits.remove(hit)
+                value.pop(sym, None)
+                counts["illiquid"] += 1
+                counts["scanned"] -= 1
+            else:
+                value[sym] = val2
+                last_vol = [v for _, _, v in bars2 if v]
+                hit["volume"] = int(last_vol[-1]) if last_vol else None
+        if unchecked:
+            counts["unchecked"] = unchecked
     hits.sort(key=lambda h: (-value[h["symbol"]], h["symbol"]))  # most rupees traded first
     last_date = max(dates, key=lambda d: (dates[d], d)) if dates else None
     counts["hits"] = len(hits)
@@ -822,11 +984,13 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None, cfg=None, holi
 
 
 def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_value_cr=0.0, confirm=None,
-             max_confirm=None, cfg=None):
+             max_confirm=None, cfg=None, names=None):
     """stage1 = {SYMBOL: series} with closes (spark or v8). confirm(sym) -> series with highs/lows
     (None = use the stage-1 series). With confirm and max_confirm, only the max_confirm most
     traded candidates (rupees traded so far) are confirmed; the rest are counted as unconfirmed.
+    names: {SYMBOL: company name}, written to each hit that has one.
     Returns (hits, counts, failed {sym: why})."""
+    names = names or {}
     n_range = or_minutes // BAR_MIN
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
               "candidates": 0, "gappy": 0, "confirmed": 0, "unconfirmed": 0}
@@ -877,7 +1041,10 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_value_
         counts["confirmed"] += 1
         h = orb_hit(full, n_range)
         if h:
-            hits.append(dict({"symbol": sym, "setups": ["orb"]}, **h))
+            hit = {"symbol": sym, "setups": ["orb"]}
+            if sym in names:
+                hit["name"] = names[sym]
+            hits.append(dict(hit, **h))
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
     for h in hits:
         del h["_t"]
@@ -936,9 +1103,29 @@ def symbols_from_file(path):
     return out
 
 
-def resolve_universe(a, offline_syms=None):
+def pipe_names(path):
+    """{SYMBOL: name} from a SYMBOL|Name text file (what `universe` writes); {} for other files."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except OSError:
+        return out
+    if text.lstrip().startswith(("{", "[")):
+        return out
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#") and "|" in ln:
+            sym, _, name = ln.partition("|")
+            if name.strip():
+                out[nc.nse_symbol(sym)] = name.strip()
+    return out
+
+
+def resolve_universe(a, offline_syms=None, names=None):
     """-> (symbols, label, source). --symbols, --watchlist, --universe NAME|FILE; offline with
-    none of those: every chart in the file; online: Nifty 500."""
+    none of those: every chart in the file; online: Nifty 500. `names`, if given, is filled in
+    with {SYMBOL: company name} from the list that was read (a SYMBOL|Name file, an NSE list)."""
     if a.symbols:
         syms = [nc.nse_symbol(s) for s in re.split(r"[,\s]+", a.symbols) if s.strip()]
         label, src = "your symbols", "--symbols"
@@ -948,12 +1135,16 @@ def resolve_universe(a, offline_syms=None):
         if not os.path.exists(a.universe):
             raise ScanError("--universe is nifty50, nifty500, fno, all or a file; no file at %s" % a.universe)
         syms, label, src = symbols_from_file(a.universe), os.path.basename(a.universe), a.universe
+        if names is not None:
+            names.update(pipe_names(a.universe))
     elif offline_syms is not None and not a.universe:
         syms, label, src = sorted(offline_syms), "every chart in the offline file", a.offline
     else:
         name = (a.universe or DEFAULT_UNIVERSE).lower()
         rows, src = load_list(name, a)
         syms, label = [s for s, _ in rows], LISTS[name][1]
+        if names is not None:
+            names.update(dict(rows))
     bad = [s for s in syms if not nc.is_nse_symbol(s)]
     if bad:
         raise ScanError("not NSE symbols: %s" % ", ".join(bad[:5]))
@@ -966,7 +1157,8 @@ def resolve_universe(a, offline_syms=None):
 
 def build_scan_list(a, cfg, offline_syms=None):
     """Universe, then the sec_list screen, then --limit. -> (symbols, info)."""
-    syms, label, src = resolve_universe(a, offline_syms)
+    uni_names = {}
+    syms, label, src = resolve_universe(a, offline_syms, uni_names)
     sec = load_sec(a)
     if sec is None:
         kept, dropped = list(syms), {}
@@ -978,8 +1170,10 @@ def build_scan_list(a, cfg, offline_syms=None):
         kept = kept[:a.limit]
     if not kept:
         raise ScanError("no symbols to scan" + (" (%s)" % screened if dropped else ""))
+    names = company_names(a, uni_names, sec)
     return kept, {"label": label, "source": src, "listed": len(syms), "dropped": dropped,
-                  "screened": screened, "sec_list": sec is not None}
+                  "screened": screened, "sec_list": sec is not None,
+                  "names": {s: names[s] for s in kept if s in names}}
 
 
 def holiday_note(day, years):
@@ -996,6 +1190,27 @@ def load_cfg(a):
         return nc.load_config(a.config)
     except (ValueError, OSError) as e:
         raise ScanError("%s is not valid JSON: %s" % (a.config, e))
+
+
+def unread_symbols(symbols, data, failed):
+    """(unread symbols, {symbol: why}): the symbols that have no chart in `data`."""
+    unread = [s for s in symbols if s not in (data or {})]
+    why = {s: (failed or {}).get(s) or "no chart in the offline files" for s in unread}
+    return unread, why
+
+
+def require_read(symbols, unread, why, what="symbols", of=None):
+    """Raise ScanFailed (exit code 3) when more than half could not be read: that is a data
+    failure, not "no setups", and it must not overwrite the watchlist the last good scan wrote."""
+    total = of if of is not None else len(symbols)
+    if total and len(unread) * 2 > total:
+        raise ScanFailed("scan failed: could not read prices (%d of %d %s failed)" % (len(unread), total, what),
+                         failed=len(unread), total=total, samples=dict(list(why.items())[:5]))
+
+
+def error_fields(unread_why):
+    """The "errors" and "error_samples" a written watchlist.json records."""
+    return {"errors": len(unread_why), "error_samples": dict(list(unread_why.items())[:5])}
 
 
 def cmd_universe(a):
@@ -1020,6 +1235,7 @@ def cmd_universe(a):
         print(json.dumps({"universe": name, "listed": len(syms), "count": len(kept),
                           "dropped": reason_counts(dropped), "dropped_symbols": dropped,
                           "source": src, "out": None if a.no_write else a.out,
+                          "config": a.config if os.path.isfile(a.config) else None,
                           "seconds": round(time.time() - t0, 1)}, indent=2, ensure_ascii=False))
     else:
         print("%s from NSE (%s): %s symbols." % (LISTS[name][1], os.path.basename(src), _c(len(syms))))
@@ -1027,6 +1243,7 @@ def cmd_universe(a):
         print("Kept %s for intraday scans." % _c(len(kept)))
         if not a.no_write:
             print("Wrote %s (one SYMBOL|Name a line)." % a.out)
+        print(config_line(a.config))
     return 0 if kept else 1
 
 
@@ -1040,11 +1257,23 @@ def cmd_daily(a):
         data, failed = load_offline(a.offline)
         offline_syms = sorted(set(data) | set(failed))
     symbols, info = build_scan_list(a, cfg, offline_syms)
+    volume_of = None
     if not a.offline:
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % (_c(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_value_cr, cfg, holidays)
+
+        def volume_of(sym):
+            """A hit's own daily chart (volumes of complete sessions), for the value floor while the
+            session is running and spark's volume is only today's partial count."""
+            if a.pause:
+                SLEEP(a.pause)
+            return parse_chart(yahoo_get(chart_url(sym, "3mo", "1d")), sym)
+    # More than half unread is a data failure, not "no setups": stop before anything is written.
+    unread, why = unread_symbols(symbols, data, failed)
+    require_read(symbols, unread, why)
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_value_cr, cfg, holidays,
+                                         names=info["names"], volume_of=volume_of)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "nse-scanner", "created_at": nc.utc_iso(now), "mode": "daily", "exchange": "NSE",
@@ -1053,12 +1282,14 @@ def cmd_daily(a):
            "filters": {"min_price": a.min_price, "min_value_cr": a.min_value_cr},
            "dropped": reason_counts(info["dropped"]), "dropped_symbols": info["dropped"],
            "note": NOTE, "hits": hits}
+    doc.update(error_fields(why))
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
         nc.write_json(a.out, doc)
     if a.json:
-        print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2, ensure_ascii=False))
+        print(json.dumps(dict(doc, counts=counts, config=a.config if os.path.isfile(a.config) else None,
+                              seconds=round(time.time() - t0, 1)), indent=2, ensure_ascii=False))
         return 0 if hits else 1
     local = nc.to_ist(now)
     print("Daily scan, %s IST, closes through %s (Yahoo spark, daily closes only)." % (
@@ -1074,6 +1305,12 @@ def cmd_daily(a):
     note = holiday_note(local.date(), years)
     if note:
         print(note)
+    if counts.get("deferred"):
+        print("The session is running, so Yahoo's spark volume is only today's partial count: the %s floor was "
+              "checked on each hit's own daily chart (complete sessions, %d hits)%s." % (
+                  cr_text(a.min_value_cr), counts["deferred"],
+                  (", %d of them could not be checked and are marked value_checked false" % counts["unchecked"])
+                  if counts.get("unchecked") else ""))
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
@@ -1088,6 +1325,7 @@ def cmd_daily(a):
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
         print("Wrote %s (mode daily, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+    print(config_line(a.config))
     print(NOTE + " Next: pick one chart, then /nse-news SYMBOL.")
     return 0 if hits else 1
 
@@ -1150,11 +1388,20 @@ def cmd_orb(a):
             if len(done) % 50 == 0:
                 progress(a, "  stage 2: %d v8 charts so far" % len(done))
             return parse_chart(yahoo_get(chart_url(sym, rng, "%dm" % BAR_MIN)), sym)
+    # More than half unread is a data failure, not "no setups": stop before anything is written.
+    unread, why = unread_symbols(symbols, data, failed)
+    require_read(symbols, unread, why)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_value_cr,
-                                     confirm, a.max_confirm, cfg)
+                                     confirm, a.max_confirm, cfg, names=info["names"])
+    # The same for stage 2: every candidate's v8 chart failing leaves hits missing, not absent.
+    asked = counts["confirmed"] + len(failed2)
+    if confirm is not None and asked:
+        require_read(symbols, list(failed2), dict(list(failed2.items())[:5]), "candidate charts", of=asked)
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
+    errors_why = dict(why)
+    errors_why.update(failed2)
     open_dt, _ = session_dt(day, cfg)
     as_of = "%s %s IST" % (day.isoformat(), hm(cutoff))
     doc = {"created_by": "nse-scanner", "created_at": nc.utc_iso(now), "mode": "orb", "exchange": "NSE",
@@ -1164,12 +1411,14 @@ def cmd_orb(a):
            "filters": {"min_price": a.min_price, "min_value_cr": a.min_value_cr},
            "dropped": reason_counts(info["dropped"]), "dropped_symbols": info["dropped"],
            "note": NOTE, "hits": hits}
+    doc.update(error_fields(errors_why))
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
         nc.write_json(a.out, doc)
     if a.json:
-        print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2, ensure_ascii=False))
+        print(json.dumps(dict(doc, counts=counts, config=a.config if os.path.isfile(a.config) else None,
+                              seconds=round(time.time() - t0, 1)), indent=2, ensure_ascii=False))
         return 0 if hits else 1
     print("Opening-range breakout scan, %s %s IST: %d-minute range (%s to %s), 5-minute bars, Yahoo."
           % (day_label(day), hm(cutoff), a.or_minutes, hm(open_dt),
@@ -1203,6 +1452,7 @@ def cmd_orb(a):
         print("No chart closed above its opening-range high by %s IST." % hm(cutoff))
     if not a.no_write:
         print("Wrote %s (mode orb, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
+    print(config_line(a.config))
     print(NOTE + " Next: pick one chart, then /nse-news SYMBOL and /nse-entry SYMBOL.")
     return 0 if hits else 1
 
@@ -1216,13 +1466,15 @@ def main(argv=None):
     def lists_args(p):
         p.add_argument("--lists", metavar="DIR", help="a folder with NSE's list files instead of the network")
         p.add_argument("--sec-list", metavar="FILE", help="NSE's sec_list.csv (.gz fine) instead of the network")
-        p.add_argument("--cache", default=os.path.join("trader", "cache"), help="where the day's NSE files are kept")
+        p.add_argument("--cache", default=nc.tpath("cache"),
+                       help="where the day's NSE files are kept (default: cache/ in the trader folder)")
         p.add_argument("--refresh", action="store_true", help="download the NSE files again")
-        p.add_argument("--config", default=os.path.join("trader", "config.json"))
+        p.add_argument("--config", default=nc.tpath("config.json"),
+                       help="default: config.json in the trader folder (nse_common.trader_home)")
 
     p = sub.add_parser("universe", help="an NSE list, screened by sec_list -> trader/universe.txt")
     p.add_argument("name", nargs="?", default=DEFAULT_UNIVERSE, help="nifty50, nifty500 (default), fno or all")
-    p.add_argument("--out", default=os.path.join("trader", "universe.txt"))
+    p.add_argument("--out", default=nc.tpath("universe.txt"))
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--json", action="store_true")
     lists_args(p)
@@ -1238,7 +1490,7 @@ def main(argv=None):
                        help="traded value a session, in crore of rupees (default %s)" % _n(min_value_cr))
         p.add_argument("--offline", metavar="PATH", help="Yahoo fixture folder or file instead of the network")
         p.add_argument("--now", help='pretend it is this time ("2026-11-13 10:05" IST, or ...Z for UTC)')
-        p.add_argument("--out", default=os.path.join("trader", "watchlist.json"))
+        p.add_argument("--out", default=nc.tpath("watchlist.json"))
         p.add_argument("--no-write", action="store_true")
         p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
@@ -1261,6 +1513,16 @@ def main(argv=None):
         return 1
     try:
         return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
+    except ScanFailed as e:
+        # exit 3: the prices could not be read. Not "no setups", and nothing was written.
+        print(e, file=sys.stderr)
+        for sym, why in e.samples.items():
+            print("  %s: %s" % (sym, why), file=sys.stderr)
+        print("The existing watchlist.json was left as it was and nothing was written.", file=sys.stderr)
+        if getattr(a, "json", False):
+            print(json.dumps({"error": str(e), "failed": e.failed, "universe": e.total, "wrote": False,
+                              "error_samples": e.samples}, indent=2, ensure_ascii=False))
+        return e.exit_code
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1

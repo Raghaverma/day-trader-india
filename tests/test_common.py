@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from decimal import Decimal
+from unittest import mock
 
 from _load import load, FIX
 
@@ -187,6 +188,205 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg["budget"], 50000)
         self.assertEqual(cfg["charges"], {"brokerage_cap": 0})
         self.assertEqual(cfg["max_loss_per_trade_inr"], 500)
+
+
+class OrderTick(unittest.TestCase):
+    def test_near_a_slab_edge_takes_the_coarser_tick(self):
+        cfg = nc.load_config(None)
+        # 997.97 is on the 0.05 slab but within 10% of 1000: use 0.10 so the price is valid either way
+        self.assertEqual(nc.order_tick(997.97, "X", cfg), Decimal("0.10"))
+        self.assertEqual(nc.tick_size(997.97), Decimal("0.05"))
+        self.assertEqual(nc.order_tick(1334, "RELIANCE", cfg), Decimal("0.10"))
+        self.assertEqual(nc.order_tick(150, "X", cfg), Decimal("0.01"))
+        self.assertEqual(nc.order_tick(240, "X", cfg), Decimal("0.05"))      # 10% above is over 250
+
+    def test_override_and_band_switch(self):
+        self.assertEqual(nc.order_tick(997.97, "X", {"tick_sizes": {"X": 0.05}}), Decimal("0.05"))
+        self.assertEqual(nc.order_tick(997.97, "X", {"tick_band_pct": 0}), Decimal("0.05"))
+
+    def test_a_price_on_the_coarse_grid_is_on_every_finer_grid(self):
+        cfg = nc.load_config(None)
+        for price in (249.7, 998.3, 1003.2, 4890.4, 5120.0, 9800.5, 19999.0):
+            tick = nc.order_tick(price, "X", cfg)
+            q = nc.round_to_tick(price, tick)
+            for finer in (Decimal("0.01"), Decimal("0.05"), Decimal("0.10"), Decimal("0.50"), Decimal("1.00")):
+                if finer <= tick:
+                    self.assertTrue(nc.on_tick(q, finer), (price, tick, finer))
+
+
+class LossAtStop(unittest.TestCase):
+    CFG = nc.load_config(None)
+
+    def test_the_max_loss_is_measured_at_the_sl_limit(self):
+        self.assertEqual(nc.stop_limit_price(1328.80, "RELIANCE", self.CFG), Decimal("1322.10"))
+        self.assertEqual(nc.worst_exit_price(1328.80, "RELIANCE", self.CFG), Decimal("1322.10"))
+        loss = nc.loss_at_stop(56, 1334, 1328.80, "RELIANCE", self.CFG)
+        self.assertEqual(loss["per_share"], Decimal("11.90"))
+        self.assertEqual(loss["gross"], Decimal("666.40"))
+        self.assertEqual(loss["total"], loss["gross"] + loss["charges"])
+        self.assertGreater(loss["total"], 500)
+
+    def test_trigger_basis_is_the_old_behaviour(self):
+        cfg = dict(self.CFG, loss_basis="trigger")
+        self.assertEqual(nc.worst_exit_price(1328.80, "RELIANCE", cfg), Decimal("1328.80"))
+        self.assertEqual(nc.loss_at_stop(56, 1334, 1328.80, "RELIANCE", cfg)["gross"], Decimal("291.20"))
+
+    def test_shares_that_fit_the_cap(self):
+        n = nc.max_loss_shares(500, 1334, 1328.80, "RELIANCE", self.CFG)
+        self.assertEqual(n, 37)
+        self.assertLessEqual(nc.loss_at_stop(n, 1334, 1328.80, "RELIANCE", self.CFG)["total"], 500)
+        self.assertGreater(nc.loss_at_stop(n + 1, 1334, 1328.80, "RELIANCE", self.CFG)["total"], 500)
+
+    def test_the_four_limits(self):
+        limits = {l["name"]: l["shares"] for l in nc.size_limits(1334, 1328.80, "RELIANCE", self.CFG)}
+        self.assertEqual(limits, {"max loss": 37, "position cap": 56, "max order": 59, "cash": 67})
+        self.assertEqual(nc.size_qty(1334, 1328.80, "RELIANCE", self.CFG), 37)
+
+    def test_a_losing_day_shrinks_the_account_base(self):
+        pf = {"cash": 60000, "positions": []}
+        total = nc.portfolio_total(pf)
+        self.assertEqual(total, 60000)
+        self.assertEqual(nc.account_base(self.CFG, total), 60000)
+        self.assertEqual(nc.account_base(self.CFG, None), 100000)
+        self.assertEqual(nc.account_base(self.CFG, 250000), 100000)
+        small = {l["name"]: l["shares"] for l in nc.size_limits(1334, 1328.80, "RELIANCE", self.CFG,
+                                                                  portfolio_total=total, cash=60000)}
+        self.assertLess(small["position cap"], 56)
+
+    def test_portfolio_total_values_holdings_at_price_else_cost(self):
+        pf = {"cash": 50000, "positions": [{"ticker": "RELIANCE", "shares": 10,
+                                            "lots": [{"shares": 10, "cost": 13300}]}]}
+        self.assertEqual(nc.portfolio_total(pf, {"RELIANCE": 1334}), 63340)
+        self.assertEqual(nc.portfolio_total(pf, {}), 63300)
+        self.assertIsNone(nc.portfolio_total(None))
+
+
+class ReadmeExample(unittest.TestCase):
+    """The RELIANCE numbers the README quotes: 37 shares, worst fill 1,322.10."""
+    CFG = nc.load_config(None)
+
+    def test_the_numbers_in_the_readme(self):
+        self.assertEqual(nc.size_qty(1334, 1328.80, "RELIANCE", self.CFG), 37)
+        self.assertEqual(37 * Decimal("1334"), Decimal("49358"))
+        loss = nc.loss_at_stop(37, 1334, 1328.80, "RELIANCE", self.CFG)
+        self.assertEqual((loss["gross"], loss["charges"], loss["total"]),
+                         (Decimal("440.30"), Decimal("52.18"), Decimal("492.48")))
+        self.assertEqual(nc.max_loss_shares(500, 1334, 1328.80, "RELIANCE", self.CFG) + 1, 38)
+        self.assertEqual(nc.loss_at_stop(38, 1334, 1328.80, "RELIANCE", self.CFG)["total"], Decimal("505.79"))
+        self.assertEqual(nc.loss_at_stop(56, 1334, 1328.80, "RELIANCE", self.CFG)["total"], Decimal("739.91"))
+        at_target = nc.intraday_charges(37, 1334, 1344.40, self.CFG)["total"]
+        self.assertEqual(at_target, 52.71)
+        self.assertEqual(round(37 * 10.40 - at_target, 2), 332.09)
+        paper = nc.intraday_charges(37, 1334, 1344.30, self.CFG)["total"]
+        self.assertEqual((paper, round(37 * 10.30, 2), round(37 * 10.30 - paper, 2)), (52.70, 381.10, 328.40))
+
+
+class TraderHome(unittest.TestCase):
+    def test_env_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(nc.trader_home(cwd=tmp, env={nc.HOME_ENV: tmp}), os.path.abspath(tmp))
+
+    def test_finds_trader_in_a_parent_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            os.makedirs(os.path.join(tmp, "trader"))
+            nc.write_json(os.path.join(tmp, "trader", "config.json"), {})
+            deep = os.path.join(tmp, "a", "b")
+            os.makedirs(deep)
+            self.assertEqual(nc.trader_home(cwd=deep, env={}), os.path.join(tmp, "trader"))
+
+    def test_falls_back_to_trader_in_the_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            with mock.patch.dict(os.environ, {"HOME": tmp}):      # no ~/.day-trader-india either
+                self.assertEqual(nc.trader_home(cwd=tmp, env={}), os.path.join(tmp, "trader"))
+
+    def test_a_missing_config_is_refused_when_required(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "config.json")
+            with self.assertRaises(nc.ConfigMissing) as cm:
+                nc.load_config(p, require=True)
+            self.assertIn(p, str(cm.exception))
+            self.assertEqual(nc.load_config(p)["budget"], 100000)       # not required: defaults
+            nc.write_json(p, {"budget": 5000})
+            self.assertEqual(nc.load_config(p, require=True)["budget"], 5000)
+
+    def test_test_mode_needs_the_env_var(self):
+        self.assertFalse(nc.test_mode({}))
+        self.assertFalse(nc.test_mode({nc.TEST_ENV: "0"}))
+        self.assertTrue(nc.test_mode({nc.TEST_ENV: "1"}))
+
+
+class HolidayRefresh(unittest.TestCase):
+    DOC = {"CM": [{"tradingDate": "26-Jan-2027", "description": "Republic Day"},
+                  {"tradingDate": "25-Dec-2027", "description": "Christmas"}]}
+
+    def test_an_unknown_year_is_stale_and_refreshes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime.datetime(2027, 1, 4, 5, 0)
+            today = datetime.date(2027, 1, 4)
+            stale, why = nc.holidays_stale(tmp, today, {}, now)
+            self.assertTrue(stale)
+            self.assertIn("2027", why)
+            hol, years, note = nc.ensure_holidays({}, tmp, today, now, fetch=lambda: self.DOC)
+            self.assertIn(2027, years)
+            self.assertEqual(hol["2027-01-26"], "Republic Day")
+            self.assertIn("refreshed", note)
+            self.assertFalse(nc.holidays_stale(tmp, today, {}, now)[0])
+
+    def test_a_failed_refresh_never_raises(self):
+        def boom():
+            raise nc.HolidayError("NSE answered HTTP 403")
+        with tempfile.TemporaryDirectory() as tmp:
+            hol, years, note = nc.ensure_holidays({}, tmp, datetime.date(2027, 1, 4),
+                                                  datetime.datetime(2027, 1, 4, 5, 0), fetch=boom)
+            self.assertNotIn(2027, years)
+            self.assertIn("could not refresh", note)
+
+    def test_an_old_cache_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nc.update_holiday_cache(self.DOC, tmp, datetime.datetime(2027, 1, 1, 0, 0))
+            today = datetime.date(2027, 3, 20)
+            self.assertFalse(nc.holidays_stale(tmp, datetime.date(2027, 1, 10), {}, datetime.datetime(2027, 1, 10))[0])
+            stale, why = nc.holidays_stale(tmp, today, {}, datetime.datetime(2027, 3, 20))
+            self.assertTrue(stale)
+            self.assertIn("older", why)
+
+    def test_december_wants_next_years_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale, why = nc.holidays_stale(tmp, datetime.date(2026, 12, 10), {}, datetime.datetime(2026, 12, 10))
+            self.assertTrue(stale)
+            self.assertIn("2027", why)
+
+    def test_fetch_retries_with_cookies_after_a_403(self):
+        calls = []
+
+        def fake_get(url, timeout, headers, opener):
+            calls.append((url, opener is not None))
+            if url == nc.HOLIDAY_URL and not any(o for _, o in calls):
+                return 403, ""
+            if url == nc.HOLIDAY_URL:
+                return 200, json.dumps(self.DOC)
+            return 200, "<html></html>"
+        doc = nc.fetch_holiday_master(get=fake_get)
+        self.assertEqual(doc, self.DOC)
+        self.assertEqual([u for u, _ in calls], [nc.HOLIDAY_URL, nc.NSE_HOME_URL, nc.HOLIDAY_URL])
+
+
+class FreshPrice(unittest.TestCase):
+    NOW = datetime.datetime(2026, 11, 13, 4, 35)
+
+    def doc(self, t):
+        return {"prices": {"RELIANCE": 1334.0}, "detail": {"RELIANCE": {"time": t}}}
+
+    def test_fresh_stale_future_and_missing(self):
+        p, t, ok = nc.fresh_price(self.doc("2026-11-13T04:33:00Z"), "RELIANCE", self.NOW)
+        self.assertEqual((p, ok), (1334.0, True))
+        self.assertFalse(nc.fresh_price(self.doc("2026-11-13T04:20:00Z"), "RELIANCE", self.NOW)[2])
+        self.assertTrue(nc.fresh_price(self.doc("2026-11-13T04:20:00Z"), "RELIANCE", self.NOW, minutes=30)[2])
+        self.assertFalse(nc.fresh_price(self.doc("2026-11-13T05:30:00Z"), "RELIANCE", self.NOW)[2])
+        self.assertEqual(nc.fresh_price(self.doc("2026-11-13T04:33:00Z"), "TCS", self.NOW), (None, None, False))
+        self.assertEqual(nc.fresh_price(None, "TCS", self.NOW), (None, None, False))
 
 
 if __name__ == "__main__":

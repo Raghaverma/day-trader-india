@@ -1,19 +1,15 @@
 ---
 name: nse-timemachine
 description: >-
-  Time Machine for NSE intraday trades. Replays every possible outcome of a
-  trade before you risk a rupee: 10,000 simulated sessions plus every past
-  time the setup fired, before and after Zerodha charges. Takes the plan from
-  nse-exit (entry, stop, target, flat-by 15:10 IST), rebuilds the rest of the
-  day 10,000 times from the stock's own 5-minute bars over the last 60 NSE
-  sessions (Yahoo .NS), and re-runs the same opening-range rule on every past
-  session. Prints the odds of target first, stop first, or neither by the
-  flat-by time, where the price sits then, the average R before and after
-  charges, the history, and one honest verdict, then hands off to
+  Time Machine for NSE intraday trades. Replays a planned trade before you
+  risk a rupee: 10,000 simulated sessions from the stock's own 5-minute bars,
+  plus every past time the same opening-range rule fired, before and after
+  charges. Prints the odds of target first, stop first or neither by
+  flat-by 15:10 IST, the average R and one honest verdict, then hands off to
   /nse-budget. Use when the user says "run the time machine", "replay this
   trade", "what are the odds on RELIANCE", "simulate this trade", "monte
-  carlo", "backtest this setup on NSE", "is this a coin flip", "does it beat
-  the charges", or after /nse-exit writes a plan, before /nse-budget.
+  carlo", "backtest this setup", "is this a coin flip", or after /nse-exit
+  writes a plan.
 argument-hint: "[path to plan.json, or NSE symbol]"
 ---
 
@@ -38,7 +34,7 @@ is placed without the user's explicit **yes** in the chat for that one order.
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run                    # trader/plan.json, 10,000 replays, seed 19
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --write            # also save trader/timemachine.json
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 15:00      # end each replay before the plan's flat-by
-python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --qty 56 --json    # charges on 56 shares
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --qty 37 --json    # charges on 37 shares
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol RELIANCE --date 2026-11-13 \
     --entry 1334 --stop 1328.80 --target 1344.40 --entry-time 10:05
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
@@ -46,14 +42,21 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan 
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-11-13 10:05"` (IST) to pin the clock, `--config PATH`.
+`--now "2026-11-13 10:05"` (IST) to pin the clock, `--config PATH`,
+`--portfolio PATH` (default: the portfolio.json next to the config).
+
+The trader folder (config, plan, results) is the same wherever Claude Code was
+started: the `NSE_TRADER_HOME` environment variable, else the nearest
+`trader/` folder that has a `config.json` in the working folder or above, else
+`~/.day-trader-india`.
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/plan.json` | the plan from nse-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range, flat_by |
-| `trader/config.json` | `flat_by`, `charges`, `tick_sizes`, and the caps that size the charges estimate |
+| `trader/plan.json` | the plan from nse-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range, flat_by, and `quantity` (the share count nse-exit estimated, used for the charges) |
+| `trader/config.json` | `flat_by`, `charges`, `tick_sizes`, `tick_band_pct`, `loss_basis`, and the rules that size the charges estimate when the plan has no `quantity` |
+| `trader/portfolio.json` | optional: a real account smaller than the budget shrinks the estimated share count |
 | Yahoo chart API | one request: 60 days of 5-minute bars for SYMBOL.NS (`range=60d&interval=5m`), free and unofficial, can lag |
 | `trader/timemachine.json` | with `--write`: `{plan, mc, history}` plus the verdict. `mc` holds the odds, percentiles, the after-charges sums, the fan-chart bands, 160 sample paths and a 24-bin histogram |
 
@@ -84,9 +87,12 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 4. **Charges.** Indian round-trip costs are material on a tight intraday
    stop. Every replay and every history trade also gets its R after
    Zerodha's intraday charges (`nse_common.intraday_charges`) on `--qty`
-   shares, or the plan's quantity, or the size your config's caps allow.
+   shares, else the plan's `quantity`, else the size your rules allow
+   (`nse_common.size_qty`: the same arithmetic nse-exit and nse-budget use,
+   so the three agree on the share count; at least one share).
 5. **The history.** The plan's own rule (the same opening range, stop rule
-   and target R, prices on the NSE tick) runs again on every one of those
+   and target R, prices on the NSE order tick: the coarsest tick within 10 %
+   of the price, `tick_band_pct`) runs again on every one of those
    past sessions, flat at the same time. That is what really happened, not a
    simulation.
 6. **The verdict** is one line from the numbers. It looks only at the
@@ -144,13 +150,14 @@ had a gap and was left out):
   neither        8.3 %    still open at 15:10
   green          28.8 %   target first, or above the entry at 15:10
   Average R: -0.199
-  After charges on 56 shares: average R -0.452
-History: fired 31 times in 58 sessions: 7 target, 15 stop, 9 neither. Average R -0.030, -0.280 after charges.
+  After charges on 37 shares: average R -0.471
+History: fired 31 times in 58 sessions: 7 target, 15 stop, 9 neither. Average R -0.030, -0.289 after charges.
 Leans toward the stop: at 2R the target has to come first in 33 % of the replays that hit one side; it did in 25 %.
-After charges: +1.75R at the target, -1.25R at the stop, so the target has to come first in 42 %.
+After charges: +1.73R at the target, -1.27R at the stop, so the target has to come first in 42 %.
 ```
 
-That day the real price ran to ₹1,350.50 and the target filled in the 10:10
+The 37 shares are the size nse-budget would give (the max loss at the stop
+leg's worst fill decides it), not an invented number. That day the real price ran to ₹1,350.50 and the target filled in the 10:10
 bar. One good day is not the odds: the replays and the history both lean
 toward the stop, and the charges make it worse. That is what the user should
 hear before `/nse-budget` sizes anything.

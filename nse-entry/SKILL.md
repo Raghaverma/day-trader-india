@@ -1,21 +1,14 @@
 ---
 name: nse-entry
 description: >-
-  Entry Timer for the Indian cash market (NSE). Watches a setup bar by bar
-  and tells you the moment to get in. Reads free Yahoo .NS 1-minute or
-  5-minute bars, builds the opening range from 09:15 IST (the first 15
-  minutes by default) and calls the entry on the first completed bar that
-  CLOSES above the range high, or above a level you give it (like a 20-day
-  high from nse-scanner), with an optional volume check. Knows the NSE
-  session (pre-open 09:00-09:15, normal market 09:15-15:30 IST), weekends and
-  NSE trading holidays, and the entry window from config (09:30 to 14:30 by
-  default). Says waiting and how far in ₹, triggered with the time and the
-  price, expired, pre-open or market closed, and writes trader/entry.json for
-  /nse-exit. Long side only. It never places an order. Use when the user
-  says "tell me when to get in", "watch RELIANCE", "has it broken out", "did
-  it break the opening range", "Nifty stock entry signal", "time my entry on
-  Zerodha", "check my watchlist", or after /nse-scanner and /nse-news,
-  before /nse-exit.
+  Entry Timer for NSE. Watches a setup bar by bar and says the moment to get
+  in. Reads Yahoo .NS bars, builds the opening range from 09:15 IST and calls
+  the entry on the first completed bar that CLOSES above the range high (or a
+  level from nse-scanner), once the whole range is in. Knows NSE holidays and
+  the 09:30 to 14:30 window. Writes trader/entry.json for /nse-exit. Long only,
+  never places an order. Use when the user says "tell me when to get in",
+  "watch RELIANCE", "has it broken out", "did it break the opening range",
+  "Nifty stock entry signal", "check my watchlist", or after /nse-scanner.
 argument-hint: "[SYMBOL] [--setup orb|level] [--interval 5m|1m] [--now \"YYYY-MM-DD HH:MM\"]"
 ---
 
@@ -40,6 +33,7 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" check RELIANCE --setup level --level 1340
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check M&M --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch RELIANCE --until 14:30  # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist --setup level     # each hit's own "level" (its prior 20-day closing high)
 ```
 
 Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
@@ -50,22 +44,40 @@ symbols: `RELIANCE`, `M&M`, `BAJAJ-AUTO` (`RELIANCE.NS` and `NSE:RELIANCE`
 are read too). `watch` with `--now` or `--offline` runs on a simulated clock
 and replays the day bar by bar without waiting.
 
+Every file lives in the trader folder, the same one for all the skills:
+the `NSE_TRADER_HOME` environment variable if set, else the nearest `trader/` folder with a
+`config.json` above where Claude Code was started, else `~/.day-trader-india`,
+else `./trader`. Each run ends with a line saying which `config.json` it used,
+or that none was found at that path and the built-in defaults are in use (this
+skill does not guard money, so it runs without one).
+
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
-| `trader/watchlist.json` | the scanner's hits (`hits[].symbol`), for `watchlist` |
+| `trader/watchlist.json` | the scanner's hits (`hits[].symbol`, and `hits[].level`, the prior 20-day closing high on a 20-day-breakout hit), for `watchlist` |
 | `trader/config.json` | `no_entries_before` (09:30) and `no_entries_after` (14:30), IST; `special_sessions` (Muhurat trading); `extra_holidays`. Optional |
-| `trader/state/nse-holidays.json` | holiday years beyond 2026, written by nse-alerts |
+| `trader/state/nse-holidays.json` | holiday years beyond 2026, written by nse-alerts, or by this skill when the list is stale and it refreshes it (best effort, never an error; not on an `--offline` replay) |
 | Yahoo chart API | today's bars, `RELIANCE.NS?range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
-| `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time (IST HH:MM), bar, price, level, opening range |
+| `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time (IST HH:MM), bar, price, level, opening range, **`triggered_at`** (UTC, the trigger bar's close; `/nse-exit` refuses a trigger older than `trigger_max_age_minutes`, 30, unless you give it a price or `--allow-late`) and **`late_by_minutes`** |
 
 ## The rule
 
 - **Opening range (orb).** The high and low of the first 15 minutes of the
   NSE session: the 09:15, 09:20 and 09:25 five-minute bars, or fifteen
   1-minute bars. The level to beat is the range high.
+- **The range must be whole.** The orb only triggers once every bar of the
+  range window is in: the 09:15, 09:20 and 09:25 bars for 15 minutes. Yahoo
+  sometimes leaves a bar out. With 2 of 3 present it says WAITING, "opening
+  range incomplete: 2 of 3 bars", and never triggers off a range it could not
+  see whole (a bar missing from the window can hide the real range high). If
+  the range is still incomplete at 14:30 the setup expires.
 - **Level.** A price you give, like a 20-day high from `/nse-scanner`.
+  `watchlist --setup level` takes each hit's own `level` from
+  `trader/watchlist.json` (nse-scanner writes the prior 20-day closing high on
+  every 20-day-breakout hit). A hit with no `level` (an oversold or flag hit)
+  is reported as an error for that row, saying so: pass `--level PRICE` or
+  watch it with `--setup orb`.
 - **The trigger** is the first completed bar after the range that CLOSES
   above the level. A wick above is not a trigger. A close exactly at the
   level is not above it.
@@ -73,7 +85,15 @@ and replays the day bar by bar without waiting.
   10:05). The price is its close, in rupees.
 - **Only closed bars count.** A bar is closed when the clock passes its start
   plus 5 (or 1) minutes and Yahoo has caught up to that moment (it waits a
-  minute at most). Yahoo's live tick, like 10:44:45, is never a bar.
+  minute at most). Yahoo's live tick, like 10:44:45, is never a bar, and a bar
+  still forming is never used, not even to say "it is above".
+- **The tick.** The tick printed and written is for ORDER prices
+  (`nse_common.order_tick`: the coarsest NSE tick within 10% of the price,
+  because NSE sets a stock's tick from an earlier close, not today's price).
+- **Late triggers.** The JSON carries `late_by_minutes`: 0 on a fresh trigger
+  (the trigger bar closed within one bar), otherwise how many minutes ago it
+  closed. Text output says "That was N minutes ago": a late entry is a
+  different trade, the price, the stop distance and the odds have moved.
 - **Volume, if you want it.** `--min-volume-x 1.5` also needs the trigger
   bar's volume at 1.5 times the range bars' average. Yahoo stamps the 09:15
   bar of most NSE charts with volume 0, so the average leaves zero-volume
@@ -86,8 +106,9 @@ and replays the day bar by bar without waiting.
   in ₹), triggered, expired, or no data. Before 09:00: not open yet. 09:00 to
   09:15: pre-open (the call auction makes no bars). Before 09:30: the range is
   still forming. Weekends and NSE holidays: the market is closed, with the
-  next open. A year whose holiday list is not loaded is said, and weekdays
-  count as trading days.
+  next open. A year whose holiday list is not loaded is refreshed from NSE
+  first (best effort); if that fails it is said, and weekdays count as trading
+  days.
 
 ## Steps
 
@@ -102,8 +123,9 @@ and replays the day bar by bar without waiting.
    the setup expires. Keep the computer awake while it watches: a sleeping
    laptop pauses it, and it catches up, late, when it wakes.
 4. When it triggers, say the time and the price, and that nothing was placed.
-   If the trigger is more than a bar old, say that too: a late entry is a
-   different trade.
+   If `late_by_minutes` is above 0 (the trigger is more than a bar old), say
+   that too: a late entry is a different trade, and `/nse-exit` will refuse a
+   trigger older than 30 minutes unless the user gives it a price on purpose.
 5. Hand off to `/nse-exit` to set the stop and the target BEFORE anything
    is bought. Mention Zerodha's 15:25 MIS auto square-off; the plan's
    flat-by (15:10) is set there.

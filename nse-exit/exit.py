@@ -25,19 +25,34 @@ Targets (round half up to the NSE tick for their price):
   price:X                      your price
 
 Ticks (NSE cash market since 15 Apr 2025): under 250 -> 0.01, 250-1,000 -> 0.05,
-1,000-5,000 -> 0.10, 5,000-10,000 -> 0.50, 10,000-20,000 -> 1.00, above -> 5.00
-(nse_common.tick_size; "tick_sizes" in trader/config.json overrides a symbol).
+1,000-5,000 -> 0.10, 5,000-10,000 -> 0.50, 10,000-20,000 -> 1.00, above -> 5.00.
+Every price goes on nse_common.order_tick: the coarsest tick within
+tick_band_pct (10%) of the price, because NSE sets a stock's tick from an
+earlier close, not today's price (a 999.99 stop goes to 999.90, valid on the
+0.05 and the 0.10 grid). "tick_sizes" in the config overrides a symbol.
 
 Refused, with the reason: a stop at or above the entry, a target at or below
 it, a stop too tight to survive the spread (closer than 0.05% of the price or
 three spreads, where a spread is at least one tick; --spread X gives the one
 you see in Kite's market depth), an entry.json that has not triggered (unless
-you give --entry), a short (this pack plans longs only).
+you give --entry), a trigger older than trigger_max_age_minutes (30; its
+triggered_at, else its date and time in IST: the price has probably moved, so
+give --entry PRICE, or --allow-late to plan from the old price anyway), a
+short (this pack plans longs only).
+
+Worst fill: the stop leg is an SL order whose limit sits stop_limit_buffer_pct
+under the trigger (nse_common.worst_exit_price). The max loss is measured
+there (the way nse-budget sizes and nse-risk checks), and printed next to the
+trigger numbers. Reward:risk after charges is the plan's R to the trigger, the
+same figure nse-budget and nse-risk use; the worst-fill version is shown too.
 
 Charges: Zerodha's intraday (MIS) equity rates from nse_common.intraday_charges,
-on --qty shares (default: the size your trader/config.json caps allow, the way
-nse-budget sizes it). It shows the charges a share, the reward:risk after
-charges and the break-even sell price on the tick grid.
+on --qty shares (default: nse_common.size_qty, the size nse-budget would give,
+with portfolio.json's cash and value next to the config when it exists; at
+least one share for the estimate). It shows the charges a share, the
+reward:risk after charges and the break-even sell price on the tick grid.
+plan.json carries that estimate as "quantity" (0 when your rules fit no whole
+share: nse-budget would refuse) and the worst-fill risk as "risk_per_share_worst".
 
 flat_by (default 15:10 IST, or "flat_by" in trader/config.json): out by then,
 win or lose. Zerodha squares off MIS at 15:25 and charges Rs 50 + GST an order
@@ -55,7 +70,6 @@ import argparse
 import datetime
 import gzip
 import json
-import math
 import os
 import re
 import sys
@@ -143,11 +157,12 @@ def D(x, what="a number"):
 
 
 def tick_of(price, symbol=None, cfg=None):
-    return nc.tick_size(price, symbol, cfg)
+    """The order tick for this price (nse_common.order_tick: safe near a slab edge)."""
+    return nc.order_tick(price, symbol, cfg)
 
 
 def on_grid(x, mode, symbol=None, cfg=None):
-    """x on the NSE tick grid for its own price. mode: nearest | down | up."""
+    """x on the NSE order-tick grid for its price. mode: nearest | down | up."""
     return nc.round_to_tick(D(x), tick_of(D(x), symbol, cfg), mode)
 
 
@@ -316,23 +331,50 @@ def ticks_words(x, tick):
 
 # ---------------------------------------------------------------- charges (nse_common.intraday_charges)
 
-def default_qty(entry, risk, cfg):
-    """A size for the charges estimate, from the config's caps the way nse-budget
-    sizes: max loss per trade / risk, max order, and the budget's max position.
-    nse-budget sets the real size."""
-    e, r = float(entry), float(risk)
-    caps = []
+def loss_basis(cfg):
+    """Where the max loss is measured: "limit" (the SL limit, the default) or "trigger"."""
+    return "trigger" if str((cfg or {}).get("loss_basis") or "limit").lower() == "trigger" else "limit"
+
+
+def account_files(config_path, portfolio_path=None):
+    """(cash, portfolio total, note) from the portfolio.json next to the config, holdings valued at the
+    prices.json next to it when there is one (nse_common.portfolio_total: what nse-budget and nse-risk
+    size against). (None, None, "") when there is no portfolio. An unreadable file is ignored with a note."""
+    home = os.path.dirname(config_path or "") or "."
+    pf_path = portfolio_path or os.path.join(home, "portfolio.json")
+    if not os.path.isfile(pf_path):
+        return None, None, ""
     try:
-        if cfg.get("max_loss_per_trade_inr") and r > 0:
-            caps.append(math.floor(float(cfg["max_loss_per_trade_inr"]) / r + 1e-9))
-        if cfg.get("max_order_inr"):
-            caps.append(math.floor(float(cfg["max_order_inr"]) / e + 1e-9))
-        if cfg.get("budget") and cfg.get("max_position_pct"):
-            caps.append(math.floor(float(cfg["budget"]) * float(cfg["max_position_pct"]) / 100.0 / e + 1e-9))
-    except (TypeError, ValueError):
-        raise PlanError("trader/config.json has a non-number in budget, max_position_pct, max_order_inr or "
-                        "max_loss_per_trade_inr")
-    return max(1, min(caps)) if caps else 1
+        pf = nc.read_json(pf_path)
+        prices = {}
+        pp = os.path.join(home, "prices.json")
+        if os.path.isfile(pp):
+            doc = nc.read_json(pp) or {}
+            prices = {nc.nse_symbol(k): v for k, v in (doc.get("prices") or {}).items()}
+        total = nc.portfolio_total(pf, prices)
+        if total is None:
+            raise ValueError("no \"cash\" number")
+        return float(pf["cash"]), total, ""
+    except (ValueError, TypeError, AttributeError, OSError) as e:
+        return None, None, "%s could not be read (%s): the share estimate ignores it." % (pf_path, e)
+
+
+def estimate_qty(c, symbol, cfg, cash=None, total=None):
+    """Whole shares your rules allow for this plan (nse_common.size_qty, the same arithmetic as
+    nse-budget and nse-timemachine). May be 0."""
+    try:
+        return nc.size_qty(c["entry"], c["stop"], symbol, cfg, cash=cash, portfolio_total=total)
+    except (TypeError, ValueError, InvalidOperation):
+        raise PlanError("the config has a non-number in budget, cash_buffer_pct, max_position_pct, max_order_inr "
+                        "or max_loss_per_trade_inr")
+
+
+def no_size_note(c, symbol, cfg, cash=None, total=None):
+    """Why your rules fit no whole share of this plan, for a warning."""
+    lim = nc.size_limits(c["entry"], c["stop"], symbol, cfg, cash=cash, portfolio_total=total)
+    worst = min(lim, key=lambda l: l["shares"])
+    return ("Your rules fit no whole share of this plan (the %s limit allows %d: %s). nse-budget will refuse it: "
+            "plan a closer stop, or change the rule." % (worst["name"], worst["shares"], worst["how"]))
 
 
 def break_even(qty, entry, symbol=None, cfg=None):
@@ -352,7 +394,8 @@ def break_even(qty, entry, symbol=None, cfg=None):
 
 
 def charges_for(c, qty, qty_source, symbol=None, cfg=None):
-    """What the round trip costs at the stop and at the target, on qty shares."""
+    """What the round trip costs at the stop and at the target, on qty shares, and the loss at the
+    worst fill of the stop leg (its SL limit; the trigger with "loss_basis": "trigger")."""
     if qty < 1:
         raise PlanError("--qty must be 1 or more")
     e, s, t = c["entry"], c["stop"], c["target"]
@@ -363,14 +406,21 @@ def charges_for(c, qty, qty_source, symbol=None, cfg=None):
     win = q * (t - e) - nc.dec(ct["total"])
     rr_net = (win / lose).quantize(CENT, rounding=ROUND_HALF_UP)
     be = break_even(qty, e, symbol, cfg)
+    lw = nc.loss_at_stop(qty, e, s, symbol, cfg)
+    lose_worst = lw["gross"] + lw["charges"]
+    rr_worst = (win / lose_worst).quantize(CENT, rounding=ROUND_HALF_UP) if lose_worst > 0 else rr_net
     return {"quantity": int(qty), "quantity_from": qty_source,
             "at_stop": cs["total"], "at_target": ct["total"],
             "per_share_at_stop": float((nc.dec(cs["total"]) / q).quantize(CENT, rounding=ROUND_HALF_UP)),
             "per_share_at_target": float((nc.dec(ct["total"]) / q).quantize(CENT, rounding=ROUND_HALF_UP)),
             "max_loss": float(q * (e - s)), "max_loss_with_charges": float(lose),
-            "reward_risk_after_charges": float(rr_net), "break_even": float(be),
+            "worst_exit": float(lw["exit_price"]), "loss_basis": loss_basis(cfg),
+            "risk_per_share_worst": float(lw["per_share"]), "max_loss_worst": float(lw["gross"]),
+            "charges_at_worst": float(lw["charges"]), "max_loss_worst_with_charges": float(lose_worst),
+            "reward_risk_after_charges": float(rr_net), "reward_risk_after_charges_worst": float(rr_worst),
+            "break_even": float(be),
             "lines_at_target": {k: v for k, v in ct.items() if k not in ("total", "turnover")},
-            "rates": "Zerodha intraday equity (nse_common.intraday_charges); \"charges\" in trader/config.json overrides"}
+            "rates": "Zerodha intraday equity (nse_common.intraday_charges); \"charges\" in the config overrides"}
 
 
 # ---------------------------------------------------------------- bars for ATR (Yahoo .NS)
@@ -575,8 +625,64 @@ def resolve_flat_by(day, explicit, cfg, entry_time, holidays=None):
     return hm(t), note
 
 
-def gather(a):
-    """The entry facts, from trader/entry.json or the flags."""
+def age_words(minutes):
+    m = float(minutes)
+    if m < 120:
+        return "%d minute%s" % (int(m), "" if int(m) == 1 else "s")
+    if m < 48 * 60:
+        return "%.1f hours" % (m / 60.0)
+    return "%d days" % int(m / 1440)
+
+
+def trigger_time(doc):
+    """When entry.json's trigger happened, naive UTC: its triggered_at (UTC, the trigger bar's close), else its
+    date and time read as IST. None when neither is there or readable."""
+    when = doc.get("triggered_at")
+    if when:
+        try:
+            return nc.parse_now(str(when))
+        except ValueError:
+            pass
+    if doc.get("date") and doc.get("time"):
+        try:
+            day = datetime.date.fromisoformat(str(doc["date"]))
+            return nc.to_utc(datetime.datetime.combine(day, parse_clock(doc["time"], "the entry time")))
+        except (ValueError, PlanError):
+            pass
+    return None
+
+
+def check_trigger_age(doc, path, now_utc, cfg, allow_late):
+    """A trigger older than trigger_max_age_minutes is not planned from: the price has moved since, and a
+    plan built on the old price sizes and stops the wrong trade. Returns a note when --allow-late let an old
+    one through (else ""); raises PlanError when it is too old, or cannot be dated, and nothing overrides it."""
+    v = cfg.get("trigger_max_age_minutes")
+    limit = 30.0 if v is None else float(v)
+    sym = doc.get("symbol") or "the stock"
+    when = trigger_time(doc)
+    how = ("Give --entry PRICE to plan from the price now, or --allow-late to plan from the old trigger price "
+           "anyway (the price has probably moved).")
+    if when is None:
+        if allow_late:
+            return "%s does not say when %s triggered, so its age is unknown: planned from it because of --allow-late." % (path, sym)
+        raise PlanError("%s does not say when %s triggered (no triggered_at, and no date and time), so it may be "
+                        "old. %s" % (path, sym, how))
+    age = (now_utc - when).total_seconds() / 60.0
+    if age <= limit:
+        return ""
+    ist = nc.to_ist(when)
+    text = ("the %s trigger is %s old (it fired at %s IST on %s; the limit is %s minutes, \"trigger_max_age_minutes\")"
+            % (sym, age_words(age), ist.strftime("%H:%M"), ist.date().isoformat(), "%g" % limit))
+    if allow_late:
+        return "Planned from a trigger that is %s old (fired %s IST on %s) because of --allow-late: the price has probably moved." % (
+            age_words(age), ist.strftime("%H:%M"), ist.date().isoformat())
+    raise PlanError("%s: %s. %s" % (path, text, how))
+
+
+def gather(a, now_utc=None, cfg=None):
+    """The entry facts, from trader/entry.json or the flags. Returns (info, note); the note is a warning to
+    print ("" when there is none)."""
+    note = ""
     if a.symbol and a.from_path:
         raise PlanError("use --from or --symbol, not both")
     if a.side in ("sell", "short"):
@@ -591,7 +697,7 @@ def gather(a):
                 "date": a.date, "entry_time": a.time, "entry_bar": a.entry_bar, "interval": a.interval or "5m",
                 "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags"}
     else:
-        path = a.from_path or os.path.join("trader", "entry.json")
+        path = a.from_path or nc.tpath("entry.json")
         doc = read_json(path, "entry (run /nse-entry first, or give --symbol and --entry)")
         if not isinstance(doc, dict):
             raise PlanError("%s is not an entry" % path)
@@ -600,6 +706,8 @@ def gather(a):
         if doc.get("status") != "triggered" and a.entry is None:
             raise PlanError("%s says %s is %s, not triggered: plan once it triggers, or give --entry PRICE to plan ahead"
                             % (path, doc.get("symbol"), doc.get("status") or "unknown"))
+        if a.entry is None:         # the trigger's price is the entry: it must be recent. --entry PRICE is the user's own.
+            note = check_trigger_age(doc, path, now_utc or nc.utc_now(), cfg or {}, a.allow_late)
         orr = doc.get("opening_range") or {}
         info = {"symbol": nc.nse_symbol(doc.get("symbol") or ""),
                 "entry": a.entry if a.entry is not None else doc.get("price"),
@@ -616,12 +724,12 @@ def gather(a):
         raise PlanError("%r is not an NSE symbol (bare, like RELIANCE or M&M)" % info["symbol"])
     if info["interval"] not in INTERVALS:
         raise PlanError("interval is 5m or 1m")
-    return info
+    return info, note
 
 
 def build_plan(a, now_utc):
-    info = gather(a)
     cfg = read_config(a.config)
+    info, late_note = gather(a, now_utc, cfg)
     holidays, years = nc.load_holidays(cfg, state_dir_for(a.config))
     sym = info["symbol"]
     stop_text = a.stop
@@ -668,9 +776,24 @@ def build_plan(a, now_utc):
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
-    qty, qsrc = (a.qty, "--qty") if a.qty else (default_qty(c["entry"], c["risk"], cfg), "config caps")
-    charges = charges_for(c, qty, qsrc, sym, cfg)
+    cash, total, acct_note = account_files(a.config, a.portfolio)
+    if a.qty:
+        est, qsrc = a.qty, "--qty"
+    else:
+        est, qsrc = estimate_qty(c, sym, cfg, cash, total), "config caps"
+    charges = charges_for(c, max(1, est), qsrc, sym, cfg)
+    worst_exit = nc.worst_exit_price(c["stop"], sym, cfg)
+    plan["quantity"] = int(est)
+    plan["quantity_from"] = qsrc
+    plan["risk_per_share_worst"] = float(c["entry"] - worst_exit)
+    plan["worst_exit"] = float(worst_exit)
     warnings = []
+    if late_note:
+        warnings.append(late_note)
+    if acct_note:
+        warnings.append(acct_note)
+    if est < 1 and not a.qty:
+        warnings.append(no_size_note(c, sym, cfg, cash, total))
     if abs(float(D(info["entry"])) - float(c["entry"])) > 1e-6:
         warnings.append("The entry %s is off the ₹%s tick: planned at %s." % (
             money_raw(info["entry"]), tick_text(c["tick"]), money(c["entry"])))
@@ -727,6 +850,17 @@ def describe(plan, charges=None):
     out.append(rr)
     if charges:
         n = charges["quantity"]
+        if charges["loss_basis"] == "trigger":
+            out.append("  Worst fill    the stop trigger %s (\"loss_basis\": \"trigger\": a gap below it can lose more): "
+                       "%s on %d share%s with charges" % (money(charges["worst_exit"]),
+                                                          money(charges["max_loss_worst_with_charges"]), n,
+                                                          "" if n == 1 else "s"))
+        else:
+            out.append("  Worst fill    the SL limit %s, %s a share under the entry: %s on %d share%s with charges "
+                       "(reward:risk %s after charges if it fills there)" % (
+                           money(charges["worst_exit"]), money(charges["risk_per_share_worst"]),
+                           money(charges["max_loss_worst_with_charges"]), n, "" if n == 1 else "s",
+                           ratio(charges["reward_risk_after_charges_worst"])))
         out.append("  Charges       about %s a share at the target, %s at the stop (%s and %s a round trip on %d "
                    "share%s, Zerodha intraday rates)" % (
                        money(charges["per_share_at_target"]), money(charges["per_share_at_stop"]),
@@ -777,8 +911,17 @@ def cmd_show(a):
     full = dict({"setup": "orb", "interval": "5m", "stop_label": "", "target_label": ""}, **plan)
     c = {"entry": D(plan["entry"]), "stop": D(plan["stop"]), "target": D(plan["target"])}
     risk = c["entry"] - c["stop"]
-    qty, qsrc = (a.qty, "--qty") if a.qty else (default_qty(c["entry"], risk, cfg), "config caps")
-    charges = charges_for(c, qty, qsrc, plan["symbol"], cfg) if risk > 0 and c["target"] > c["entry"] else None
+    charges = None
+    if risk > 0 and c["target"] > c["entry"]:
+        pq = plan.get("quantity")
+        if a.qty:
+            qty, qsrc = a.qty, "--qty"
+        elif isinstance(pq, int) and not isinstance(pq, bool) and pq >= 1:
+            qty, qsrc = pq, plan.get("quantity_from") or "config caps"
+        else:
+            cash, total, _ = account_files(a.config, a.portfolio)
+            qty, qsrc = max(1, estimate_qty(c, plan["symbol"], cfg, cash, total)), "config caps"
+        charges = charges_for(c, qty, qsrc, plan["symbol"], cfg)
     for line in describe(full, charges):
         print(line)
     today = nc.to_ist(parse_now(a.now)).date().isoformat()
@@ -792,7 +935,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Exit Planner (nse-exit): the stop and target before the entry, NSE.")
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("plan", help="set the stop and target")
-    p.add_argument("--from", dest="from_path", metavar="PATH", help="entry.json to plan from (default trader/entry.json)")
+    p.add_argument("--from", dest="from_path", metavar="PATH",
+                   help="entry.json to plan from (default: entry.json in the trader folder)")
     p.add_argument("--symbol", help="NSE symbol, e.g. RELIANCE")
     p.add_argument("--entry", type=float, help="entry price (or a plan-ahead price with --from)")
     p.add_argument("--or-high", type=float)
@@ -808,16 +952,21 @@ def main(argv=None):
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM IST (default: config flat_by, 15:10)")
     p.add_argument("--spread", type=float, help="the bid-ask spread in rupees (Kite market depth); default one tick")
-    p.add_argument("--qty", type=int, help="shares for the charges estimate (default: your config's caps)")
-    p.add_argument("--config", default=os.path.join("trader", "config.json"))
+    p.add_argument("--qty", type=int, help="shares for the charges estimate (default: what your rules allow, "
+                                           "nse_common.size_qty)")
+    p.add_argument("--allow-late", action="store_true",
+                   help="plan from an entry.json trigger older than trigger_max_age_minutes (the price has probably moved)")
+    p.add_argument("--portfolio", help="portfolio.json for the share estimate (default: the one next to the config)")
+    p.add_argument("--config", default=nc.tpath("config.json"), help="your rules (default trader/config.json)")
     p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
     p.add_argument("--now", help='pretend it is this IST time, e.g. "2026-11-13 10:05"')
-    p.add_argument("--write", nargs="?", const=os.path.join("trader", "plan.json"), metavar="PATH",
+    p.add_argument("--write", nargs="?", const=nc.tpath("plan.json"), metavar="PATH",
                    help="save the plan (default trader/plan.json)")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("show", help="print the current plan")
-    p.add_argument("--plan", default=os.path.join("trader", "plan.json"))
-    p.add_argument("--config", default=os.path.join("trader", "config.json"))
+    p.add_argument("--plan", default=nc.tpath("plan.json"))
+    p.add_argument("--config", default=nc.tpath("config.json"))
+    p.add_argument("--portfolio", help="portfolio.json for the share estimate (default: the one next to the config)")
     p.add_argument("--qty", type=int)
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")

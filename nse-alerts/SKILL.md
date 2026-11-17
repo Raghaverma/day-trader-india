@@ -2,21 +2,15 @@
 name: nse-alerts
 description: >-
   Price Alerts and the NSE clock. Rings when a price, a stop or the 09:15
-  opening bell hits on the National Stock Exchange. Turns the trade plan into
-  three alerts in one go (the stop, the target and flat-by 15:10 IST), plus
-  above / below / stop / target levels in rupees, percent moves from the
-  previous close, any time of day, and the opening bell, each ringing once so
-  you are not spammed. The target alert says what Zerodha Kite needs (no OCO
-  for MIS: cancel the stop, then sell). Knows NSE hours (pre-open 09:00,
-  normal market 09:15 to 15:30 IST), weekends and NSE trading holidays by
-  name, refreshes the holiday list from NSE's holiday-master, fetches free
-  delayed quotes from Yahoo (.NS) one symbol at a time, and writes
-  trader/prices.json for sizing and the risk check. Use when the user says
-  "alert me when RELIANCE hits", "watch my stop", "watch my trade", "remind
-  me to square off by 15:10", "is the NSE open", "is the market open
-  today", "when does Nifty open", "is it a market holiday", "NSE holidays",
-  "get me a price in rupees", or right after /nse-exit writes a plan.
-argument-hint: "[clock | holidays [--refresh] | quote SYMBOL | add --from-plan | check]"
+  opening bell hits on NSE. Turns the trade plan into a stop, a target and a
+  flat-by 15:10 alert, and catches a spike through a level between two checks.
+  Each rings once. The target alert says what Kite needs (no OCO for MIS:
+  cancel the stop, then sell). Knows NSE holidays, writes Yahoo .NS quotes to
+  trader/prices.json. Use when the user says "alert me when RELIANCE
+  hits", "watch my stop", "watch my trade", "square off by 15:10", "is the NSE
+  open", "NSE holidays", "get me a price", or right after /nse-exit writes a
+  plan.
+argument-hint: "[clock | holidays [--refresh [--if-stale]] | quote SYMBOL --write | add --from-plan | check]"
 ---
 
 # nse-alerts
@@ -38,6 +32,7 @@ for that one order.
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NSE open, pre-open or closed; next open; holidays
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" holidays                       # this year's NSE trading holidays, with names
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" holidays --refresh             # NSE holiday-master -> trader/state/nse-holidays.json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" holidays --refresh --if-stale  # only when the list is stale; silent when fresh
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" holidays --year 2027
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat-by 15:10 from trader/plan.json
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --opening-bell             # 09:15 IST each trading day
@@ -46,7 +41,7 @@ python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol RELIANCE --target 1344.40
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --at 15:10 --label "flat by" --before-close
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol INFY --pct 3
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" check                          # exit 0 = something rang
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote RELIANCE TCS --write     # -> trader/prices.json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote RELIANCE --write         # -> trader/prices.json (right before nse-risk)
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --holdings --write       # portfolio + plan symbols
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" list
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset reliance-plan-stop
@@ -55,6 +50,12 @@ python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset reliance-plan-stop
 `--now "2026-11-13 15:10"` pins the clock (IST); `--offline DIR` reads saved
 quote files (`yahoo-RELIANCE.json`) instead of the network.
 
+Every file lives in the trader folder, the same one for all the skills: `$NSE_TRADER_HOME` if set,
+else the nearest `trader/` folder with a `config.json` above where Claude Code was started, else
+`~/.day-trader-india`, else `./trader`. Each run says which `config.json` it used, or that none was
+found at that path and the built-in defaults are in use (this skill does not guard money, so it
+runs without one).
+
 ## What it reads and writes
 
 | file | what |
@@ -62,20 +63,33 @@ quote files (`yahoo-RELIANCE.json`) instead of the network.
 | `trader/plan.json` | the trade from nse-exit, for `add --from-plan` |
 | `trader/config.json` | `flat_by` when the plan has none, `special_sessions` (Muhurat trading), `extra_holidays` |
 | `trader/alerts.json` | the rules (`alerts.example.json` in this folder) |
-| `trader/state/alerts.json` | which rules rang and when, so each rings once |
+| `trader/state/alerts.json` | which rules rang and when, so each rings once (`rung`); when each rule started to count (`armed`); when each symbol was last quoted (`quoted`, `last_check`), so the next check knows which bars are new |
 | `trader/state/nse-holidays.json` | written by `holidays --refresh`: `{"fetched_at", "source", "holidays": {date: name}, "years": [...]}`; every skill reads it through `nse_common.load_holidays` |
-| `trader/prices.json` | the latest quotes in rupees, merged in, for nse-budget and nse-risk |
+| `trader/prices.json` | the latest quotes in rupees, merged in, for nse-budget and nse-risk: `prices[SYM]` and `detail[SYM]` with `time` (when the last trade was struck, UTC), `fetched` (when this tool read it), `prev_close`, `source` |
 | `trader/portfolio.json` | the symbols held, for `quote --holdings` |
 
 ## Rule types
 
 | type | rings when | rings again |
 | --- | --- | --- |
-| `above` / `target` | price at or above `price`; a `target` adds "cancel the stop, then sell" | after `reset`, or on its own if `"rearm": true` and the price fell back |
-| `below` / `stop` | price at or below `price` | same |
+| `above` / `target` | price at or above `price`, or a completed 5-minute bar's high since the previous check reached it; a `target` adds "cancel the stop, then sell" | after `reset`, or on its own if `"rearm": true` and the price fell back |
+| `below` / `stop` | price at or below `price`, or a completed 5-minute bar's low since the previous check reached it | same |
 | `pct_move` | moved `pct` percent from the previous close (or `ref`), optional `direction` up or down | once per day at most |
 | `time` | the IST clock passed `at` ("15:10") on a trading day | once per trading day |
 | `opening_bell` | the NSE normal market is open (09:15 IST) | once per trading day |
+
+**Spikes between two checks.** A check used to compare only the last price, so a spike through the
+target between two checks (up, then back down) never rang, and in Kite mode the target alert is the
+only take-profit. Now a check also reads the 5-minute bars it already downloads: an above / target
+rule rings when a completed bar's high since the previous check reached the level, a below / stop
+rule when a bar's low did. The message says so ("RELIANCE traded at ₹1,347.90 in the 10:10 IST
+5-minute bar (bar high, not the last price) ... The last price is ₹1,339.70: check the live quote")
+and the ring in `--json` carries `"source": "bar"` and the bar's start time. Rules for this: a bar
+counts only once it has ended (a forming bar is never used); only bars that ended after the
+symbol's previous quote (`quoted`) and started after the rule was added or re-armed (`armed`)
+count, so a morning low from before the trade never rings its stop; the first check after a rule is
+added looks back only to the moment it was added (`add` stamps it), and a rule with no stamp starts
+counting at the check that first sees it. A rule rings once either way.
 
 A rule with `"date"` is watched on that IST date only; `--from-plan` rules
 carry the plan's date, so yesterday's stop never rings today. A `time` rule
@@ -90,13 +104,20 @@ session's close.
   daylight saving, so the tool needs no time-zone files.
 - **Holidays.** The 2026 capital-market list is built in, with names (24 Nov
   2026 is Prakash Gurpurb Sri Guru Nanak Dev). `clock` names the next ones.
-  NSE publishes the next year's list around December: `holidays --refresh`
-  fetches `https://www.nseindia.com/api/holiday-master?type=trading` (segment
-  CM; on a 401 or 403 it visits nseindia.com once for cookies and asks again)
-  and merges it into `trader/state/nse-holidays.json`. A year with no list is
-  said plainly, and weekdays then count as trading days. `extra_holidays` in
-  the config adds dates by hand; a year counts as known only once NSE's list
-  is cached or the config names it in `holiday_years`.
+  NSE publishes the next year's list around December. `clock` and `holidays`
+  refresh the list on their own when it is stale (the year is not loaded, next
+  year's list is missing in December, or the cache is older than
+  `holiday_refresh_days`, 30), best effort: a failed refresh is one line, never
+  an error. `holidays --refresh --if-stale` does only that: silent when the list
+  is fresh, one line when it refreshed or could not, always exit 0, so it can
+  run at the start of every day. `holidays --refresh` always fetches
+  `https://www.nseindia.com/api/holiday-master?type=trading` (segment CM; on a
+  401 or 403 it visits nseindia.com once for cookies and asks again) and merges
+  it into `trader/state/nse-holidays.json` (the work is done by
+  `nse_common.fetch_holiday_master` and `update_holiday_cache`). A year with no
+  list is said plainly, and weekdays then count as trading days.
+  `extra_holidays` in the config adds dates by hand; a year counts as known
+  only once NSE's list is cached or the config names it in `holiday_years`.
 - **Special sessions.** Muhurat trading and other one-off sessions come from
   `special_sessions` in the config.
 - **Square-off.** Zerodha squares off MIS at 15:25 and charges ₹50 + GST an
@@ -122,9 +143,15 @@ session's close.
    three alerts back to the user: the stop, the target and the flat-by time.
 2. Run `check` while the trade is open: every few minutes from a Claude
    scheduled task or `/loop`. Each run fetches only the symbols in today's
-   rules and rings each alert once. A check reads the latest delayed quote;
-   it is not a live feed, and a price can pass a level between two checks.
-3. Tell the user what rang in one line each. A stop alert means the SL sell
+   rules and rings each alert once. A check reads the latest delayed quote and
+   the 5-minute bars since the previous check, so a spike through the stop or
+   the target between two checks still rings; it is not a live feed.
+3. Immediately before nse-risk, run `alerts.py quote SYMBOL --write`
+   (`SYMBOL` is the order's symbol). nse-risk now blocks an entry whose
+   quote in `trader/prices.json` is more than 5 minutes old (or missing), and
+   the quote time is `detail[SYMBOL].time`; `check` refreshes it too, but a
+   check is not guaranteed to have run in the last 5 minutes.
+4. Tell the user what rang in one line each. A stop alert means the SL sell
    has probably triggered: check the order book and record the fill with
    nse-broker. A target alert means: cancel the stop, then sell. "Flat by"
    means close anything still open: nse-broker `flatten`, then nse-risk,

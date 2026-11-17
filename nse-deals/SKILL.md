@@ -1,18 +1,14 @@
 ---
 name: nse-deals
 description: >-
-  The Big-Money Tracker for NSE. Reads NSE's bulk deal and block deal files
-  every evening (who bought or sold a large chunk of an Indian stock that day,
-  by name, with quantity and price), keeps the history NSE's daily file does
-  not, and alerts once per new deal. Filters by symbol, client name (a
-  follow list such as "HDFC Mutual Fund" or "Societe Generale"), buy or sell
-  and a minimum value in ₹ crore; guesses the client type (mutual fund,
-  insurance, bank, foreign fund) from the name; hides same-day round trips;
-  flags deals in stocks you hold or watch. Use when the user says "any bulk
-  deals today", "who bought MEESHO", "block deals on NSE", "what are mutual
-  funds buying", "did any FII buy", "track big money", "follow Societe
-  Generale's deals", "alert me on block deals in my stocks", or "run the
-  deals skill".
+  Big-Money Tracker for NSE. Reads NSE's bulk and block deal files every
+  evening (who bought or sold a large chunk of a stock, by name, quantity and
+  price), keeps the history NSE's file does not, and alerts once per new deal.
+  Filters by symbol, client (a follow list like "HDFC Mutual Fund"), side and
+  minimum ₹ crore; flags your stocks; says when a file could not be read. Use
+  when the user says "any bulk deals today", "who bought MEESHO", "block deals
+  on NSE", "what are mutual funds buying", "did any FII buy", "track big
+  money", "follow Societe Generale's deals", or "run the deals skill".
 argument-hint: "[show|new|history] [--symbol SYM] [--client NAME] [--min-value 25cr]"
 ---
 
@@ -74,7 +70,16 @@ it once, as the block deal, and says it was also a bulk deal.
 - Reads `trader/portfolio.json` (nse-broker) and `trader/watchlist.json`
   (nse-scanner) to flag deals in your stocks, and `trader/config.json` for
   `"follow_clients": ["hdfc mutual fund", "societe generale"]` (name
-  substrings) and `"deals_min_value_inr"` (default ₹1 crore).
+  substrings) and `"deals_min_value_inr"` (default ₹1 crore). The config is
+  optional: one line on stderr says which file was used, or that the built-in
+  defaults are (no follow list, ₹1 crore), so a config that was not found is
+  never a silent difference. A portfolio or watchlist that is there but
+  broken is a `note:` line, not an empty "your stocks".
+- `trader/` is the one trader folder `nse_common` finds (`$NSE_TRADER_HOME`,
+  else the nearest `trader/` with a `config.json` above the working folder,
+  else `~/.day-trader-india`), so state and config are the same wherever Claude
+  Code was started. The check that the files are the latest session's uses
+  NSE's holiday list, refreshed when it is stale (best effort).
 
 ## The rules
 
@@ -89,6 +94,14 @@ it once, as the block deal, and says it was also a bulk deal.
 - **Round trips are not positions.** A client who bought and sold the same
   stock the same day (most high-frequency firms in the bulk file) is hidden
   by default; `--round-trips` shows them.
+- **A file that failed is not "no deals".** An empty body, a web page, the
+  wrong columns or rows none of which parse make that file fail: the header
+  says `INCOMPLETE: block.csv could not be read, so this covers bulk deals
+  only.`, `(block.csv NOT READ, 136 bulk)` replaces "0 block", and a `note:`
+  gives the reason. Rows that do not parse among good ones are counted in a
+  note. Say it to the user: "no block deals" is only true when block.csv was
+  read. A day with only NSE's "NO RECORDS" row, or only the header, is a real
+  empty day.
 - **A deal is history, not a signal.** It says what someone did yesterday,
   not what they or anyone will do next. No return claims.
 
@@ -114,10 +127,16 @@ python3 "${CLAUDE_SKILL_DIR}/deals.py" new
 python3 "${CLAUDE_SKILL_DIR}/deals.py" new --client "mutual fund" --min-value 10cr
 ```
 
-Shows only deals that have not alerted before, then records them. Exit code
-1 means nothing new. NSE posts the files in the evening, so one run a day
-after 18:00 IST on trading days is plenty: `/loop` or a scheduled task. A
-note says when the files are older than the last session.
+Shows only deals that have not alerted before, then records them. NSE posts
+the files in the evening, so one run a day after 18:00 IST on trading days is
+plenty: `/loop` or a scheduled task. A note says when the files are older than
+the last session. The header says "since 2026-11-14 10:00 IST", the last
+check in IST; when a file could not be read the check does not move that time
+forward.
+
+Exit codes: 0 deals shown, 1 nothing matched (every file was read), 2 usage,
+or no file could be read at all, 3 nothing shown and one file could not be
+read (the output says which: treat it as "not checked", not "nothing new").
 
 ## Step 3: the history
 

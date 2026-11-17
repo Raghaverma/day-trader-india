@@ -16,6 +16,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 from _load import load, FIX, ROOT
 
@@ -234,9 +235,9 @@ class WorkedExample(unittest.TestCase):
         gap, share, even = tm.lean(self.doc["mc"])
         self.assertEqual((round(share, 3), round(even, 3)), (0.246, 0.333))
         self.assertEqual(self.doc["verdict_notes"], [
-            "After charges on 56 shares (₹73.87 a round trip at the target, ₹73.62 at the stop): +1.75R at the "
-            "target, -1.25R at the stop, so the target has to come first in 42 % of the replays that hit one side; "
-            "it did in 25 %. Average R after charges -0.452."])
+            "After charges on 37 shares (₹52.71 a round trip at the target, ₹52.33 at the stop): +1.73R at the "
+            "target, -1.27R at the stop, so the target has to come first in 42 % of the replays that hit one side; "
+            "it did in 25 %. Average R after charges -0.471."])
 
     def test_bands_start_at_the_entry(self):
         m = self.doc["mc"]
@@ -263,9 +264,9 @@ class WorkedExample(unittest.TestCase):
                      "target first   22.6 %", "stop first     69.1 %", "neither        8.3 %    still open at 15:10",
                      "green          28.8 %", "median ₹1,331.84, 90 % of replays between ₹1,314.07 and "
                      "₹1,350.33", "Average R: -0.199",
-                     "After charges on 56 shares (sized from your config's caps): average R -0.452, green 27.7 %",
-                     "₹73.87 at the target (0.25R) and ₹73.62 at the stop (0.25R)",
-                     "fired 31 times: 7 target, 15 stop, 9 neither. Average R -0.030, -0.280 after charges.",
+                     "After charges on 37 shares (sized from your config's caps): average R -0.471, green 27.7 %",
+                     "₹52.71 at the target (0.27R) and ₹52.33 at the stop (0.27R)",
+                     "fired 31 times: 7 target, 15 stop, 9 neither. Average R -0.030, -0.289 after charges.",
                      "Left out 1 session(s) with a gap before 15:10: 2026-10-15.", "not a prediction", "--seed 19"):
             self.assertIn(line, text)
         for word in ("profit", "P&L", "guarantee", "$", "dollar", "New York", " ET"):
@@ -279,38 +280,43 @@ class Charges(unittest.TestCase):
 
     def test_charges_in_the_replays(self):
         m = self.doc["mc"]
-        self.assertEqual((m["qty"], m["qty_from"]), (56, "config caps"))   # 75% of the ₹1,00,000 default budget
-        self.assertEqual(m["charges_at_target"], nc.intraday_charges(56, 1334.0, 1344.4)["total"])
-        self.assertEqual(m["charges_at_target"], 73.87)
-        self.assertEqual(m["charges_at_stop"], nc.intraday_charges(56, 1334.0, 1328.8)["total"])
-        self.assertEqual(m["charges_at_stop"], 73.62)
-        self.assertEqual(m["r_at_target_net"], round(2.0 - 73.87 / (56 * 5.2), 4))
-        self.assertEqual(m["r_at_stop_net"], round(-1.0 - 73.62 / (56 * 5.2), 4))
-        self.assertEqual((m["avg_R_net"], m["p_green_net"]), (-0.452, 0.2772))
+        # the shared nc.size_qty on the default rules: the max loss at the SL limit decides, 37 shares (the old
+        # private caps maths said 56, the position cap, and ignored the stop leg's limit)
+        self.assertEqual((m["qty"], m["qty_from"]), (37, "config caps"))
+        self.assertEqual(m["qty"], nc.size_qty(1334.0, 1328.8, "RELIANCE", dict(nc.DEFAULT_CONFIG)))
+        self.assertEqual(m["charges_at_target"], nc.intraday_charges(37, 1334.0, 1344.4)["total"])
+        self.assertEqual(m["charges_at_target"], 52.71)
+        self.assertEqual(m["charges_at_stop"], nc.intraday_charges(37, 1334.0, 1328.8)["total"])
+        self.assertEqual(m["charges_at_stop"], 52.33)
+        self.assertEqual(m["r_at_target_net"], round(2.0 - 52.71 / (37 * 5.2), 4))
+        self.assertEqual(m["r_at_stop_net"], round(-1.0 - 52.33 / (37 * 5.2), 4))
+        self.assertEqual((m["avg_R_net"], m["p_green_net"]), (-0.471, 0.277))
         self.assertLess(m["avg_R_net"], m["avg_R"])
         self.assertLessEqual(m["p_green_net"], m["p_green"])
 
     def test_charges_in_the_history(self):
         h = self.doc["history"]
-        self.assertEqual((h["qty"], h["avg_R_net"], h["green_net"]), (56, -0.28, 11))
+        self.assertEqual((h["qty"], h["avg_R_net"], h["green_net"]), (37, -0.289, 11))
         for t in h["trades"]:
             risk = t["entry"] - t["stop"]
-            self.assertAlmostEqual(t["R_net"], round(t["R"] - t["charges"] / (56 * risk), 2), places=1)
+            self.assertAlmostEqual(t["R_net"], round(t["R"] - t["charges"] / (37 * risk), 2), places=1)
             if t["outcome"] == "target":
-                self.assertEqual(t["charges"], nc.intraday_charges(56, t["entry"], t["target"])["total"])
+                self.assertEqual(t["charges"], nc.intraday_charges(37, t["entry"], t["target"])["total"])
             if t["outcome"] == "stop":
-                self.assertEqual(t["charges"], nc.intraday_charges(56, t["entry"], t["stop"])["total"])
+                self.assertEqual(t["charges"], nc.intraday_charges(37, t["entry"], t["stop"])["total"])
         last = h["trades"][-1]
         self.assertEqual((last["date"], last["outcome"], last["charges"], last["R_net"]),
-                         ("2026-11-12", "stop", 73.76, -1.22))
+                         ("2026-11-12", "stop", 52.61, -1.24))
 
     def test_charges_never_change_the_gross_odds(self):
         a = machine(replays=500)["mc"]
-        b = machine(replays=500, qty=1)["mc"]
+        b = machine(replays=500, qty=200)["mc"]
         for k in ("p_target", "p_stop", "p_neither", "p_green", "avg_R", "median_close"):
             self.assertEqual(a[k], b[k], k)
-        self.assertEqual((b["qty"], b["qty_from"], b["charges_at_target"]), (1, "--qty", 1.42))
-        self.assertLess(b["avg_R_net"], a["avg_R_net"])           # one share pays percent brokerage
+        self.assertEqual((b["qty"], b["qty_from"], b["charges_at_target"]), (200, "--qty", 142.46))
+        self.assertGreater(b["avg_R_net"], a["avg_R_net"])        # 200 shares hit Zerodha's ₹20 brokerage cap
+        one = machine(replays=500, qty=1)["mc"]
+        self.assertEqual((one["qty"], one["charges_at_target"]), (1, 1.42))
 
     def test_the_plans_quantity_and_the_config(self):
         m = machine(plan(quantity=100), replays=300)["mc"]
@@ -321,6 +327,23 @@ class Charges(unittest.TestCase):
         self.assertEqual((free["charges_at_target"], free["avg_R_net"]), (0.0, free["avg_R"]))
         with self.assertRaises(tm.TMError):
             machine(replays=10, qty=0)
+
+    def test_the_size_is_the_shared_size_qty_not_a_private_caps_maths(self):
+        # item 19: exit, timemachine and nse-budget all ask nc.size_qty
+        self.assertFalse(hasattr(tm, "default_qty"))
+        p = plan()
+        cfg = dict(nc.DEFAULT_CONFIG)
+        self.assertEqual(tm.estimate_qty(p, cfg), nc.size_qty(1334.0, 1328.8, "RELIANCE", cfg))
+        self.assertEqual(tm.estimate_qty(p, cfg), 37)
+        # the old private maths (500 / 5.20, the max order, the position cap) said 56
+        self.assertEqual(tm.estimate_qty(p, dict(cfg, loss_basis="trigger")), 56)
+        # a real account of 20,000 in portfolio.json: the position cap shrinks to 75% of it, 11 shares
+        m = machine(replays=100, cash=20000, total=20000)["mc"]
+        self.assertEqual((m["qty"], m["qty_from"]), (11, "config caps"))
+        # a plan nse-exit wrote with quantity 0 (nothing fits) still needs one share for the charges estimate
+        m = machine(plan(quantity=0, stop=1000.0, target=1668.0), replays=100)["mc"]
+        self.assertEqual((m["qty"], m["qty_from"]), (1, "config caps"))
+        self.assertEqual(machine(plan(quantity=37), replays=100)["mc"]["qty_from"], "plan")
 
     def test_a_target_that_does_not_pay_its_charges(self):
         mc = {"p_target": 0.5, "p_stop": 0.4, "p_neither": 0.1, "r_at_target": 0.1, "avg_R": 0.0, "qty": 1,
@@ -536,10 +559,31 @@ class Plans(unittest.TestCase):
         self.assertEqual(tm.tick_away(1324.300048828125, True), 1324.3)
         self.assertEqual(tm.tick_away(1324.2999999999998, True), 1324.3)
         self.assertEqual(tm.tick_away(250.04, True), 250.0)
-        self.assertEqual(tm.tick_away(249.996, True), 249.99)
         self.assertEqual(tm.tick_away(5000.4, True), 5000.0)
         self.assertEqual(tm.tick_near(1344.43), 1344.4)
         self.assertEqual(tm.tick_near(1328.85, "RELIANCE", {"tick_sizes": {"RELIANCE": 0.05}}), 1328.85)
+
+    def test_prices_near_a_slab_edge_use_the_order_tick(self):
+        # nc.order_tick: the coarsest tick within 10% of the price, since NSE sets a stock's tick from an earlier
+        # close. 249.996 on the old per-slab rule was 249.99 (0.01 grid): rejected when the stock's tick is 0.05.
+        self.assertEqual(tm.tick_away(249.996, True), 249.95)
+        self.assertEqual(tm.tick_away(997.97, True), 997.9)           # not 997.95: valid on the 0.05 AND the 0.10 grid
+        self.assertEqual(tm.tick_away(997.97, False), 998.0)
+        self.assertEqual(tm.tick_near(997.97), 998.0)
+        self.assertEqual(tm.tick_near(1000.03), 1000.0)
+        for x in (249.996, 997.97, 4999.97, 9999.9, 19999.5):
+            for fn in (lambda v: tm.tick_away(v, True), tm.tick_near):
+                v = fn(x)
+                self.assertTrue(nc.on_tick(v, nc.order_tick(v)), x)
+                self.assertTrue(nc.on_tick(v, nc.tick_size(v)), x)     # and on the slab's own grid
+        # a per-symbol override still wins
+        self.assertEqual(tm.tick_away(997.97, True, "ABC", {"tick_sizes": {"ABC": 0.05}}), 997.95)
+
+    def test_the_history_replay_puts_its_prices_on_the_order_tick(self):
+        h = machine(replays=10)["history"]
+        for t in h["trades"]:
+            for k in ("entry", "stop", "target"):
+                self.assertTrue(nc.on_tick(t[k], nc.order_tick(t[k])), (t["date"], k))
 
     def test_the_stop_rule_is_worked_out_when_not_given(self):
         rule = machine(plan(stop_rule=None), replays=100)["history"]["rule"]
@@ -592,11 +636,11 @@ class Plans(unittest.TestCase):
         doc = machine(plan(target=1339.2, target_r=1.0))
         m, h = doc["mc"], doc["history"]
         self.assertEqual((m["r_at_target"], m["p_target"], m["p_stop"], m["p_neither"], m["avg_R"], m["avg_R_net"]),
-                         (1.0, 0.4288, 0.5661, 0.0051, -0.137, -0.39))
+                         (1.0, 0.4288, 0.5661, 0.0051, -0.137, -0.41))
         self.assertEqual(doc["verdict"], "Leans toward the stop: target first 42.9 % vs stop first 56.6 %.")
-        self.assertIn("so the target has to come first in 63 % of the replays", doc["verdict_notes"][0])
+        self.assertIn("so the target has to come first in 64 % of the replays", doc["verdict_notes"][0])
         self.assertEqual((h["triggered"], h["target"], h["stop"], h["close"], h["avg_R"], h["avg_R_net"]),
-                         (31, 12, 13, 6, -0.081, -0.331))
+                         (31, 12, 13, 6, -0.081, -0.339))
 
 
 class Network(unittest.TestCase):
@@ -673,8 +717,11 @@ class Cli(unittest.TestCase):
             json.dump(PLAN, fh, indent=2)
         self.out = os.path.join(self.d, "trader", "timemachine.json")
         self.cfg = os.path.join(self.d, "trader", "config.json")
+        self.env = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": os.path.join(self.d, "trader")})
+        self.env.start()                      # default paths are this temp folder, never the real trader/
 
     def tearDown(self):
+        self.env.stop()
         shutil.rmtree(self.d)
 
     def args(self, *more):
@@ -691,7 +738,7 @@ class Cli(unittest.TestCase):
             doc = json.load(fh)
         self.assertEqual(sorted(k for k in ("plan", "mc", "history") if k in doc), ["history", "mc", "plan"])
         self.assertEqual((doc["created_by"], doc["source"]), ("nse-timemachine", "offline"))
-        self.assertEqual((doc["mc"]["p_target"], doc["mc"]["avg_R"], doc["mc"]["avg_R_net"]), (0.2258, -0.199, -0.452))
+        self.assertEqual((doc["mc"]["p_target"], doc["mc"]["avg_R"], doc["mc"]["avg_R_net"]), (0.2258, -0.199, -0.471))
         self.assertEqual(sha(doc["mc"]["sample_paths"]), PATHS)
         self.assertEqual((doc["history"]["triggered"], doc["history"]["avg_R"]), (31, -0.03))
         self.assertEqual(doc["plan"]["from"], self.plan)
@@ -710,6 +757,34 @@ class Cli(unittest.TestCase):
             json.dump({"budget": 50000}, fh)
         code, text, _ = run(self.args("--json", "--replays", "300"))
         self.assertEqual(json.loads(text)["mc"]["qty"], 28)       # 75% of ₹50,000 / ₹1,334
+
+    def test_the_portfolio_next_to_the_config_sizes_the_charges(self):
+        with open(os.path.join(self.d, "trader", "portfolio.json"), "w", encoding="utf-8") as fh:
+            json.dump({"cash": 20000, "positions": []}, fh)
+        code, text, err = run(self.args("--json", "--replays", "200"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(text)["mc"]["qty"], 11)                  # 75% of the 20,000 account / 1,334
+        other = os.path.join(self.d, "other.json")
+        with open(other, "w", encoding="utf-8") as fh:
+            json.dump({"cash": 100000, "positions": []}, fh)
+        code, text, err = run(self.args("--json", "--replays", "200", "--portfolio", other))
+        self.assertEqual(json.loads(text)["mc"]["qty"], 37)                  # the max loss decides on a full account
+        with open(os.path.join(self.d, "trader", "portfolio.json"), "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        code, text, err = run(self.args("--json", "--replays", "200"))
+        self.assertEqual(code, 0)
+        self.assertIn("could not be read", err)                              # said, not hidden
+        self.assertEqual(json.loads(text)["mc"]["qty"], 37)
+
+    def test_the_plans_quantity_from_nse_exit_is_used(self):
+        raw = dict(PLAN, quantity=25, quantity_from="config caps", risk_per_share_worst=11.9, worst_exit=1322.1)
+        with open(self.plan, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        code, text, err = run(self.args("--json", "--replays", "200"))
+        self.assertEqual(code, 0, err)
+        doc = json.loads(text)
+        self.assertEqual((doc["mc"]["qty"], doc["mc"]["qty_from"]), (25, "plan"))
+        self.assertEqual(doc["plan"]["quantity"], 25)
 
     def test_the_plan_as_flags_matches_the_file(self):
         code, text, err = run(["run", "--symbol", "RELIANCE", "--date", "2026-11-13", "--entry", "1334",
@@ -766,9 +841,31 @@ class Cli(unittest.TestCase):
         self.assertIn("10:05", text)
         self.assertIn("15:10", text)
         self.assertTrue(lines[-2].startswith("Leans toward the stop"))
-        self.assertTrue(lines[-1].startswith("After charges on 56 shares"))
+        self.assertTrue(lines[-1].startswith("After charges on 37 shares"))
         code, again, _ = run(["chart", "--plan", self.plan, "--offline", REL, "--now", NOW, "--config", self.cfg])
         self.assertEqual(again, text)
+
+
+def frontmatter(text):
+    """The SKILL.md frontmatter the way a strict reader sees it: ({key: value}, body). Folded (>-) and
+    plain values are joined with single spaces. Raises AssertionError on anything malformed."""
+    assert text.startswith("---\n"), "no opening ---"
+    head, sep, body = text[4:].partition("\n---\n")
+    assert sep, "no closing ---"
+    assert "\t" not in head, "a tab in the frontmatter"
+    meta, key = {}, None
+    for line in head.split("\n"):
+        if not line.strip():
+            continue
+        if line[0] not in " -" and ":" in line:
+            key, val = line.split(":", 1)
+            val = val.strip()
+            meta[key] = "" if val in (">-", ">", "|", "|-") else val.strip('"')
+        elif key and line.startswith("  "):
+            meta[key] = (meta[key] + " " + line.strip()).strip()
+        else:
+            raise AssertionError("cannot place the frontmatter line %r" % line)
+    return meta, body
 
 
 class SkillDoc(unittest.TestCase):
@@ -785,7 +882,28 @@ class SkillDoc(unittest.TestCase):
                      "15:10", "charges", "22.6 %", "69.1 %", "8.3 %", "/nse-budget", "not a prediction", "nse"):
             self.assertIn(must, low)
         for never in ("—", "dollar", "pro" + "fit", "trader-", "new york"):
-            self.assertNotIn(never, low)
+            self.assertNotIn(never, low.replace("day-trader-india", ""))     # the plugin's own name is fine
+
+    def test_the_frontmatter_has_a_description_a_skill_list_can_show(self):
+        # nse-timemachine showed up in a live skill list with NO description. The frontmatter parses (this reader is
+        # stricter than most); what it was is a description of 942 characters, the longest-winded of the pack,
+        # against a listing that has a budget. So: parse it, and keep it short (under 600 characters).
+        with open(os.path.join(ROOT, "nse-timemachine", "SKILL.md"), encoding="utf-8") as fh:
+            meta, body = frontmatter(fh.read())
+        self.assertEqual(meta["name"], "nse-timemachine")
+        self.assertEqual(sorted(meta), ["argument-hint", "description", "name"])
+        d = meta["description"]
+        self.assertTrue(d.startswith("Time Machine for NSE intraday trades."))
+        self.assertGreater(len(d), 200)
+        self.assertLess(len(d), 600, len(d))
+        self.assertNotIn("  ", d)                                     # folded to single spaces
+        low = d.lower()
+        for phrase in ("run the time machine", "replay this trade", "what are the odds", "simulate this trade",
+                       "monte carlo", "backtest", "coin flip", "/nse-exit", "/nse-budget"):
+            self.assertIn(phrase, low)
+        self.assertIn("10,000", d)
+        self.assertTrue(meta["argument-hint"].startswith("["))
+        self.assertTrue(body.lstrip().startswith("# nse-timemachine"))
 
 
 if __name__ == "__main__":

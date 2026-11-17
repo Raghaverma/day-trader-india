@@ -1,0 +1,40 @@
+{
+  "description": "day-trader-india order gate: blocks broker order tools (mcp__<server>__place_order and friends) unless they match a ticket you approved, records your last message so the approving yes is verifiable, and warns at session start about trades with no stop. The PreToolUse hook only ever denies; your own Needs approval setting still asks as the second gate.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__.*__(place_order|modify_order|cancel_order|place_gtt_order|modify_gtt_order)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/gate.py\"",
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/record_prompt.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_status.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

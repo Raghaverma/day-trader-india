@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from _load import FIX, load
 
@@ -302,6 +303,219 @@ class Cli(unittest.TestCase):
         self.assertNotIn("user-agent", out.getvalue().lower())
         code, _, _ = run([])
         self.assertEqual(code, 2)
+
+
+# ---------------------------------------------------------------- a block page is never a filing
+
+HTML = b"<!DOCTYPE html><html><head><title>Access Denied</title></head><body>Reference #18.4a</body></html>"
+
+
+def good_xbrl():
+    with gzip.open(os.path.join(DIR, "xbrl-RELIANCE-30-SEP-2026-consolidated.xml.gz")) as fh:
+        return fh.read()
+
+
+class Scripted(res.Fetcher):
+    """A Fetcher whose network answers come from a list (bytes, or an Exception to raise)."""
+
+    def __init__(self, cache_dir, answers):
+        super(Scripted, self).__init__(offline=None, pause=0, cache_dir=cache_dir)
+        self.answers, self.calls = list(answers), 0
+
+    def get(self, url, name, nse=False):
+        self.calls += 1
+        a = self.answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+URL = "https://nsearchives.nseindia.in/corporate/xbrl/INTEGRATED_FILING_INDAS_1750537_30102026093254_WEB.xml"
+
+
+class XbrlCache(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = os.path.join(self.tmp.name, "cache", "nse-xbrl")
+        self.file = os.path.join(self.cache, os.path.basename(URL) + ".gz")
+
+    def test_check_xbrl(self):
+        self.assertIsNone(res.check_xbrl(good_xbrl()))
+        self.assertEqual(res.check_xbrl(b""), "empty")
+        self.assertEqual(res.check_xbrl(b"  \n"), "empty")
+        self.assertIn("HTML page", res.check_xbrl(HTML))
+        self.assertIn("HTML page", res.check_xbrl(b"\n  <HTML><body>x</body></HTML>"))
+        self.assertIn("not valid XML", res.check_xbrl(b"<xbrl><context>"))
+        # well-formed XML that is an error page, not a filing
+        self.assertIn("root is <Error>", res.check_xbrl(b"<Error><Code>AccessDenied</Code></Error>"))
+        self.assertIn("no reporting period", res.check_xbrl(b"<xbrli:xbrl xmlns:xbrli='http://www.xbrl.org/2003/instance'/>"))
+
+    def test_a_block_page_is_not_cached_and_a_later_good_response_works(self):
+        f = Scripted(self.cache, [HTML, good_xbrl()])
+        with self.assertRaises(res.ResultsError) as cm:
+            f.xbrl(URL, "x.xml")
+        self.assertIn("an HTML page, not XBRL", str(cm.exception))
+        self.assertIn("not cached", str(cm.exception))
+        self.assertFalse(os.path.exists(self.cache) and os.listdir(self.cache))  # nothing on disk
+        data = f.xbrl(URL, "x.xml")  # NSE answers properly this time
+        self.assertIsNone(res.check_xbrl(data))
+        self.assertEqual(os.listdir(self.cache), [os.path.basename(URL) + ".gz"])  # no .tmp left behind
+        # and from now on the cache answers: no request
+        again = Scripted(self.cache, [])
+        self.assertEqual(again.xbrl(URL, "x.xml"), data)
+        self.assertEqual(again.calls, 0)
+
+    def test_empty_and_error_bodies_are_not_cached_either(self):
+        for body in (b"", b"<Error><Code>AccessDenied</Code></Error>", b"Service Unavailable"):
+            f = Scripted(self.cache, [body])
+            with self.assertRaises(res.ResultsError):
+                f.xbrl(URL, "x.xml")
+        self.assertFalse(os.path.exists(self.cache) and os.listdir(self.cache))
+
+    def test_a_cached_block_page_is_deleted_and_fetched_again(self):
+        os.makedirs(self.cache)
+        with gzip.open(self.file, "wb") as fh:  # what the old code wrote: any body starting with "<"
+            fh.write(HTML)
+        f = Scripted(self.cache, [good_xbrl()])
+        data = f.xbrl(URL, "x.xml")
+        self.assertEqual(f.calls, 1)
+        self.assertIsNone(res.check_xbrl(data))
+        with gzip.open(self.file) as fh:
+            self.assertIsNone(res.check_xbrl(fh.read()))  # the file on disk is the good one now
+
+    def test_a_cached_file_that_is_cut_off_or_corrupt_is_deleted_and_fetched_again(self):
+        os.makedirs(self.cache)
+        with open(self.file, "wb") as fh:
+            fh.write(b"\x1f\x8b\x08\x00not really gzip at all")
+        f = Scripted(self.cache, [good_xbrl()])
+        self.assertIsNone(res.check_xbrl(f.xbrl(URL, "x.xml")))
+        self.assertEqual(f.calls, 1)
+
+    def test_a_cached_block_page_with_nse_still_blocking_leaves_nothing_behind(self):
+        os.makedirs(self.cache)
+        with gzip.open(self.file, "wb") as fh:
+            fh.write(HTML)
+        f = Scripted(self.cache, [HTML])
+        with self.assertRaises(res.ResultsError):
+            f.xbrl(URL, "x.xml")
+        self.assertFalse(os.path.exists(self.file))  # the poisoned file is gone, not served forever
+
+    def test_default_cache_is_in_the_trader_home(self):
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.tmp.name}):
+            f = res.Fetcher()
+        self.assertEqual(f.cache_dir, os.path.join(self.tmp.name, "cache", "nse-xbrl"))
+        self.assertIsNone(res.Fetcher(cache_dir=None).cache_dir)
+
+
+class WhenTheFeedIsWrong(unittest.TestCase):
+    def test_the_newest_quarter_unreadable_says_the_table_starts_older(self):
+        class Newest(res.Fetcher):
+            def xbrl(self, url, name):
+                if "30102026093254" in url:  # the Sep 2026 consolidated filing: NSE sends a block page
+                    raise res.ResultsError("INTEGRATED_FILING_INDAS_1750537_30102026093254_WEB.xml is an HTML "
+                                           "page, not XBRL; not cached")
+                return super(Newest, self).xbrl(url, name)
+
+        notes = []
+        r = res.report(Newest(offline=DIR), "RELIANCE", 3, "consolidated", NOW, notes)
+        self.assertEqual(r["rows"][0]["end"], "2026-09-30")  # Yahoo has that quarter (fixture): marked as such
+        self.assertEqual(r["rows"][0]["source"], "Yahoo")
+        self.assertTrue(any("2026-09-30: XBRL unreadable, Yahoo's numbers used" in n for n in notes))
+
+        class NoYahoo(Newest):
+            def get(self, url, name, nse=False):
+                if "yahoo" in url:
+                    raise res.ResultsError("could not reach yahoo")
+                return super(NoYahoo, self).get(url, name, nse)
+
+        notes = []
+        r = res.report(NoYahoo(offline=DIR), "RELIANCE", 3, "consolidated", NOW, notes)
+        self.assertEqual(r["rows"][0]["end"], "2026-06-30")
+        self.assertTrue(any("could not read the XBRL" in n and "30-SEP-2026" in n for n in notes), notes)
+        loud = [n for n in notes if "newest filing on NSE (quarter ending 2026-09-30) could not be read" in n]
+        self.assertEqual(len(loud), 1, notes)
+        self.assertIn("start at the quarter ending 2026-06-30, not at the latest results", loud[0])
+        out = res.render(r, NOW, None, notes)
+        self.assertIn("NOTE: RELIANCE: the newest filing on NSE", out)
+
+    def test_an_xbrl_with_none_of_our_numbers_is_not_a_row_of_dashes(self):
+        odd = (b"<xbrli:xbrl xmlns:xbrli='http://www.xbrl.org/2003/instance' "
+               b"xmlns:in-capmkt='http://www.sebi.gov.in/xbrl/2017'>"
+               b"<xbrli:context id='OneD'><xbrli:period><xbrli:startDate>2026-07-01</xbrli:startDate>"
+               b"<xbrli:endDate>2026-09-30</xbrli:endDate></xbrli:period></xbrli:context>"
+               b"<in-capmkt:SomethingNew contextRef='OneD'>5</in-capmkt:SomethingNew></xbrli:xbrl>")
+
+        class Odd(res.Fetcher):
+            def xbrl(self, url, name):
+                return odd
+
+            def get(self, url, name, nse=False):
+                if "yahoo" in url:
+                    raise res.ResultsError("could not reach yahoo")
+                return super(Odd, self).get(url, name, nse)
+
+        notes = []
+        with self.assertRaises(res.ResultsError):  # nothing readable, and Yahoo has nothing either
+            res.report(Odd(offline=DIR), "RELIANCE", 1, "consolidated", NOW, notes)
+        self.assertTrue(any("the XBRL has none of the expected numbers" in n for n in notes), notes)
+
+    def test_nse_filing_list_in_the_wrong_shape_is_not_no_filings(self):
+        with self.assertRaises(res.ResultsError):
+            res.parse_filings({"error": "Resource not found"})
+        with self.assertRaises(res.ResultsError):
+            res.parse_filings({"data": "nope"})
+        self.assertEqual(res.parse_filings({"data": []}), [])  # a company with none: Yahoo takes over
+        with self.assertRaises(res.ResultsError):
+            res.parse_filings({"data": [{"XBRL": "x.xml", "qe": "30-SEP-2026"}]})  # a renamed field
+
+    def test_a_filing_list_error_falls_back_to_yahoo_with_the_reason(self):
+        class Blocked(res.Fetcher):
+            def get(self, url, name, nse=False):
+                if "integrated-filing" in url or name.startswith("integrated-filing"):
+                    return b'{"error": "Resource not found"}'
+                return super(Blocked, self).get(url, name, nse)
+
+        notes = []
+        r = res.report(Blocked(offline=DIR), "RELIANCE", 3, "consolidated", NOW, notes)
+        self.assertEqual(r["sources"], ["Yahoo"])
+        self.assertTrue(any("NSE filings list: NSE's filing list came back in an unexpected shape" in n
+                            for n in notes), notes)
+
+    def test_event_calendar_that_is_empty_or_unreadable_is_a_note_never_no_meeting(self):
+        for body in ({"data": []}, [], {"message": "nope"}, [{"symbol": "TCS", "date": "2026/11/16"}]):
+            with self.assertRaises(res.ResultsError):
+                res.parse_calendar(body)
+        for body, word in ((b'{"data": []}', "empty"), (b'{"message": "nope"}', "unexpected shape"),
+                           (b'<html>blocked</html>', "not JSON")):
+            with tempfile.TemporaryDirectory() as tmp:
+                cal = os.path.join(tmp, "cal.json")
+                with open(cal, "wb") as fh:
+                    fh.write(body)
+                code, out, err = run(["RELIANCE", "--offline", DIR, "--calendar", cal, "--now", "2026-11-14 21:30"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("NOTE: NSE event calendar: ", out)
+            self.assertIn(word, out)
+            self.assertNotIn("Next board meeting: none", out)  # an unread calendar says nothing about meetings
+
+    def test_metrics_file_that_is_not_an_object_is_refused_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "metrics.json")
+            with open(path, "w") as fh:
+                fh.write("[1, 2]")
+            code, _, err = run(["RELIANCE", "--offline", DIR, "--no-calendar", "--metrics", path,
+                                "--now", "2026-11-14 21:30"])
+        self.assertEqual(code, 2)
+        self.assertIn("not a metrics file", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_exit_codes_one_symbol_failing_and_all_failing(self):
+        code, out, err = run(["RELIANCE", "ZZZZ", "--offline", DIR, "--no-calendar", "--now", "2026-11-14 21:30"])
+        self.assertEqual(code, 1)  # some symbols failed
+        self.assertIn("results: ZZZZ:", err)
+        self.assertIn("Reliance Industries", out)
+        code, _, _ = run(["ZZZZ", "YYYY", "--offline", DIR, "--no-calendar"])
+        self.assertEqual(code, 2)  # none read
 
 
 if __name__ == "__main__":

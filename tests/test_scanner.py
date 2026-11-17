@@ -18,6 +18,7 @@ import unittest
 import urllib.error
 import urllib.parse
 from contextlib import redirect_stdout, redirect_stderr
+from unittest import mock
 
 from _load import load, FIX, ROOT
 
@@ -583,8 +584,13 @@ class Cli(unittest.TestCase):
         self.saved = (scan.http_get, scan.yahoo_get, scan.SLEEP, scan.today_ist)
         scan.SLEEP = lambda s: None
         scan.today_ist = lambda: D(2026, 11, 14)
+        # a default path (--out, --cache, --config left off) lands in the scratch trader folder, never in
+        # the repo's working folder or ~/.day-trader-india
+        self._home = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.t})
+        self._home.start()
 
     def tearDown(self):
+        self._home.stop()
         scan.http_get, scan.yahoo_get, scan.SLEEP, scan.today_ist = self.saved
         shutil.rmtree(self.d)
 
@@ -605,18 +611,29 @@ class Cli(unittest.TestCase):
         self.assertIn("M&M|Mahindra & Mahindra Ltd.", lines)
         self.assertNotIn("HFCL|HFCL Ltd.", lines)
 
-        # daily over that universe with the Nifty 50 charts: partial, and said so
-        code, text, _ = run(["daily", "--universe", uni, "--offline", DAILY, "--lists", SDIR,
+        # daily over the Nifty 50 charts plus 30 symbols the file has no chart for (30 of 80 unread: a
+        # partial scan, and said so; more than half unread is a failure, see ReadFailures)
+        have = set(scan.load_offline(DAILY)[0])
+        mixed = [l for l in lines if l.split("|")[0] in have] + [l for l in lines if l.split("|")[0] not in have][:30]
+        uni80 = os.path.join(self.t, "universe80.txt")
+        with open(uni80, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(mixed) + "\n")
+        code, text, _ = run(["daily", "--universe", uni80, "--offline", DAILY, "--lists", SDIR,
                              "--now", "2026-11-16 09:00", "--out", self.wl, "--config", self.cfg])
         self.assertEqual(code, 0)
-        self.assertIn("Fetched 50 of 494 charts (444 failed or had no data)", text)
+        self.assertEqual(len(mixed), 80)
+        self.assertIn("Fetched 50 of 80 charts (30 failed or had no data)", text)
         self.assertIn("(₹20+ and ₹10 cr+ traded a day)", text)
+        self.assertIn("Config: none at %s, so the built-in defaults are in use." % self.cfg, text)
         self.assertNotIn("$", text)
         doc = self.read(self.wl)
         self.assertEqual((doc["created_by"], doc["mode"], doc["universe"], doc["scanned"], doc["failed"]),
-                         ("nse-scanner", "daily", 494, 50, 444))
-        self.assertEqual(doc["hits"][0], {"symbol": "RELIANCE", "setups": ["bull_flag"], "price": 1339.7,
-                                          "close_date": "2026-11-13", "rsi": 70.8, "volume": 13756247})
+                         ("nse-scanner", "daily", 80, 50, 30))
+        self.assertEqual((doc["errors"], len(doc["error_samples"])), (30, 5))
+        # "name" is new: the company name from EQUITY_L.csv (in --lists), for nse-news
+        self.assertEqual(doc["hits"][0], {"symbol": "RELIANCE", "name": "Reliance Industries Limited",
+                                          "setups": ["bull_flag"], "price": 1339.7, "close_date": "2026-11-13",
+                                          "rsi": 70.8, "volume": 13756247})
         self.assertEqual(doc["as_of"], "2026-11-13 close")
         self.assertEqual(doc["filters"], {"min_price": 20.0, "min_value_cr": 10.0})
 
@@ -635,7 +652,10 @@ class Cli(unittest.TestCase):
                          {"created_by": "nse-scanner", "mode": "orb", "exchange": "NSE",
                           "as_of": "2026-11-13 15:30 IST", "universe": 50, "scanned": 50, "source": "yahoo"})
         self.assertEqual(len(doc["hits"]), 34)
-        self.assertIn(Orb.RELIANCE, doc["hits"])
+        self.assertIn(Orb.RELIANCE, [{k: v for k, v in h.items() if k != "name"} for h in doc["hits"]])
+        rel = [h for h in doc["hits"] if h["symbol"] == "RELIANCE"][0]
+        self.assertEqual(rel["name"], "Reliance Industries Limited")
+        self.assertEqual((doc["errors"], doc["scanned"]), (0, 50))
 
         # the hits read back as a watchlist, with --now in IST
         code, text, _ = run(["orb", "--offline", WALL, "--lists", SDIR, "--now", "2026-11-13 10:05",
@@ -758,8 +778,9 @@ class Cli(unittest.TestCase):
         os.makedirs(self.t)
         with open(self.cfg, "w") as fh:
             json.dump({"block_surveillance": False, "min_circuit_band_pct": 5}, fh)
-        code, text, _ = run(["daily", "--offline", DAILY, "--sec-list", SEC, "--symbols", "RELIANCE,BALKRISHNA,VISL",
-                             "--now", "2026-11-16 09:00", "--json", "--no-write", "--config", self.cfg])
+        code, text, _ = run(["daily", "--offline", DAILY, "--sec-list", SEC, "--symbols",
+                             "RELIANCE,M&M,TCS,BALKRISHNA,VISL", "--now", "2026-11-16 09:00", "--json", "--no-write",
+                             "--config", self.cfg])
         self.assertEqual(json.loads(text)["dropped_symbols"], {})
 
     def test_offline_folder_of_v8_files(self):
@@ -804,6 +825,462 @@ class Cli(unittest.TestCase):
         self.assertEqual(out["note"], "A scan is a list of charts that match a rule, not a list of stocks to buy.")
 
 
+def daily_series(closes, volumes=None, meta_volume=None, price=None, start=D(2026, 10, 1)):
+    """A daily series, one bar a calendar day from `start`, 09:15 IST stamps. volumes=None is spark-like:
+    closes only, the volume only in the meta (what Yahoo's spark sends)."""
+    t = [ts((start + datetime.timedelta(days=i)).isoformat() + " 09:15") for i in range(len(closes))]
+    meta = {"regularMarketPrice": price if price is not None else closes[-1]}
+    if meta_volume is not None:
+        meta["regularMarketVolume"] = meta_volume
+    return {"t": t, "c": list(closes), "o": None, "h": None, "l": None,
+            "v": list(volumes) if volumes is not None else None, "meta": meta}
+
+
+BREAKOUT = [100.0] * 39 + [101.0]        # a 20-day closing-high breakout: the level is 100.00
+
+
+class Level(unittest.TestCase):
+    """Review item 18, the scanner end: the breakout level, and the company name."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data, _ = scan.load_offline(DAILY)
+        cls.syms = sorted(cls.data)
+        cls.now = scan.parse_now("2026-11-16 09:00")
+
+    def test_a_breakout_hit_carries_the_prior_20_day_closing_high(self):
+        hits, _, _ = scan.scan_daily(self.data, self.syms, self.now, 0, 0)
+        by = {h["symbol"]: h for h in hits}
+        for sym in ("BSE", "BAJFINANCE", "MAXHEALTH"):
+            self.assertIn("breakout_20d", by[sym]["setups"])
+            closes = [c for _, c in scan.daily_closes(self.data[sym], self.now)]
+            self.assertEqual(by[sym]["level"], round(max(closes[-21:-1]), 2), sym)   # the 20 closes before the last
+            self.assertLess(by[sym]["level"], by[sym]["price"])                       # the close that beat it
+        self.assertEqual(by["BSE"]["level"], 3909.1)
+        for sym, h in by.items():
+            if "breakout_20d" not in h["setups"]:
+                self.assertNotIn("level", h, sym)                                     # only on breakout hits
+        self.assertTrue(all(isinstance(by[s]["level"], float) for s in ("BSE", "BAJFINANCE", "MAXHEALTH")))
+
+    def test_a_hit_has_a_name_only_when_one_is_known(self):
+        hits, _, _ = scan.scan_daily(self.data, self.syms, self.now, 0, 0, names={"BSE": "BSE Limited"})
+        by = {h["symbol"]: h for h in hits}
+        self.assertEqual(by["BSE"]["name"], "BSE Limited")
+        self.assertNotIn("name", by["RELIANCE"])
+        hits, _, _ = scan.scan_daily(self.data, self.syms, self.now, 0, 0)
+        self.assertTrue(all("name" not in h for h in hits))
+
+    def test_orb_hits_carry_names_too(self):
+        data, _ = scan.load_offline(WALL)
+        hits, _, _ = scan.scan_orb(data, ["RELIANCE", "TCS"], FRI, cut("10:05"), 15,
+                                   names={"RELIANCE": "Reliance Industries Limited"})
+        by = {h["symbol"]: h for h in hits}
+        self.assertEqual(by["RELIANCE"]["name"], "Reliance Industries Limited")
+        self.assertNotIn("name", by["TCS"])
+
+    def test_name_sources_and_their_order(self):
+        class A(object):
+            lists, cache = SDIR, None
+        sec = scan.parse_sec_list(scan.read_maybe_gz(SEC))
+        names = scan.company_names(A, {"RELIANCE": "from the universe list", "M&M": "Mahindra & Mahindra Ltd."}, sec)
+        self.assertEqual(names["RELIANCE"], "Reliance Industries Limited")          # EQUITY_L.csv wins
+        self.assertEqual(names["ANKITMETAL"], "Ankit Metal & Power Limited")          # EQUITY_L covers every series
+        d = tempfile.mkdtemp()
+        try:
+            class B(object):
+                lists, cache = None, d
+            got = scan.company_names(B, {"RELIANCE": "from the universe list"}, sec)
+            self.assertEqual(got["RELIANCE"], "from the universe list")               # no EQUITY_L on hand
+            self.assertEqual(got["ANKITMETAL"], "ANKIT METAL & POWER LIMITED")        # sec_list's Security Name
+            # today's cache file, by the exact name nse-news and `universe all` share
+            saved = scan.today_ist
+            scan.today_ist = lambda: D(2026, 11, 14)
+            try:
+                with open(os.path.join(d, "EQUITY_L-2026-11-14.csv"), "w", encoding="utf-8") as fh:
+                    fh.write(scan.read_maybe_gz(os.path.join(SDIR, "EQUITY_L.csv.gz")))
+                self.assertEqual(scan.company_names(B, {}, None)["RELIANCE"], "Reliance Industries Limited")
+                os.rename(os.path.join(d, "EQUITY_L-2026-11-14.csv"), os.path.join(d, "EQUITY_L-2026-11-13.csv"))
+                self.assertNotIn("RELIANCE", scan.company_names(B, {}, None))        # yesterday's copy is not used
+            finally:
+                scan.today_ist = saved
+        finally:
+            shutil.rmtree(d)
+
+    def test_a_broken_equity_l_does_not_lose_the_other_names(self):
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, "EQUITY_L.csv"), "w", encoding="utf-8") as fh:
+                fh.write("<html>Access Denied</html>")
+
+            class A(object):
+                lists, cache = d, None
+            self.assertEqual(scan.company_names(A, {"RELIANCE": "Reliance"}, None), {"RELIANCE": "Reliance"})
+        finally:
+            shutil.rmtree(d)
+
+
+class Liquidity(unittest.TestCase):
+    """Review item 15, the floor: the rupee-crore floor is measured on COMPLETE sessions' volume. Yahoo's
+    spark meta carries today's partial volume while the session runs, so a liquid stock failed the floor
+    early in the day."""
+
+    LIVE = scan.parse_now("2026-11-13 10:00")          # Friday, in progress
+    PRE = scan.parse_now("2026-11-13 08:30")           # before the open
+    AFTER = scan.parse_now("2026-11-13 15:45")
+
+    def liquid(self, with_volumes=True):
+        # 100 x 1,200,000 = Rs 12 crore a complete session; 5,000 shares so far today
+        return daily_series(BREAKOUT, [1200000] * 40 if with_volumes else None, meta_volume=5000)
+
+    def thin(self, with_volumes=True):
+        return daily_series(BREAKOUT, [10000] * 40 if with_volumes else None, meta_volume=5000)
+
+    def test_session_in_progress(self):
+        f = scan.session_in_progress
+        self.assertFalse(f(scan.parse_now("2026-11-13 09:14")))
+        self.assertTrue(f(scan.parse_now("2026-11-13 09:15")))
+        self.assertTrue(f(scan.parse_now("2026-11-13 15:29")))
+        self.assertFalse(f(scan.parse_now("2026-11-13 15:30")))
+        self.assertFalse(f(scan.parse_now("2026-11-14 11:00")))      # Saturday
+        self.assertFalse(f(scan.parse_now("2026-11-24 11:00")))      # NSE holiday
+
+    def test_early_in_the_session_a_liquid_stock_is_not_dropped_for_a_partial_volume(self):
+        data = {"LIQ": self.liquid(False), "THIN": self.thin(False)}
+        asked = []
+
+        def volume_of(sym):
+            asked.append(sym)
+            return self.liquid() if sym == "LIQ" else self.thin()
+        hits, counts, _ = scan.scan_daily(data, ["LIQ", "THIN"], self.LIVE, 20, 10, volume_of=volume_of)
+        # before the fix both were "illiquid" (100 x 5,000 shares = Rs 0.05 crore) and the scan was empty
+        self.assertEqual([h["symbol"] for h in hits], ["LIQ"])
+        self.assertEqual(sorted(asked), ["LIQ", "THIN"])
+        self.assertEqual((counts["deferred"], counts["illiquid"], counts["scanned"]), (2, 1, 1))
+        self.assertNotIn("unchecked", counts)
+        self.assertEqual(hits[0]["volume"], 1200000)                 # a complete session's volume, not 5,000
+        self.assertNotIn("value_checked", hits[0])
+        self.assertEqual(hits[0]["level"], 100.0)
+
+    def test_a_hit_that_cannot_be_checked_is_kept_and_marked(self):
+        data = {"LIQ": self.liquid(False)}
+        hits, counts, _ = scan.scan_daily(data, ["LIQ"], self.LIVE, 20, 10)          # no daily chart to ask
+        self.assertEqual([(h["symbol"], h["value_checked"]) for h in hits], [("LIQ", False)])
+        self.assertEqual((counts["deferred"], counts["unchecked"], counts["illiquid"]), (1, 1, 0))
+
+        def broken(sym):
+            raise scan.ScanError("Yahoo answered HTTP 429")
+        hits, counts, _ = scan.scan_daily(data, ["LIQ"], self.LIVE, 20, 10, volume_of=broken)
+        self.assertEqual((hits[0]["value_checked"], counts["unchecked"]), (False, 1))
+
+    def test_stage_two_never_falls_back_to_the_partial_volume(self):
+        no_volumes = self.liquid(False)                  # a "daily chart" that has no volumes either
+        hits, counts, _ = scan.scan_daily({"LIQ": self.liquid(False)}, ["LIQ"], self.LIVE, 20, 10,
+                                          volume_of=lambda sym: no_volumes)
+        self.assertEqual((hits[0]["value_checked"], counts["illiquid"]), (False, 0))
+
+    def test_todays_partial_daily_bar_is_not_a_complete_session(self):
+        s = self.thin()                                  # Rs 0.1 crore a complete session
+        s["t"].append(ts("2026-11-13 09:15"))            # today's bar, still forming, with a huge volume so far
+        s["c"].append(101.0)
+        s["v"].append(50000000)
+        hits, counts, _ = scan.scan_daily({"THIN": s}, ["THIN"], self.LIVE, 20, 10)
+        self.assertEqual((hits, counts["illiquid"]), ([], 1))
+        self.assertEqual(len(scan.daily_closes(s, self.LIVE)), 40)
+
+    def test_with_complete_volumes_there_is_nothing_to_defer(self):
+        hits, counts, _ = scan.scan_daily({"LIQ": self.liquid(), "THIN": self.thin()}, ["LIQ", "THIN"], self.LIVE, 20, 10)
+        self.assertEqual([h["symbol"] for h in hits], ["LIQ"])
+        self.assertEqual((counts["illiquid"], "deferred" in counts), (1, False))
+
+    def test_before_the_open_and_after_the_close_the_meta_volume_is_the_last_complete_session(self):
+        full = daily_series(BREAKOUT, None, meta_volume=1200000)                 # Rs 12 crore yesterday
+        thin = daily_series(BREAKOUT, None, meta_volume=10000)
+        for when in (self.PRE, self.AFTER, scan.parse_now("2026-11-14 11:00")):
+            hits, counts, _ = scan.scan_daily({"LIQ": full, "THIN": thin}, ["LIQ", "THIN"], when, 20, 10)
+            self.assertEqual([h["symbol"] for h in hits], ["LIQ"], when)
+            self.assertEqual((counts["illiquid"], "deferred" in counts), (1, False), when)
+
+    def test_no_floor_no_deferral(self):
+        hits, counts, _ = scan.scan_daily({"LIQ": self.liquid(False)}, ["LIQ"], self.LIVE, 20, 0)
+        self.assertEqual((len(hits), "deferred" in counts), (1, False))
+        self.assertNotIn("value_checked", hits[0])
+
+    def test_hits_are_ordered_by_what_was_traded(self):
+        a = daily_series(BREAKOUT, [1200000] * 40, meta_volume=5000)
+        b = daily_series(BREAKOUT, [9000000] * 40, meta_volume=5000)
+        hits, _, _ = scan.scan_daily({"AAA": a, "BBB": b}, ["AAA", "BBB"], self.LIVE, 20, 10)
+        self.assertEqual([h["symbol"] for h in hits], ["BBB", "AAA"])
+
+
+class FakeDailyYahoo(object):
+    """Answers spark (daily closes, from the real 13 Nov spark answer) and v8 daily charts (the same
+    bars plus complete sessions' volumes) the way Yahoo would. `answer` limits which symbols exist."""
+
+    def __init__(self, answer=None, volume=5000000, thin=()):
+        with open(DAILY, encoding="utf-8") as fh:
+            self.items = {nc.nse_symbol(r["symbol"]): r for r in json.load(fh)["spark"]["result"]}
+        self.answer = None if answer is None else set(answer)
+        self.volume, self.thin = volume, set(thin)
+        self.calls = []
+
+    def __call__(self, url):
+        self.calls.append(url)
+        path = url.split("finance.yahoo.com")[1]
+        if path.startswith("/v7/finance/spark"):
+            res = []
+            for y in urllib.parse.parse_qs(path.split("?")[1])["symbols"][0].split(","):
+                sym = nc.nse_symbol(y)
+                if sym in self.items and (self.answer is None or sym in self.answer):
+                    res.append(self.items[sym])
+            return json.dumps({"spark": {"result": res, "error": None}})
+        sym = nc.nse_symbol(urllib.parse.unquote(path.split("/chart/")[1].split("?")[0]))
+        r = json.loads(json.dumps(self.items[sym]["response"][0]))
+        n = len(r["timestamp"])
+        r["indicators"]["quote"][0]["volume"] = [100 if sym in self.thin else self.volume] * n
+        return json.dumps({"chart": {"result": [r], "error": None}})
+
+
+class ReadFailures(unittest.TestCase):
+    """Review item 15: a total Yahoo failure overwrote watchlist.json with hits: [] and exited 1, exactly
+    like a genuine "no setups"."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.t = os.path.join(self.d, "trader")
+        os.makedirs(self.t)
+        self.wl = os.path.join(self.t, "watchlist.json")
+        self.cfg = os.path.join(self.t, "config.json")
+        self.saved = (scan.http_get, scan.yahoo_get, scan.SLEEP, scan.today_ist)
+        scan.SLEEP = lambda s: None
+        scan.today_ist = lambda: D(2026, 11, 14)
+        self._home = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.t})
+        self._home.start()
+        self.good = {"created_by": "nse-scanner", "mode": "daily", "hits": [{"symbol": "RELIANCE", "setups": ["x"]}]}
+        with open(self.wl, "w", encoding="utf-8") as fh:
+            json.dump(self.good, fh)
+
+    def tearDown(self):
+        self._home.stop()
+        scan.http_get, scan.yahoo_get, scan.SLEEP, scan.today_ist = self.saved
+        shutil.rmtree(self.d)
+
+    def kept(self):
+        with open(self.wl, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def daily(self, *extra):
+        return run(["daily", "--universe", "nifty50", "--lists", SDIR, "--now", "2026-11-16 09:00", "--pause", "0",
+                    "--config", self.cfg] + list(extra))
+
+    def test_a_total_failure_is_exit_3_and_writes_nothing(self):
+        def down(url):
+            raise scan.ScanError("Yahoo answered HTTP 429 for /v7/finance/spark")
+        scan.yahoo_get = down
+        code, text, err = self.daily()
+        self.assertEqual(code, 3)
+        self.assertIn("scan failed: could not read prices (50 of 50 symbols failed)", err)
+        self.assertIn("HTTP 429", err)                                   # why, for the first few
+        self.assertIn("nothing was written", err)
+        self.assertEqual(text, "")
+        self.assertEqual(self.kept(), self.good)                          # yesterday's watchlist is still there
+
+    def test_the_same_for_the_orb_scan(self):
+        def down(url):
+            raise scan.ScanError("Yahoo answered HTTP 503")
+        scan.yahoo_get = down
+        code, _, err = run(["orb", "--universe", "nifty50", "--lists", SDIR, "--now", "2026-11-13 10:05",
+                            "--pause", "0", "--config", self.cfg])
+        self.assertEqual(code, 3)
+        self.assertIn("scan failed: could not read prices (50 of 50 symbols failed)", err)
+        self.assertEqual(self.kept(), self.good)
+
+    def test_more_than_half_is_a_failure_exactly_half_is_not(self):
+        fake = FakeDailyYahoo(answer=sorted(FakeDailyYahoo().items)[:24])           # 26 of 50 unread
+        scan.yahoo_get = fake
+        code, _, err = self.daily()
+        self.assertEqual(code, 3)
+        self.assertIn("(26 of 50 symbols failed)", err)
+        self.assertEqual(self.kept(), self.good)
+        scan.yahoo_get = FakeDailyYahoo(answer=sorted(FakeDailyYahoo().items)[:25])  # 25 of 50: a partial scan
+        code, text, err = self.daily()
+        self.assertNotEqual(code, 3, err)
+        doc = self.kept()
+        self.assertEqual((doc["mode"], doc["failed"], doc["errors"]), ("daily", 25, 25))
+
+    def test_a_scan_that_writes_records_errors_and_scanned(self):
+        items = sorted(FakeDailyYahoo().items)
+        scan.yahoo_get = FakeDailyYahoo(answer=items[:42])                           # 8 of 50 unread
+        code, text, _ = self.daily()
+        doc = self.kept()
+        self.assertEqual((doc["scanned"], doc["errors"], doc["failed"], doc["universe"]), (42, 8, 8, 50))
+        self.assertEqual(len(doc["error_samples"]), 5)
+        self.assertTrue(all(v == "no data from Yahoo" for v in doc["error_samples"].values()))
+        self.assertIn("(8 failed or had no data)", text)
+
+    def test_no_setups_is_still_exit_1_and_is_written(self):
+        scan.yahoo_get = FakeYahoo()
+        code, text, _ = run(["orb", "--lists", SDIR, "--now", "2026-11-13 09:40",
+                             "--symbols", "RELIANCE", "--pause", "0", "--config", self.cfg])
+        # (09:40: no close above the range high yet for RELIANCE: a genuine empty result)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.kept()["hits"], [])
+        self.assertEqual((self.kept()["errors"], self.kept()["scanned"]), (0, 1))
+
+    def test_stage_two_failures_are_a_failure_too(self):
+        fake = FakeYahoo()
+
+        def spark_ok_v8_down(url):
+            if "/v8/" in url:
+                raise scan.ScanError("Yahoo answered HTTP 429 for /v8/finance/chart/X.NS")
+            return fake(url)
+        scan.yahoo_get = spark_ok_v8_down
+        code, _, err = run(["orb", "--universe", "nifty50", "--lists", SDIR, "--now", "2026-11-13 10:05",
+                            "--pause", "0", "--config", self.cfg])
+        self.assertEqual(code, 3)
+        self.assertRegex(err, r"scan failed: could not read prices \(\d+ of \d+ candidate charts failed\)")
+        self.assertEqual(self.kept(), self.good)
+
+    def test_json_mode_says_so_too(self):
+        scan.yahoo_get = lambda url: (_ for _ in ()).throw(scan.ScanError("Yahoo answered HTTP 429"))
+        code, text, err = self.daily("--json")
+        self.assertEqual(code, 3)
+        out = json.loads(text)
+        self.assertEqual((out["failed"], out["universe"], out["wrote"]), (50, 50, False))
+        self.assertIn("scan failed", out["error"])
+
+    def test_the_online_session_floor_uses_each_hits_daily_chart(self):
+        # 10:00 Friday: the session is running, spark's volume is partial. The fake daily charts have
+        # complete volumes: 5,000,000 a session (far over Rs 10 crore) except BSE's (100 shares)
+        fake = FakeDailyYahoo(thin=["BSE"])
+        scan.yahoo_get = fake
+        code, text, _ = self.daily("--now", "2026-11-13 10:00", "--json", "--no-write")
+        out = json.loads(text)
+        syms = [h["symbol"] for h in out["hits"]]
+        self.assertEqual(code, 0)
+        self.assertNotIn("BSE", syms)
+        self.assertEqual(out["counts"]["deferred"], len(syms) + 1)
+        self.assertEqual(out["counts"]["illiquid"], 1)
+        self.assertTrue(all(h["volume"] == 5000000 for h in out["hits"]))
+        self.assertEqual(sum(1 for c in fake.calls if "/v8/" in c), out["counts"]["deferred"])   # hits only, not 50
+        self.assertEqual(sum(1 for c in fake.calls if "/v7/" in c), 3)
+        code, text, _ = self.daily("--now", "2026-11-13 10:00", "--no-write")
+        self.assertIn("checked on each hit's own daily chart", text)
+
+
+class ScanToEntry(unittest.TestCase):
+    """The two ends together: nse-scanner's watchlist.json -> nse-entry's `watchlist --setup level`
+    (before the fix the scanner wrote no level and the entry side always errored)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.t = os.path.join(self.d, "trader")
+        os.makedirs(self.t)
+        self.wl = os.path.join(self.t, "watchlist.json")
+        self._home = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.t})
+        self._home.start()
+
+    def tearDown(self):
+        self._home.stop()
+        shutil.rmtree(self.d)
+
+    def test_scan_output_feeds_the_entry_watchlist(self):
+        entry = load("nse-entry", "entry")
+        # RELIANCE as a 20-day-breakout: 39 closes at 1,300.00 and the last at 1,345.00
+        res = {"meta": {"symbol": "RELIANCE.NS", "regularMarketPrice": 1345.0, "regularMarketVolume": 10 ** 7},
+               "timestamp": [ts((D(2026, 10, 1) + datetime.timedelta(days=i)).isoformat() + " 09:15")
+                             for i in range(40)],
+               "indicators": {"quote": [{"close": [1300.0] * 39 + [1345.0]}]}}
+        bundle = os.path.join(self.d, "daily.json")
+        with open(bundle, "w", encoding="utf-8") as fh:
+            json.dump({"RELIANCE": res}, fh)
+        code, _, err = run(["daily", "--offline", bundle, "--lists", SDIR, "--now", "2026-11-16 09:00", "--out", self.wl,
+                            "--config", os.path.join(self.t, "config.json")])
+        self.assertEqual(code, 0, err)
+        with open(self.wl, encoding="utf-8") as fh:
+            hit = json.load(fh)["hits"][0]
+        self.assertEqual((hit["symbol"], hit["setups"], hit["level"], hit["name"]),
+                         ("RELIANCE", ["breakout_20d"], 1300.0, "Reliance Industries Limited"))
+
+        charts = os.path.join(self.d, "charts")
+        os.makedirs(charts)
+        shutil.copy(os.path.join(FIX, "nse-entry", "RELIANCE-2026-11-13-5m.json"), os.path.join(charts, "RELIANCE.json"))
+        out, err_ = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err_):
+            code = entry.main(["watchlist", "--setup", "level", "--watchlist", self.wl, "--offline", charts,
+                               "--now", "2026-11-13 10:30", "--config", os.path.join(self.t, "config.json")])
+        self.assertEqual(code, 0, err_.getvalue())
+        row = out.getvalue().splitlines()[1]
+        # the level (1,300.00) is under the open: the first eligible close is the 09:25 bar's, at 09:30
+        self.assertTrue(row.startswith("RELIANCE    triggered  09:30"), row)
+        self.assertIn("₹1,300.00", row)
+        self.assertNotIn("error", row)
+
+    def test_a_hit_without_a_level_is_explained_not_crashed(self):
+        entry = load("nse-entry", "entry")
+        with open(self.wl, "w", encoding="utf-8") as fh:
+            json.dump({"hits": [{"symbol": "RELIANCE", "setups": ["bull_flag"]}]}, fh)
+        charts = os.path.join(self.d, "charts")
+        os.makedirs(charts)
+        shutil.copy(os.path.join(FIX, "nse-entry", "RELIANCE-2026-11-13-5m.json"), os.path.join(charts, "RELIANCE.json"))
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = entry.main(["watchlist", "--setup", "level", "--watchlist", self.wl, "--offline", charts,
+                               "--now", "2026-11-13 10:30", "--config", os.path.join(self.t, "config.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("this hit is bull_flag", out.getvalue())
+
+
+class TraderHome(unittest.TestCase):
+    """Review item 8 for the scanner: default files in the trader folder; the config used is named."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.home = os.path.join(self.d, "home")
+        os.makedirs(self.home)
+        self.cwd = os.getcwd()
+        self.elsewhere = os.path.join(self.d, "elsewhere")
+        os.makedirs(self.elsewhere)
+        os.chdir(self.elsewhere)
+        self._home = mock.patch.dict(os.environ, {"NSE_TRADER_HOME": self.home})
+        self._home.start()
+
+    def tearDown(self):
+        self._home.stop()
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def test_default_outputs_go_to_the_trader_home(self):
+        code, text, _ = run(["universe", "--lists", SDIR])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "universe.txt")))
+        self.assertIn("Config: none at %s, so the built-in defaults are in use." % os.path.join(self.home, "config.json"),
+                      text)
+        self.assertIn("Wrote %s (one SYMBOL|Name a line)." % os.path.join(self.home, "universe.txt"), text)
+        code, text, _ = run(["daily", "--offline", DAILY, "--symbols", "RELIANCE,BSE", "--now", "2026-11-16 09:00"])
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.home, "watchlist.json")))
+        self.assertIn("Wrote %s (mode daily" % os.path.join(self.home, "watchlist.json"), text)
+        self.assertEqual(os.listdir(self.elsewhere), [])
+        with open(os.path.join(self.home, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump({"min_circuit_band_pct": 5}, fh)
+        code, text, _ = run(["daily", "--offline", DAILY, "--symbols", "RELIANCE,BSE", "--now", "2026-11-16 09:00",
+                             "--no-write"])
+        self.assertIn("Config: %s." % os.path.join(self.home, "config.json"), text)
+
+    def test_the_cache_is_in_the_trader_home(self):
+        saved = scan.http_get, scan.today_ist
+        scan.today_ist = lambda: D(2026, 11, 14)
+        scan.http_get = lambda url, timeout=20: scan.read_maybe_gz(
+            os.path.join(SDIR, os.path.basename(url) + (".gz" if "sec_list" in url else "")))
+        try:
+            run(["universe", "nifty50", "--no-write"])
+        finally:
+            scan.http_get, scan.today_ist = saved
+        self.assertEqual(sorted(os.listdir(os.path.join(self.home, "cache"))),
+                         ["ind_nifty50list-2026-11-14.csv", "sec_list-2026-11-14.csv"])
+        self.assertEqual(os.listdir(self.elsewhere), [])
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "nse-scanner", "SKILL.md"), encoding="utf-8") as fh:
@@ -816,8 +1293,16 @@ class SkillDoc(unittest.TestCase):
         low = " ".join(text.lower().split())
         for must in ("nse", "nifty", "₹", "${claude_skill_dir}", "not financial advice", "explicit **yes**",
                      "sec_list", "gsm", "09:15", "1,334.00", "34 of 50", "/nse-news", "/nse-entry",
-                     "trader/watchlist.json", "trader/cache/"):
+                     "trader/watchlist.json", "trader/cache/",
+                     "scan failed: could not read prices", "**3**", "leaves the existing", "error_samples",
+                     "value_checked", "prior 20-day closing high", "watchlist --setup level", "nse_trader_home",
+                     "built-in defaults", "equity_l-<date>.csv", "complete sessions"):
             self.assertIn(must, low)
+        desc = " ".join(fm.split("description: >-")[1].split("argument-hint:")[0].split())
+        self.assertLess(len(desc), 600)                       # review item 27
+        for phrase in ("scan the market", "scan nifty 50", "what is breaking out", "pre-market scan",
+                       "build my watchlist"):
+            self.assertIn(phrase, desc.lower())
         for never in ("\u2014", "$", "dollar", "nasdaq", "nyse"):
             self.assertNotIn(never, low.replace("${claude_skill_dir}", ""))
 
