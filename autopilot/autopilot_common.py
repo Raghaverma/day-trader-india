@@ -248,7 +248,7 @@ def keychain(service, account=None):
     """A secret from the login keychain (macOS `security`), or None. Secrets never go in a file."""
     argv = ["security", "find-generic-password", "-s", service, "-w"]
     if account:
-        argv[3:3] = ["-a", account]
+        argv[4:4] = ["-a", account]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):

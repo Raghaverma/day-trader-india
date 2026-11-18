@@ -496,5 +496,17 @@ class Mail(unittest.TestCase):
         self.assertIn("no \"from\" address", why)
 
 
+class KeychainArgvTest(unittest.TestCase):
+    def test_account_goes_after_the_service_name(self):
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return mock.Mock(returncode=0, stdout="pw\n")
+        with mock.patch.object(ac.subprocess, "run", fake_run):
+            self.assertEqual(ac.keychain("svc", "sender-account"), "pw")
+        self.assertEqual(seen[0], ["security", "find-generic-password", "-s", "svc", "-a", "sender-account", "-w"])
+
+
 if __name__ == "__main__":
     unittest.main()
