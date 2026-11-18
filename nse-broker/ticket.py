@@ -23,6 +23,11 @@ Commands:
               "yes to all", "sure", "ok", a yes that names a different stock or
               amount, a reply that is not what you typed (the UserPromptSubmit
               hook records it), and any order that is not READY.
+  autopilot-approve
+              paper only, and only with "autopilot": true in config.json: the
+              unattended paper run's approval for one READY entry, labelled
+              approved_by "autopilot" with no reply. It refuses in manual and
+              kite mode; there is no switch around that.
   decline     records a no.
   result      records what happened after the Allow once / Deny card or in Kite:
               placed (with Kite's order id and the FILLED quantity), denied or
@@ -1482,25 +1487,16 @@ def cmd_approve(a):
         print("Not recorded: %s." % problem)
         return 1
     e, s = legs(order)
-    fp = nc.order_fingerprint(order)
-    kind = kind_of(order, rv)
     cf = order.get("cancel_first")
     if mode == "kite" and isinstance(cf, dict) and not cf.get("order_id") and not order.get("modify_first"):
         raise TicketError("order %d must cancel the open stop first and its Kite order id is not recorded. Call "
                           "get_orders, find the SL order for %s, and run ticket.py flatten --symbol %s --stop-id ID "
                           "(or --no-stop if there is none), then nse-risk, show and the yes again"
                           % (a.index, _symbol(order), _symbol(order)))
-    loss, stop, gross, ch = max_loss(order, cfg)
-    if rv and rv.get("max_loss") is not None:
-        loss = rv["max_loss"]
-    rec = {"at": ist_iso(now), "date": today, "index": a.index, "fingerprint": fp,
-           "symbol": _symbol(order), "side": str(e.get("transaction_type", "")).lower(),
-           "qty": int(float(e.get("quantity") or 0)), "kind": kind, "max_loss": loss, "stop": stop,
-           "plain": plain(order, cfg), "status": "approved", "reply": a.reply, "reply_verified": bool(verified),
-           "broker": mode, "plan_entry": _f(e.get("price")) or _f((order.get("plan") or {}).get("entry")),
-           "plan_target": target_of(order), "flat_by": order.get("flat_by")}
+    rec = approval_record(order, a.index, cfg, rv, now, today, mode)
+    rec["reply"], rec["reply_verified"] = a.reply, bool(verified)
     if mode in ("kite", "manual"):
-        rec["legs"] = approval_legs(order, fp, now, cfg, kind)
+        rec["legs"] = approval_legs(order, rec["fingerprint"], now, cfg, rec["kind"])
         if s:
             rec["stop_leg"] = leg_args(s)
     mf = order.get("modify_first")
@@ -1514,6 +1510,58 @@ def cmd_approve(a):
         print("Note: the reply could not be checked against what you typed (no recent message on record; the "
               "UserPromptSubmit hook is not installed or has not run), so it is marked reply_verified=false.")
     print_calls(order, e, s, a, mode, cfg)
+    return 0
+
+
+def approval_record(order, index, cfg, rv, now, today, mode):
+    """The approval record approve and autopilot-approve share (the caller adds who approved it)."""
+    e, _ = legs(order)
+    loss, stop, gross, ch = max_loss(order, cfg)
+    if rv and rv.get("max_loss") is not None:
+        loss = rv["max_loss"]
+    return {"at": ist_iso(now), "date": today, "index": index, "fingerprint": nc.order_fingerprint(order),
+            "symbol": _symbol(order), "side": str(e.get("transaction_type", "")).lower(),
+            "qty": int(float(e.get("quantity") or 0)), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
+            "plain": plain(order, cfg), "status": "approved", "reply": None, "reply_verified": False,
+            "broker": mode, "plan_entry": _f(e.get("price")) or _f((order.get("plan") or {}).get("entry")),
+            "plan_target": target_of(order), "flat_by": order.get("flat_by")}
+
+
+def autopilot_problem(cfg):
+    """Why the unattended paper autopilot may not approve under this config, or None. Paper only, by code:
+    there is no switch that lets it approve a manual or kite order, because nobody is there to say yes."""
+    mode = mode_of(cfg)
+    if mode != "paper":
+        return ("the autopilot is paper only and this config says \"broker\": \"%s\". A real order needs the "
+                "user's own yes, every time" % mode)
+    if cfg.get("autopilot") is not True:
+        return ("the autopilot is off: it needs \"autopilot\": true in config.json (and \"broker\": \"paper\"), "
+                "which only the user sets")
+    return None
+
+
+def cmd_autopilot_approve(a):
+    """Paper only: the approval an unattended paper run records in place of a user's yes. It is labelled
+    approved_by "autopilot" with no reply, so nobody can read it as the user's yes, and it needs the same
+    READY ticket as approve (a fresh nse-risk PASS for this exact order, today's order, the entry window)."""
+    orders, cfg, risk, state, today, now, created = _load(a)
+    problem = autopilot_problem(cfg)
+    if problem:
+        raise TicketError("autopilot-approve refused: %s" % problem)
+    mode = mode_of(cfg)
+    order = _pick(orders, a.index)
+    ready, label, rv = status_of(order, risk, state, today, mode, cfg, now, created, _state_dir(a))
+    if not ready:
+        raise TicketError("order %d is not ready: %s" % (a.index, label))
+    rec = approval_record(order, a.index, cfg, rv, now, today, mode)
+    if rec["kind"] != "entry" or rec["side"] != "buy":
+        raise TicketError("autopilot-approve takes paper entries (a BUY) only; paper-check closes the trades")
+    rec["approved_by"] = "autopilot"
+    state.setdefault("orders", []).append(rec)
+    write_state(a.state, state)
+    print("Autopilot (paper only) approved order %d: %s. No yes was asked for: this is the unattended paper run, "
+          "no broker, no money." % (a.index, plain(order, cfg)))
+    print("Paper mode: now run ticket.py paper-fill --index %d." % a.index)
     return 0
 
 
@@ -2285,7 +2333,8 @@ def journal_rows(state, today, days):
                      "plan_entry": plan_entry,
                      "entry_slippage": round(entry - plan_entry, 2) if entry is not None and plan_entry else None,
                      "exit_ref": ref, "exit_vs_ref": round(exit_ - ref, 2) if exit_ is not None and ref else None,
-                     "minutes_held": held, "paper": bool(r.get("paper")), "at": r.get("at")})
+                     "minutes_held": held, "paper": bool(r.get("paper")), "at": r.get("at"),
+                     "approved_by": (ap or {}).get("approved_by") or ("user" if ap else None)})
     rows.sort(key=lambda x: (x["date"], x.get("at") or ""))
     return rows
 
@@ -2550,6 +2599,8 @@ def cmd_log(a):
     for r in rows:
         extra = (" id " + r["broker_order_id"]) if r.get("broker_order_id") else ""
         reply = (' reply "%s"' % r["reply"]) if r.get("reply") and r["status"] in ("approved", "declined") else ""
+        if r.get("approved_by") == "autopilot":
+            reply = " by the paper autopilot (no yes asked)"
         loss = (" max loss %s" % money(r["max_loss"])) if r.get("max_loss") is not None and \
             r["status"] == "placed" else ""
         idx = ("#%s" % r["index"]) if r.get("index") is not None else "  "
@@ -2595,6 +2646,10 @@ def main(argv=None):
     p.add_argument("--reply", required=True, help="the user's reply, word for word")
     p.add_argument("--prompt-file", help="where the UserPromptSubmit hook saves the user's last message "
                                          "(default: state/last_prompt.json beside the broker state)")
+    p = sub.add_parser("autopilot-approve", help="paper only, \"autopilot\": true in config.json: the unattended "
+                                                 "paper run's approval, labelled as such (never a user's yes)")
+    common(p)
+    p.add_argument("--index", type=int, required=True)
     p = sub.add_parser("decline", help="record a no")
     common(p)
     p.add_argument("--index", type=int, required=True)
@@ -2697,7 +2752,8 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
+        return {"show": cmd_show, "approve": cmd_approve, "autopilot-approve": cmd_autopilot_approve,
+                "decline": cmd_decline, "result": cmd_result,
                 "fill": cmd_fill, "flatten": cmd_flatten, "reconcile": cmd_reconcile, "move-stop": cmd_move_stop,
                 "status": cmd_status, "paper-fill": cmd_paper_fill, "paper-check": cmd_paper_check,
                 "log": cmd_log, "journal": cmd_journal}[a.cmd](a)

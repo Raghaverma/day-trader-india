@@ -40,8 +40,11 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_layout(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith((".git", ".DS_Store")))
-        self.assertEqual(root, sorted([".claude-plugin", "CHANGELOG.md", "LICENSE", "README.md", "PORTING.md", "hooks", "tests"] + SKILLS))
+        # trader/ and __pycache__/ are .gitignored: a local trader folder from using the skills is not the layout
+        root = sorted(d for d in os.listdir(ROOT)
+                      if not d.startswith((".git", ".DS_Store")) and d not in ("trader", "__pycache__"))
+        self.assertEqual(root, sorted([".claude-plugin", "CHANGELOG.md", "LICENSE", "README.md", "PORTING.md", "autopilot", "hooks",
+                                      "tests"] + SKILLS))
 
     def test_every_skill_has_its_script(self):
         for s, script in SCRIPTS.items():

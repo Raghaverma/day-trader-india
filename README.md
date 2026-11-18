@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.1.0" src="https://img.shields.io/badge/version-1.1.0-blue?style=flat-square">
+  <img alt="version 1.2.0" src="https://img.shields.io/badge/version-1.2.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="802 offline tests" src="https://img.shields.io/badge/tests-802%20offline-3fb950?style=flat-square">
+  <img alt="832 offline tests" src="https://img.shields.io/badge/tests-832%20offline-3fb950?style=flat-square">
   <img alt="NSE India" src="https://img.shields.io/badge/market-NSE%20India-FF9933?style=flat-square">
   <img alt="paper trading by default" src="https://img.shields.io/badge/broker-paper%20by%20default-58a6ff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat-square">
@@ -111,6 +111,30 @@ Tests run offline, on fixtures cut from real data from 13 November 2026, and rep
 cd tests && python3 -m unittest discover -v
 ```
 
+## Autopilot: paper trading on an always-on Mac
+
+`autopilot/` runs the skills on every NSE trading day with nobody at the keyboard, **on paper only**, and emails you a report after the close: did the setups work, did the Time Machine call them, what the skipped signals would have done. It's built for a Mac mini that stays on.
+
+| IST | what runs |
+| --- | --- |
+| 08:40 | the Nifty 50, the daily scan, the news; then headless Claude (your logged-in account, no tools) names the stocks to sit out today, such as results days or halts |
+| 09:35-14:30 | every 5 minutes, an opening-range scan; each new signal goes through entry, exit, the Time Machine, budget, a fresh quote and risk, then the paper broker. After the day's trade cap or loss limit, signals are planned but not traded |
+| 09:16-15:10 | every minute, `paper-check` runs the stops, targets and the 15:10 flat-by on 1-minute bars |
+| 15:35 | the report (Markdown, HTML, JSON and a running scorecard), Claude's plain-words analysis, then a Gmail email |
+
+```bash
+git clone <this repo> ~/Trading/day-trader-india    # not ~/Desktop or ~/Documents: launchd can't read those
+claude                                               # log in once
+~/Trading/day-trader-india/autopilot/install.sh      # paper config, Gmail app password (to Keychain), launchd job, selftest
+```
+
+`install.sh` writes a paper config with the defaults above (₹1,00,000, ₹500 a trade, ₹1,500 a day, 3 trades) in `~/Trading/nse-autopilot` and sets `"autopilot": true` in it. It installs a LaunchAgent that ticks every minute, then runs a selftest inside launchd: Claude answers, Gmail logs in and one test email goes out. Keep the Mac awake and logged in: Energy → prevent automatic sleeping and start up after a power failure; Users & Groups → automatic login. `run_day.py status` shows the day; logs are in `~/Library/Logs/nse-autopilot/`; `uninstall.sh` removes the job and keeps your reports.
+
+- **Paper only, by code, twice.** The runner refuses any config that isn't `"broker": "paper"` with `"autopilot": true`. The approval it uses, `ticket.py autopilot-approve`, checks both again and refuses in manual and kite mode with no override. It's recorded as `approved_by: "autopilot"`, never as your yes. Nothing in `autopilot/` edits the config.
+- **Every number is Python's.** Claude gets the report as data and writes only words. If Claude or Gmail fails, the report is still written, and the failure is in it.
+- **Every signal is judged.** Signals that were vetoed, capped or blocked are replayed on the day's bars by the same paper rules, so you can see whether the caps and the veto earn their keep. The scorecard tracks the Time Machine's forecasts against outcomes (Brier score, calibration buckets).
+- **A small sample proves little.** One good week is noise; read the scorecard after 20 or more trades.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does arithmetic. It doesn't know your situation and can't see the future. SEBI's [study of intraday trading in the equity cash segment](https://www.business-standard.com/markets/news/7-in-10-intraday-traders-in-equity-cash-suffered-losses-in-fy23-sebi-study-124072400975_1.html) (July 2024) found that 71% of individual intraday traders lost money in FY2022-23, and the losers paid trading costs equal to another 57% of their losses. That's why every number here counts charges. You can lose money; talk to a SEBI-registered adviser if you need advice.
@@ -123,7 +147,7 @@ cd tests && python3 -m unittest discover -v
 - **kite**: by the plugin's PreToolUse hook, which exists only when installed as a plugin. It denies any Kite `place_order`, `modify_order` or `cancel_order` call that doesn't match, field for field, a leg you approved moments ago; each leg works once; GTT is always denied. `approve` also refuses if your last message wasn't recorded (a sign the hooks aren't installed). The hook only denies, so set the order tools to "Needs approval", never "always allow": Claude's Allow-once card is a second gate.
 - **manual**: you place the order yourself. Nothing is enforced.
 
-The gate covers MCP order tools only, so a Bash or curl call to the Kite API isn't gated. It can't tell a `/loop` or scheduled run from you at the keyboard, and the "last message" record can hold text you didn't type, so never run the broker from a loop. An approved leg is spent when the gate allows the call: if you click Deny on the Allow-once card, you need a new yes.
+The gate covers MCP order tools only, so a Bash or curl call to the Kite API isn't gated. It can't tell a `/loop` or scheduled run from you at the keyboard, and the "last message" record can hold text you didn't type, so never run the broker from a loop. The one exception is the paper autopilot above: it never uses `approve` or a yes, only `autopilot-approve`, which works in paper mode alone. An approved leg is spent when the gate allows the call: if you click Deny on the Allow-once card, you need a new yes.
 
 - **Charges are estimates.** Defaults are Zerodha's published equity-intraday rates: brokerage 0.03% or ₹20 per order (lower), STT 0.025% sell side, NSE transaction 0.00307%, SEBI ₹10/crore, stamp duty 0.003% buy side, GST 18%. Your contract note is the truth; override under `charges` in `trader/config.json`.
 - **Ticks and bands change.** NSE resets tick sizes monthly and moves stocks between bands and surveillance stages. Order prices go on the coarsest tick found within 10% of the price, valid under either side of a slab edge; `tick_sizes` in the config pins a stock's real tick.
@@ -140,6 +164,8 @@ nse-<skill>/   SKILL.md + one script each (scan.py, news.py, entry.py, exit.py, 
                size.py, check.py, ticket.py, alerts.py, results.py, deals.py) + nse_common.py,
                the shared NSE clock, tick, charges, loss and sizing rules
 hooks/         the plugin's hooks: gate.py, record_prompt.py, session_status.py
+autopilot/     the paper autopilot: run_day.py (launchd tick), report.py, claude_run.py, mail.py,
+               prompts/, install.sh, uninstall.sh, run.sh
 tests/         unittest suite + offline fixtures
 CHANGELOG.md   what changed in each version        PORTING.md   how the port was done
 ```

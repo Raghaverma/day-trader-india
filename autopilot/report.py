@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""The paper autopilot's end-of-day report. Every number here is computed in Python from the files the
+skills wrote (the day's state and log, state/paper.json, state/broker.json, the journal); Claude only
+adds words, in its own section. Standard library only.
+
+    python3 report.py --date 2026-11-13        # rebuild a day's report from what is on disk
+
+Writes $NSE_TRADER_HOME/reports/<date>.json, .md and .html, and keeps reports/scorecard.json: one row a
+day, so the all-days numbers (win rate, average R, the Time Machine's calibration, what the shadow trades
+say about the caps and vetoes) grow with every session.
+"""
+
+import argparse
+import datetime
+import html
+import importlib.util
+import json
+import os
+import re
+import sys
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import autopilot_common as ac  # noqa: E402
+
+nc = ac.nc
+_TICKET = None
+
+WHY = {
+    "traded": "traded (paper)",
+    "shadow": "planned, not traded: the day's trade cap or loss limit",
+    "vetoed": "vetoed by Claude before the open",
+    "risk_block": "blocked by nse-risk",
+    "size_refused": "refused by nse-budget",
+    "plan_refused": "refused by nse-exit",
+    "stale_trigger": "first seen over 30 minutes after it fired (the runner was not running)",
+    "entry_expired": "nse-entry: the setup expired",
+    "entry_waiting": "nse-entry did not confirm the breakout",
+    "entry_no-data": "nse-entry: no data",
+    "entry_error": "nse-entry failed",
+    "approve_refused": "autopilot-approve refused",
+    "fill_refused": "paper-fill refused",
+    "error": "the runner hit an error",
+}
+EXIT_WORDS = {"target": "target", "stop": "stop", "flat_by": "flat by 15:10", "sold": "sold", "partial": "partial",
+              "cancelled": "LIMIT never filled"}
+# a step's exit code that is a decision, not a failure (no hits, nothing new, not triggered, a refusal)
+DECISION_CODES = {"scan_orb": {0, 1}, "scan_daily": {0, 1}, "news": {0, 1}, "entry": {0, 1}, "exit": {0, 1},
+                  "size": {0, 1}, "risk": {0, 1}, "quote": {0}, "timemachine": {0}, "approve": {0, 1},
+                  "paper_fill": {0, 1}, "paper_check": {0}, "journal": {0}, "status": {0}, "universe": {0},
+                  "holidays": {0}}
+BUCKETS = ((0.0, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5), (0.5, 1.01))
+
+
+def ticket():
+    """nse-broker/ticket.py, for its paper rules (walk) and its Yahoo 1-minute bars."""
+    global _TICKET
+    if _TICKET is None:
+        path = os.path.join(ac.REPO, "nse-broker", "ticket.py")
+        spec = importlib.util.spec_from_file_location("dti_autopilot_ticket", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _TICKET = mod
+    return _TICKET
+
+
+def _f(x):
+    try:
+        return None if x is None or isinstance(x, bool) else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def money(x):
+    return "n/a" if x is None else ("-" if x < 0 else "") + nc.inr(abs(x))
+
+
+def signed_money(x):
+    return "n/a" if x is None else ("+" if x > 0 else "-" if x < 0 else "") + nc.inr(abs(x))
+
+
+def r_text(x):
+    return "n/a" if x is None else "%+.2fR" % x
+
+
+def pct(x, digits=1):
+    return "n/a" if x is None else ("%." + str(digits) + "f%%") % (100.0 * x)
+
+
+def mean(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 4) if xs else None
+
+
+# ---------------------------------------------------------------- data sources (swapped in tests)
+
+def fetch_bars(sym):
+    return ticket().fetch_bars(sym)
+
+
+def nifty_move(timeout=15):
+    """The Nifty 50 index on the day: {"close", "prev_close", "pct"} from Yahoo (^NSEI), or None."""
+    url = nc.yahoo_chart_url("^NSEI", "1d", "5m")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": nc.UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            meta = json.loads(r.read().decode("utf-8"))["chart"]["result"][0]["meta"]
+        close, prev = _f(meta.get("regularMarketPrice")), _f(meta.get("chartPreviousClose"))
+        if close and prev:
+            return {"close": close, "prev_close": prev, "pct": round(close / prev - 1, 5)}
+    except Exception:
+        return None
+    return None
+
+
+# ---------------------------------------------------------------- the pieces
+
+def day_trades(home, day):
+    paper = ac.read_json(os.path.join(home, "state", "paper.json")) or {}
+    return [t for t in paper.get("trades") or [] if t.get("date") == day]
+
+
+def journal_rows(home, day):
+    doc = ac.read_json(os.path.join(ac.day_dir(home, day), "journal.json")) or {}
+    return [r for r in doc.get("trades") or [] if r.get("date") == day]
+
+
+def summary(rows, trades):
+    nets = [r["net"] for r in rows if r.get("net") is not None]
+    rs = [r.get("r") for r in rows if r.get("r") is not None]
+    best = max(rows, key=lambda r: r.get("net") or 0) if rows else None
+    worst = min(rows, key=lambda r: r.get("net") or 0) if rows else None
+    return {"orders": len(trades),
+            "filled": sum(1 for t in trades if t.get("fill_price") is not None),
+            "never_filled": sum(1 for t in trades if t.get("status") == "cancelled"),
+            "still_open": sum(1 for t in trades if t.get("status") in ("open", "filled")),
+            "closed": len(rows), "wins": sum(1 for x in nets if x > 0), "losses": sum(1 for x in nets if x < 0),
+            "net": round(sum(nets), 2), "gross": round(sum(r.get("gross") or 0 for r in rows), 2),
+            "charges": round(sum(r.get("charges") or 0 for r in rows), 2),
+            "total_r": round(sum(rs), 2) if rs else None, "avg_r": round(sum(rs) / len(rs), 2) if rs else None,
+            "win_rate": round(sum(1 for x in nets if x > 0) / float(len(nets)), 4) if nets else None,
+            "best": {"symbol": best["symbol"], "net": best["net"]} if best else None,
+            "worst": {"symbol": worst["symbol"], "net": worst["net"]} if worst else None}
+
+
+def funnel(st, trades):
+    cands = st.get("candidates") or {}
+    ph = st.get("phases") or {}
+    scans = ph.get("orb_scans") or []
+    outcomes, blocks = {}, {}
+    for c in cands.values():
+        o = c.get("outcome") or "pending"
+        outcomes[o] = outcomes.get(o, 0) + 1
+        if o == "risk_block":
+            for r in (c.get("risk") or {}).get("reasons") or [c.get("reason") or "no reason"]:
+                key = re.sub(r"\d[\d,.]*", "N", str(r))[:160]
+                blocks[key] = blocks.get(key, 0) + 1
+    exits = {}
+    for t in trades:
+        k = t.get("exit_reason") or {"filled": "still open", "open": "LIMIT still resting"}.get(t.get("status"),
+                                                                                                 t.get("status"))
+        exits[k] = exits.get(k, 0) + 1
+    pre = ph.get("premarket") or {}
+    return {"universe": pre.get("universe"), "orb_scans": len(scans),
+            "orb_scans_failed": sum(1 for s in scans if s.get("failed")), "signals": len(cands),
+            "outcomes": outcomes, "risk_blocks": blocks, "exits": exits,
+            "stop_gaps": sum(1 for t in trades if t.get("stop_gap"))}
+
+
+def trade_rows(st, rows, trades):
+    """One row per paper trade today, joined with what the Time Machine said before it."""
+    cands = st.get("candidates") or {}
+    by_sym = {}
+    for r in rows:
+        by_sym.setdefault(r["symbol"], []).append(r)
+    out = []
+    for t in trades:
+        sym = t.get("symbol")
+        c = cands.get(sym) or {}
+        tm = c.get("tm") or {}
+        j = (by_sym.get(sym) or [None])[0]
+        hit = None
+        if t.get("status") == "closed" and t.get("fill_price") is not None:
+            hit = 1 if t.get("exit_reason") == "target" else 0
+        out.append({"symbol": sym, "qty": t.get("qty"), "status": t.get("status"), "ordered_at": t.get("ordered_at"),
+                    "fill": t.get("fill_price"), "fill_time": t.get("fill_time"), "exit": t.get("exit_price"),
+                    "exit_time": t.get("exit_time"), "exit_reason": t.get("exit_reason") or t.get("status"),
+                    "net": (j or {}).get("net", t.get("pnl_net")), "charges": (j or {}).get("charges", t.get("charges")),
+                    "r": (j or {}).get("r"), "entry_slippage": (j or {}).get("entry_slippage"),
+                    "exit_vs_ref": (j or {}).get("exit_vs_ref"), "minutes_held": (j or {}).get("minutes_held"),
+                    "tm_p_target": tm.get("p_target"), "tm_p_stop": tm.get("p_stop"),
+                    "tm_category": tm.get("category"), "tm_avg_R_net": tm.get("avg_R_net"),
+                    "tm_history": tm.get("history"), "hit": hit, "daily_setups": c.get("daily_setups") or [],
+                    "stop_gap": bool(t.get("stop_gap"))})
+    return out
+
+
+def calibration(pairs):
+    """pairs: [(p_target, hit)]. The Brier score (0 is perfect; always saying the average hit rate scores
+    the base line), and predicted vs actual by bucket."""
+    pairs = [(float(p), int(h)) for p, h in pairs if p is not None and h is not None]
+    if not pairs:
+        return {"n": 0}
+    n = len(pairs)
+    brier = sum((p - h) ** 2 for p, h in pairs) / n
+    rate = sum(h for _, h in pairs) / float(n)
+    base = sum((rate - h) ** 2 for _, h in pairs) / n
+    buckets = []
+    for lo, hi in BUCKETS:
+        inb = [(p, h) for p, h in pairs if lo <= p < hi]
+        if inb:
+            buckets.append({"from": lo, "to": min(hi, 1.0), "n": len(inb),
+                            "predicted": round(sum(p for p, _ in inb) / len(inb), 4),
+                            "actual": round(sum(h for _, h in inb) / float(len(inb)), 4)})
+    return {"n": n, "brier": round(brier, 4), "base_brier": round(base, 4), "hit_rate": round(rate, 4),
+            "avg_predicted": round(sum(p for p, _ in pairs) / n, 4), "buckets": buckets}
+
+
+def shadow(c, day, bars, cfg):
+    """Replay a signal that was not traded with the paper broker's own rules (ticket.walk): a LIMIT at the
+    plan's entry from the trigger, the SL stop, the 2R target as an alert, flat by 15:10."""
+    p = c.get("plan") or {}
+    trig = c.get("trigger") or {}
+    entry, stop, target, qty = _f(p.get("entry")), _f(p.get("stop")), _f(p.get("target")), p.get("quantity")
+    row = {"symbol": c.get("symbol"), "why": c.get("outcome"), "reason": c.get("reason"), "entry": entry,
+           "stop": stop, "target": target, "qty": qty, "at": trig.get("at") or c.get("decided_at")}
+    if not (entry and stop and target and qty and row["at"]):
+        row["result"] = "no plan"
+        return row
+    tk = ticket()
+    d = datetime.date.fromisoformat(day)
+    ordered = datetime.datetime.combine(d, nc.parse_hhmm(row["at"]))
+    done = [b for b in bars if b[0].date() == d and b[0] + datetime.timedelta(minutes=1) <= ordered]
+    if not done:
+        row["result"] = "no data"
+        return row
+    stamp = ordered.strftime(tk.STAMP)
+    t = {"id": "shadow-" + row["symbol"], "date": day, "symbol": row["symbol"], "qty": int(qty), "limit": entry,
+         "ordered_at": stamp, "target": target, "flat_by": p.get("flat_by") or cfg.get("flat_by") or "15:10",
+         "stop": {"type": "SL", "trigger": stop, "price": _f(p.get("worst_exit")) or stop}}
+    fill = None
+    if done[-1][4] <= entry + 1e-9:
+        fill = done[-1][4]
+        t.update(status="filled", fill_time=stamp, fill_price=fill)
+    else:
+        t["status"] = "open"
+    end = datetime.datetime.combine(d, datetime.time(23, 59))
+    exit_ = None
+    for kind, when, price, _note in tk.walk(t, bars, end, cfg):
+        if kind == "fill":
+            fill = price
+        elif kind == "cancel":
+            row["result"] = "never filled"
+            return row
+        elif kind in ("stop", "target", "flat_by"):
+            exit_, row["result"], row["exit_at"] = price, kind, when.strftime("%H:%M")
+            break
+    if fill is None or exit_ is None:
+        row["result"] = row.get("result") or "no exit in the bars"
+        return row
+    gross = round(int(qty) * (exit_ - fill), 2)
+    ch = nc.intraday_charges(int(qty), fill, exit_, cfg)["total"]
+    row.update(fill=fill, exit=exit_, gross=gross, charges=ch, net=round(gross - ch, 2))
+    ml = _f(p.get("max_loss"))
+    row["r"] = round(row["net"] / ml, 2) if ml else None
+    return row
+
+
+def shadows(st, day, cfg, bars=None):
+    loader = bars or fetch_bars
+    rows, cache = [], {}
+    for c in sorted((st.get("candidates") or {}).values(), key=lambda c: c.get("first_seen") or ""):
+        if c.get("outcome") in (None, "traded") or not c.get("plan"):
+            continue
+        sym = c["symbol"]
+        try:
+            if sym not in cache:
+                cache[sym] = loader(sym)
+            rows.append(shadow(c, day, cache[sym], cfg))
+        except Exception as e:
+            rows.append({"symbol": sym, "why": c.get("outcome"), "result": "could not replay: %s" % ac.tail(str(e), 120)})
+    by_why = {}
+    for r in rows:
+        w = by_why.setdefault(r.get("why") or "?", {"n": 0, "replayed": 0, "net": 0.0, "wins": 0, "targets": 0,
+                                                     "stops": 0})
+        w["n"] += 1
+        if r.get("net") is not None:
+            w["replayed"] += 1
+            w["net"] = round(w["net"] + r["net"], 2)
+            w["wins"] += 1 if r["net"] > 0 else 0
+        w["targets"] += 1 if r.get("result") == "target" else 0
+        w["stops"] += 1 if r.get("result") == "stop" else 0
+    return {"rows": rows, "by_why": by_why}
+
+
+def execution(trade_list):
+    filled = [t for t in trade_list if t.get("fill") is not None and t.get("exit") is not None]
+    gross = sum(abs((t["exit"] - t["fill"]) * (t.get("qty") or 0)) for t in filled)
+    charges = sum(t.get("charges") or 0 for t in filled)
+    return {"avg_entry_slippage": mean([t.get("entry_slippage") for t in filled]),
+            "avg_exit_vs_target": mean([t.get("exit_vs_ref") for t in filled if t.get("exit_reason") == "target"]),
+            "avg_exit_vs_stop": mean([t.get("exit_vs_ref") for t in filled if t.get("exit_reason") == "stop"]),
+            "avg_minutes_held": mean([t.get("minutes_held") for t in filled]),
+            "charges_share_of_gross_move": round(charges / gross, 4) if gross else None,
+            "stop_gaps": sum(1 for t in trade_list if t.get("stop_gap"))}
+
+
+def health(st, log):
+    failures = []
+    for e in log:
+        step, code = e.get("step"), e.get("code")
+        if step not in DECISION_CODES or "code" not in e:
+            continue
+        if code is None or code not in DECISION_CODES[step]:
+            failures.append({"at": e.get("at"), "step": step, "symbol": e.get("symbol"), "code": code,
+                             "error": ac.tail(e.get("stderr") or e.get("stdout") or "", 240)})
+    ticks = st.get("ticks") or []
+    seen = sorted({t for t in ticks if "09:16" <= t <= "15:30"})
+    gaps, prev = [], None
+    for t in seen:
+        if prev:
+            a = int(prev[:2]) * 60 + int(prev[3:])
+            b = int(t[:2]) * 60 + int(t[3:])
+            if b - a > 3:
+                gaps.append("%s-%s" % (prev, t))
+        prev = t
+    ph = st.get("phases") or {}
+    pre = ph.get("premarket") or {}
+    return {"failures": failures, "failures_by_step": _count(f["step"] for f in failures),
+            "session_minutes_seen": len(seen), "session_minutes": 375, "gaps": gaps,
+            "first_tick": seen[0] if seen else None, "last_tick": seen[-1] if seen else None,
+            "premarket": "ran" if pre.get("done") else ("started, not finished" if pre else "did not run"),
+            "news": pre.get("news"), "veto": pre.get("veto"), "closed": ph.get("closed")}
+
+
+def _count(items):
+    out = {}
+    for i in items:
+        out[i] = out.get(i, 0) + 1
+    return out
+
+
+def build(home, day, settings, cfg, bars=None, index_move=None):
+    """The report dict for `day`, written out (without Claude's analysis yet). Returns {"report", "paths"}."""
+    st = ac.load_day(home, day)
+    log = ac.read_log(home, day)
+    trades = day_trades(home, day)
+    rows = journal_rows(home, day)
+    tl = trade_rows(st, rows, trades)
+    offline = settings.get("offline") or {}
+    if bars is None and offline.get("shadow_bars"):          # tests and replays: saved 1-minute charts
+        pattern = offline["shadow_bars"][0]
+        bars = lambda sym: ticket().read_bars_file(pattern.replace("{sym}", sym))
+    if index_move is None and nc.test_mode():
+        index_move = False                                   # a replay never reaches for today's index
+    move = (index_move or nifty_move)() if index_move is not False else None
+    sh = shadows(st, day, cfg, bars)
+    vetoes = ac.read_json(os.path.join(ac.day_dir(home, day), "vetoes.json")) or {}
+    rep = {"date": day, "generated_at": nc.utc_iso(), "paper": True,
+           "rules": {k: cfg.get(k) for k in ("budget", "max_loss_per_trade_inr", "max_daily_loss_inr",
+                                             "max_trades_per_day", "no_entries_before", "no_entries_after",
+                                             "flat_by", "min_reward_risk")},
+           "universe": settings.get("universe"),
+           "day": summary(rows, trades), "trades": tl, "funnel": funnel(st, trades),
+           "time_machine": calibration([(t["tm_p_target"], t["hit"]) for t in tl]),
+           "shadows": sh, "execution": execution(tl), "health": health(st, log), "benchmark": move,
+           "vetoes": vetoes.get("vetoes") or [], "veto_summary": vetoes.get("summary"),
+           "candidates": [{k: c.get(k) for k in ("symbol", "first_seen", "scan_at", "outcome", "reason",
+                                                 "daily_setups")}
+                          for c in sorted((st.get("candidates") or {}).values(),
+                                          key=lambda c: c.get("first_seen") or "")]}
+    return write_outputs(home, day, rep, None)
+
+
+# ---------------------------------------------------------------- scorecard (all days)
+
+def score_row(rep):
+    d = rep["day"]
+    return {"net": d["net"], "charges": d["charges"], "closed": d["closed"], "wins": d["wins"],
+            "losses": d["losses"], "total_r": d["total_r"], "signals": rep["funnel"]["signals"],
+            "outcomes": rep["funnel"]["outcomes"], "nifty_pct": (rep.get("benchmark") or {}).get("pct"),
+            "tm": [{"symbol": t["symbol"], "p": t["tm_p_target"], "hit": t["hit"], "category": t["tm_category"],
+                    "r": t["r"], "daily_setup": bool(t["daily_setups"])} for t in rep["trades"]],
+            "shadows": {k: {"n": v["n"], "replayed": v["replayed"], "net": v["net"], "wins": v["wins"]}
+                        for k, v in rep["shadows"]["by_why"].items()},
+            "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
+
+
+def scorecard(home, day=None, rep=None):
+    path = os.path.join(ac.reports_dir(home), "scorecard.json")
+    doc = ac.read_json(path) or {}
+    days = doc.get("days") or {}
+    if rep is not None:
+        days[day] = score_row(rep)
+    order = sorted(days)
+    equity, run = [], 0.0
+    for d in order:
+        run = round(run + (days[d].get("net") or 0), 2)
+        equity.append({"date": d, "net": days[d].get("net"), "cumulative": run})
+    tms = [t for d in order for t in days[d].get("tm") or []]
+    closed = sum(days[d].get("closed") or 0 for d in order)
+    wins = sum(days[d].get("wins") or 0 for d in order)
+    rs = [t["r"] for t in tms if t.get("r") is not None]
+    cats = {}
+    for t in tms:
+        if t.get("hit") is None:
+            continue
+        k = t.get("category") or "no Time Machine"
+        c = cats.setdefault(k, {"n": 0, "targets": 0, "r": []})
+        c["n"] += 1
+        c["targets"] += t["hit"]
+        if t.get("r") is not None:
+            c["r"].append(t["r"])
+    by_cat = {k: {"n": v["n"], "target_rate": round(v["targets"] / float(v["n"]), 4),
+                  "avg_r": round(sum(v["r"]) / len(v["r"]), 2) if v["r"] else None} for k, v in cats.items()}
+    setup = {}
+    for label, flag in (("ORB + a daily setup", True), ("ORB alone", False)):
+        xs = [t["r"] for t in tms if t.get("r") is not None and bool(t.get("daily_setup")) == flag]
+        setup[label] = {"n": len(xs), "avg_r": round(sum(xs) / len(xs), 2) if xs else None}
+    sh = {}
+    for d in order:
+        for k, v in (days[d].get("shadows") or {}).items():
+            s = sh.setdefault(k, {"n": 0, "replayed": 0, "net": 0.0, "wins": 0})
+            for f in ("n", "replayed", "wins"):
+                s[f] += v.get(f) or 0
+            s["net"] = round(s["net"] + (v.get("net") or 0), 2)
+    totals = {"days": len(order), "closed": closed, "wins": wins,
+              "win_rate": round(wins / float(closed), 4) if closed else None,
+              "net": equity[-1]["cumulative"] if equity else 0.0,
+              "charges": round(sum(days[d].get("charges") or 0 for d in order), 2),
+              "avg_r": round(sum(rs) / len(rs), 2) if rs else None,
+              "max_drawdown": max_drawdown([e["cumulative"] for e in equity]),
+              "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
+              "by_setup": setup, "shadows": sh}
+    out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
+    if rep is not None:
+        ac.write_json(path, out)
+    return out
+
+
+def max_drawdown(curve):
+    peak, worst = 0.0, 0.0
+    for x in curve:
+        peak = max(peak, x)
+        worst = min(worst, x - peak)
+    return round(worst, 2)
+
+
+# ---------------------------------------------------------------- rendering
+
+def headline(rep):
+    d = rep["day"]
+    nifty = rep.get("benchmark") or {}
+    bits = ["%s: %s net after %s charges" % (rep["date"], signed_money(d["net"]), money(d["charges"])),
+            "%d trade%s (%d win%s, %d loss%s)" % (d["closed"], "" if d["closed"] == 1 else "s", d["wins"],
+                                                 "" if d["wins"] == 1 else "s", d["losses"],
+                                                 "" if d["losses"] == 1 else "es"),
+            "%d ORB signal%s" % (rep["funnel"]["signals"], "" if rep["funnel"]["signals"] == 1 else "s")]
+    if nifty.get("pct") is not None:
+        bits.append("Nifty 50 %+.2f%%" % (100 * nifty["pct"]))
+    return ", ".join(bits)
+
+
+def blocks(rep, card, analysis=None):
+    """The report as neutral blocks, rendered to Markdown and to HTML by the same code."""
+    d, fn, ex, h = rep["day"], rep["funnel"], rep["execution"], rep["health"]
+    out = [("h1", "NSE autopilot (paper): %s" % rep["date"]),
+           ("lead", headline(rep)),
+           ("p", "Paper trading only: no broker, no money. Fills come from Yahoo's free 1-minute bars and P&L is "
+                 "net of estimated Zerodha charges. Not financial advice.")]
+    r = rep["rules"]
+    out.append(("p", "Rules: budget %s, max loss %s a trade and %s a day, at most %s trades, entries %s-%s, flat by "
+                     "%s. Universe: %s." % (money(_f(r.get("budget"))), money(_f(r.get("max_loss_per_trade_inr"))),
+                                            money(_f(r.get("max_daily_loss_inr"))), r.get("max_trades_per_day"),
+                                            r.get("no_entries_before"), r.get("no_entries_after"), r.get("flat_by"),
+                                            rep.get("universe") if not isinstance(rep.get("universe"), list)
+                                            else ", ".join(rep["universe"]))))
+    out.append(("h2", "Trades"))
+    if rep["trades"]:
+        out.append(("table", ["Stock", "Qty", "In", "Out", "Exit", "Net", "R", "Held", "TM P(target)", "TM said"],
+                    [[t["symbol"], t["qty"], _px(t["fill"]), _px(t["exit"]),
+                      EXIT_WORDS.get(t["exit_reason"], t["exit_reason"]), signed_money(_f(t["net"])), r_text(t["r"]),
+                      ("%s min" % t["minutes_held"]) if t["minutes_held"] is not None else "",
+                      pct(t["tm_p_target"]), t["tm_category"] or "not run"] for t in rep["trades"]]))
+        out.append(("p", "Day: %d closed, %d won, %d lost; gross %s, charges %s, net %s; total %s, average %s." % (
+            d["closed"], d["wins"], d["losses"], signed_money(d["gross"]), money(d["charges"]),
+            signed_money(d["net"]), r_text(d["total_r"]), r_text(d["avg_r"]))))
+    else:
+        out.append(("p", "No paper trades today."))
+
+    out.append(("h2", "Every signal, start to finish"))
+    items = ["Universe: %s stock(s). ORB scans: %d (%d failed). Signals (ORB hits): %d." % (
+        fn["universe"] if fn["universe"] is not None else "?", fn["orb_scans"], fn["orb_scans_failed"], fn["signals"])]
+    for k, n in sorted(fn["outcomes"].items(), key=lambda kv: -kv[1]):
+        items.append("%d %s" % (n, WHY.get(k, k)))
+    for k, n in sorted(fn["risk_blocks"].items(), key=lambda kv: -kv[1]):
+        items.append("nse-risk: %d x %s" % (n, k))
+    for k, n in sorted(fn["exits"].items(), key=lambda kv: -kv[1]):
+        items.append("paper exits: %d x %s" % (n, EXIT_WORDS.get(k, k)))
+    if fn["stop_gaps"]:
+        items.append("%d stop(s) gapped through the SL limit" % fn["stop_gaps"])
+    out.append(("ul", items))
+    if rep.get("vetoes"):
+        out.append(("p", "Claude's pre-market vetoes: " + "; ".join("%s (%s)" % (v["symbol"], v["reason"])
+                                                                    for v in rep["vetoes"])))
+
+    out.append(("h2", "Did the Time Machine call it?"))
+    tm = rep["time_machine"]
+    if tm.get("n"):
+        out.append(("p", "Today: %d trade%s with a forecast. Average predicted P(target first) %s, actual %s. "
+                         "Brier score %.3f (0 is perfect; %.3f is what always guessing today's hit rate scores)." % (
+                             tm["n"], "" if tm["n"] == 1 else "s", pct(tm["avg_predicted"]), pct(tm["hit_rate"]),
+                             tm["brier"], tm["base_brier"])))
+    else:
+        out.append(("p", "No closed trade with a Time Machine forecast today."))
+    ct = card["totals"]["time_machine"]
+    if ct.get("n"):
+        out.append(("p", "All days: %d forecasts, predicted %s vs actual %s, Brier %.3f vs base %.3f." % (
+            ct["n"], pct(ct["avg_predicted"]), pct(ct["hit_rate"]), ct["brier"], ct["base_brier"])))
+        out.append(("table", ["P(target) bucket", "Trades", "Predicted", "Actual"],
+                    [["%d-%d%%" % (100 * b["from"], 100 * b["to"]), b["n"], pct(b["predicted"]), pct(b["actual"])]
+                     for b in ct["buckets"]]))
+    if card["totals"]["by_category"]:
+        out.append(("table", ["Time Machine verdict", "Trades", "Target first", "Average R"],
+                    [[k, v["n"], pct(v["target_rate"]), r_text(v["avg_r"])]
+                     for k, v in sorted(card["totals"]["by_category"].items())]))
+
+    out.append(("h2", "Signals not taken, replayed"))
+    sh = rep["shadows"]
+    if sh["rows"]:
+        out.append(("p", "Each signal that was planned but not traded, replayed on the day's 1-minute bars with the "
+                         "paper broker's own rules (LIMIT at the plan's entry, SL stop, 2R target as an alert, "
+                         "flat by 15:10)."))
+        out.append(("table", ["Stock", "Why not traded", "Signal", "In", "Result", "Net", "R"],
+                    [[s["symbol"], WHY.get(s.get("why"), s.get("why")), s.get("at") or "", _px(s.get("fill")),
+                      s.get("result") or "", signed_money(s.get("net")), r_text(s.get("r"))] for s in sh["rows"]]))
+        out.append(("ul", ["%s: %d signals, %d replayed, %d green, %s net if taken" % (
+            WHY.get(k, k), v["n"], v["replayed"], v["wins"], signed_money(v["net"]))
+            for k, v in sorted(sh["by_why"].items())]))
+    else:
+        out.append(("p", "Every planned signal was traded, or there were none."))
+
+    out.append(("h2", "Execution"))
+    out.append(("ul", ["Average entry slippage vs the plan: %s" % _px(ex["avg_entry_slippage"], signed=True),
+                       "Average exit vs the target (target exits): %s" % _px(ex["avg_exit_vs_target"], signed=True),
+                       "Average exit vs the stop (stop exits): %s" % _px(ex["avg_exit_vs_stop"], signed=True),
+                       "Average time held: %s" % ("%.0f min" % ex["avg_minutes_held"]
+                                                  if ex["avg_minutes_held"] is not None else "n/a"),
+                       "Charges as a share of the gross move: %s" % pct(ex["charges_share_of_gross_move"]),
+                       "Stops that gapped: %d" % ex["stop_gaps"]]))
+
+    out.append(("h2", "Health"))
+    hl = ["Pre-market: %s; news: %s; Claude's veto: %s." % (h["premarket"], news_words(h["news"]),
+                                                             h["veto"] or "n/a"),
+          "Session minutes the runner saw: %d of %d (first %s, last %s)%s." % (
+              h["session_minutes_seen"], h["session_minutes"], h["first_tick"] or "-", h["last_tick"] or "-",
+              ("; gaps: " + ", ".join(h["gaps"])) if h["gaps"] else ""),
+          "Step failures: %s." % (", ".join("%s x%d" % kv for kv in sorted(h["failures_by_step"].items()))
+                                   or "none")]
+    for f in h["failures"][:8]:
+        hl.append("%s %s%s: %s" % ((f.get("at") or "")[11:16], f["step"],
+                                   (" " + f["symbol"]) if f.get("symbol") else "", f.get("error") or
+                                   "exit %s" % f.get("code")))
+    out.append(("ul", hl))
+
+    t = card["totals"]
+    out.append(("h2", "All days so far"))
+    out.append(("p", "%d day%s, %d closed trades, win rate %s, average %s, total %s net after %s charges, worst "
+                     "drawdown %s." % (t["days"], "" if t["days"] == 1 else "s", t["closed"], pct(t["win_rate"]),
+                                       r_text(t["avg_r"]), signed_money(t["net"]), money(t["charges"]),
+                                       signed_money(t["max_drawdown"]))))
+    if card["equity"]:
+        out.append(("table", ["Date", "Net", "Cumulative", "Nifty 50"],
+                    [[e["date"], signed_money(e["net"]), signed_money(e["cumulative"]),
+                      ("%+.2f%%" % (100 * card["days"][e["date"]]["nifty_pct"]))
+                      if card["days"][e["date"]].get("nifty_pct") is not None else "n/a"]
+                     for e in card["equity"][-20:]]))
+    bs = t["by_setup"]
+    out.append(("p", "ORB with a daily setup: %d trades, average %s. ORB alone: %d trades, average %s." % (
+        bs["ORB + a daily setup"]["n"], r_text(bs["ORB + a daily setup"]["avg_r"]), bs["ORB alone"]["n"],
+        r_text(bs["ORB alone"]["avg_r"]))))
+    if t["shadows"]:
+        out.append(("ul", ["%s: %d signals, %d replayed, %d green, %s net if taken" % (
+            WHY.get(k, k), v["n"], v["replayed"], v["wins"], signed_money(v["net"]))
+            for k, v in sorted(t["shadows"].items())]))
+
+    if analysis:
+        out.append(("h2", "Claude's analysis"))
+        out.append(("markdown", analysis))
+    elif analysis is False:
+        out.append(("h2", "Claude's analysis"))
+        out.append(("p", "Claude's analysis is unavailable today; the numbers above are complete without it."))
+    return out
+
+
+def news_words(n):
+    if not n:
+        return "not run"
+    code = n.get("code")
+    if code == 3:
+        return "FAILED (every news source was down)"
+    if code not in (0, 1):
+        return "failed (exit %s)" % code
+    return "%d new item%s" % (n.get("items") or 0, "" if n.get("items") == 1 else "s")
+
+
+def _px(x, signed=False):
+    if x is None:
+        return "n/a"
+    return ("%+.2f" % x) if signed else nc.inr(x, keep_zeros=True)
+
+
+def to_markdown(bl):
+    lines = []
+    for b in bl:
+        kind = b[0]
+        if kind == "h1":
+            lines += ["# " + b[1], ""]
+        elif kind == "h2":
+            lines += ["## " + b[1], ""]
+        elif kind == "lead":
+            lines += ["**" + b[1] + "**", ""]
+        elif kind == "p":
+            lines += [b[1], ""]
+        elif kind == "ul":
+            lines += ["- " + str(i) for i in b[1]] + [""]
+        elif kind == "table":
+            head, rows = b[1], b[2]
+            lines.append("| " + " | ".join(str(x) for x in head) + " |")
+            lines.append("|" + "|".join("---" for _ in head) + "|")
+            for r in rows:
+                lines.append("| " + " | ".join(str(x).replace("|", "/") for x in r) + " |")
+            lines.append("")
+        elif kind == "markdown":
+            lines += [b[1].strip(), ""]
+    return "\n".join(lines)
+
+
+CSS = """
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--soft:#f6f8fa;--good:#1a7f37;--bad:#cf222e}
+@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#3d444d;
+--soft:#151b23;--good:#3fb950;--bad:#f85149}}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,
+Arial,sans-serif;margin:0;padding:16px}
+main{max-width:860px;margin:0 auto}
+h1{font-size:22px;margin:8px 0 4px}h2{font-size:17px;margin:26px 0 8px;padding-bottom:4px;
+border-bottom:1px solid var(--line)}
+.lead{font-size:17px;font-weight:600;margin:6px 0 10px}
+p,li{color:var(--fg)}.muted{color:var(--muted)}
+.wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13.5px;margin:6px 0 10px}
+th,td{border:1px solid var(--line);padding:5px 8px;text-align:left;white-space:nowrap}
+th{background:var(--soft)}
+"""
+
+
+def inline_md(text):
+    t = html.escape(text)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    return t
+
+
+def md_to_html(text):
+    """Enough Markdown for Claude's analysis: headings, bullet and numbered lists, paragraphs, bold, code."""
+    out, para, lst = [], [], None
+
+    def flush():
+        nonlocal para, lst
+        if para:
+            out.append("<p>%s</p>" % inline_md(" ".join(para)))
+            para = []
+        if lst:
+            out.append("<%s>%s</%s>" % (lst[0], "".join("<li>%s</li>" % inline_md(i) for i in lst[1]), lst[0]))
+            lst = None
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            flush()
+            level = min(len(m.group(1)) + 2, 6)
+            out.append("<h%d>%s</h%d>" % (level, inline_md(m.group(2)), level))
+            continue
+        m = re.match(r"^\s*(?:[-*]|(\d+)[.)])\s+(.*)$", line)
+        if m:
+            if para:
+                out.append("<p>%s</p>" % inline_md(" ".join(para)))
+                para = []
+            tag = "ol" if m.group(1) else "ul"
+            if not lst or lst[0] != tag:
+                if lst:
+                    flush()
+                lst = (tag, [])
+            lst[1].append(m.group(2))
+            continue
+        if not line.strip():
+            flush()
+            continue
+        if lst:
+            flush()
+        para.append(line.strip())
+    flush()
+    return "\n".join(out)
+
+
+def to_html(bl, title):
+    body = []
+    for b in bl:
+        kind = b[0]
+        if kind == "h1":
+            body.append("<h1>%s</h1>" % html.escape(b[1]))
+        elif kind == "h2":
+            body.append("<h2>%s</h2>" % html.escape(b[1]))
+        elif kind == "lead":
+            body.append('<p class="lead">%s</p>' % html.escape(b[1]))
+        elif kind == "p":
+            body.append("<p>%s</p>" % html.escape(b[1]))
+        elif kind == "ul":
+            body.append("<ul>%s</ul>" % "".join("<li>%s</li>" % html.escape(str(i)) for i in b[1]))
+        elif kind == "table":
+            head = "".join("<th>%s</th>" % html.escape(str(x)) for x in b[1])
+            rows = "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(x)) for x in r) for r in b[2])
+            body.append('<div class="wrap"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+                        % (head, rows))
+        elif kind == "markdown":
+            body.append(md_to_html(b[1]))
+    return ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>%s</title><style>%s</style></head><body><main>\n%s\n</main></body></html>\n"
+            % (html.escape(title), CSS, "\n".join(body)))
+
+
+def paths_for(home, day):
+    r = ac.reports_dir(home)
+    return {"json": os.path.join(r, day + ".json"), "md": os.path.join(r, day + ".md"),
+            "html": os.path.join(r, day + ".html"), "analysis": os.path.join(r, day + ".analysis.md"),
+            "scorecard": os.path.join(r, "scorecard.json")}
+
+
+def write_outputs(home, day, rep, analysis):
+    """Write the day's JSON, Markdown and HTML (with Claude's analysis when there is one) and the scorecard.
+    analysis: text, None (not asked yet) or False (asked and unavailable)."""
+    paths = paths_for(home, day)
+    if analysis:
+        rep["analysis"] = analysis
+        with open(paths["analysis"], "w", encoding="utf-8") as fh:
+            fh.write(analysis.strip() + "\n")
+    card = scorecard(home, day, rep)
+    ac.write_json(paths["json"], rep)
+    bl = blocks(rep, card, analysis if analysis else (False if analysis is False else None))
+    with open(paths["md"], "w", encoding="utf-8") as fh:
+        fh.write(to_markdown(bl))
+    with open(paths["html"], "w", encoding="utf-8") as fh:
+        fh.write(to_html(bl, "NSE autopilot %s" % day))
+    if not analysis:
+        paths.pop("analysis")
+    return {"report": rep, "paths": paths, "scorecard": card}
+
+
+def for_claude(home, day):
+    """What Claude reads for the end-of-day analysis: the day's report and the all-days scorecard, compact."""
+    paths = paths_for(home, day)
+    rep = ac.read_json(paths["json"]) or {}
+    card = ac.read_json(paths["scorecard"]) or {}
+    rep = dict(rep)
+    rep.pop("analysis", None)
+    return {"today": rep, "all_days": {"totals": card.get("totals"), "equity": (card.get("equity") or [])[-30:]}}
+
+
+def main(argv=None):
+    nc.utf8_stdout()
+    ap = argparse.ArgumentParser(description="Rebuild the paper autopilot's report for a day.")
+    ap.add_argument("--date", help="YYYY-MM-DD (default today, IST)")
+    ap.add_argument("--no-network", action="store_true", help="skip the shadow replays' bars and the Nifty move")
+    a = ap.parse_args(argv)
+    home = ac.trader_home()
+    settings = ac.load_settings(home)
+    cfg = ac.load_cfg(home)
+    day = a.date or nc.to_ist(nc.utc_now()).date().isoformat()
+    if a.no_network:
+        out = build(home, day, settings, cfg, bars=lambda s: [], index_move=False)
+    else:
+        out = build(home, day, settings, cfg)
+    try:                                   # keep Claude's analysis from the day's run, if there was one
+        with open(paths_for(home, day)["analysis"], encoding="utf-8") as fh:
+            out = write_outputs(home, day, out["report"], fh.read())
+    except OSError:
+        pass
+    print(headline(out["report"]))
+    for k, v in sorted(out["paths"].items()):
+        print("  %s: %s" % (k, v))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

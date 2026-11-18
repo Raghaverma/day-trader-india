@@ -1,0 +1,26 @@
+{
+  "universe": "nifty50",
+  "premarket_from": "08:40",
+  "veto_by": "09:25",
+  "orb_until": "14:31",
+  "eod_at": "15:35",
+  "news": true,
+  "daily_scan": true,
+  "claude": {
+    "enabled": true,
+    "bin": "claude",
+    "premarket_model": "sonnet",
+    "eod_model": "sonnet",
+    "premarket_timeout_s": 600,
+    "eod_timeout_s": 900
+  },
+  "mail": {
+    "enabled": false,
+    "from": "",
+    "to": [],
+    "keychain_service": "nse-autopilot-gmail",
+    "host": "smtp.gmail.com",
+    "port": 465
+  },
+  "notify": true
+}

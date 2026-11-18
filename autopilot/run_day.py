@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""The paper autopilot's day runner: runs the day-trader-india skills on a trading day with nobody at the
+keyboard, on PAPER only, and writes the end-of-day report. Standard library only.
+
+    python3 run_day.py tick        # what launchd runs every minute; does whatever the clock says is due
+    python3 run_day.py status      # today's state, in plain words
+    python3 run_day.py selftest    # python, config, Claude (headless) and Gmail, from where it is run
+    python3 run_day.py eod --date 2026-11-13     # rebuild and resend a day's report
+    NSE_TEST_MODE=1 python3 run_day.py replay --date 2026-11-13 --times 08:45,10:05,15:35
+
+A tick is idempotent: the day's state lives in $NSE_TRADER_HOME/autopilot/<date>/state.json, so a tick that
+crashes, a Mac that sleeps or a reboot only means the next tick carries on. launchd never starts a job that
+is still running, and a lock file stops a hand-run tick from overlapping it.
+
+The day, in IST (times from autopilot.json):
+  08:40   once: the Nifty 50 list, the daily scan (context), the news, then Claude's pre-market veto
+  09:16-  every tick with a paper trade open: ticket.py paper-check (fills, stops, targets, flat by 15:10)
+  09:36-14:31, one minute after each 5-minute bar closes: an ORB scan; each new hit goes through
+          nse-entry -> nse-exit -> nse-timemachine -> nse-budget -> nse-alerts quote -> nse-risk ->
+          ticket.py autopilot-approve -> paper-fill, one symbol at a time. After the day's trade cap or
+          loss limit, a hit is planned but not traded: a shadow, which the report replays.
+  15:35   once: the last paper-check, the journal, report.py, Claude's analysis, the email.
+
+Paper only, by code, twice: this runner refuses unless config.json says "broker": "paper" and
+"autopilot": true, and ticket.py autopilot-approve checks both again. Nothing here changes config.json.
+Not financial advice.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import autopilot_common as ac  # noqa: E402
+import claude_run  # noqa: E402
+import mail  # noqa: E402
+import report  # noqa: E402
+
+nc = ac.nc
+
+ORB_FIRST_BAR = "09:35"          # the first bar after the 15-minute range (09:30) closes at 09:35
+PAPER_FROM = "09:16"
+SESSION = ("09:15", "15:30")
+ENTRY_RETRIES = 3                # an ORB hit nse-entry does not (yet) call triggered is checked on 3 bars
+EOD_ATTEMPTS = 3                 # an end of day that keeps failing gives up after 3 tries (and says so)
+SAFE_REASON_CHARS = 400
+
+
+def hm(t):
+    return t.strftime("%H:%M")
+
+
+def minutes(text):
+    t = nc.parse_hhmm(text)
+    return t.hour * 60 + t.minute
+
+
+class Day(object):
+    """One trading day of the autopilot. `now` is naive UTC; `runner` runs the skill scripts; `claude` and
+    `send_mail` are swapped out in tests."""
+
+    def __init__(self, home, now, settings, cfg, runner=None, claude=None, send_mail=None, bars=None,
+                 index_move=None, day=None):
+        self.home, self.now, self.settings, self.cfg = home, now, settings, cfg
+        self.ist = nc.to_ist(now)
+        self.day = day or self.ist.date().isoformat()
+        self.st = ac.load_day(home, self.day)
+        self.dir = ac.day_dir(home, self.day)
+        now_text = self.ist.strftime("%Y-%m-%d %H:%M") if nc.test_mode() else None
+        self.runner = runner or ac.Runner(home, self.day, settings, now_text)
+        self.claude = claude or claude_run.ask
+        self.send_mail = send_mail or mail.send_report
+        self.bars = bars                    # report.py's 1-minute bar loader (tests pass a fake)
+        self.index_move = index_move        # report.py's Nifty 50 move (tests pass a fake)
+
+    # ------------------------------------------------------------ helpers
+
+    def path(self, *parts):
+        return os.path.join(self.dir, *parts)
+
+    def home_path(self, *parts):
+        return os.path.join(self.home, *parts)
+
+    def at_least(self, text):
+        return minutes(hm(self.ist)) >= minutes(text)
+
+    def stamp(self):
+        return nc.utc_iso(self.now)
+
+    def save(self):
+        ac.save_day(self.home, self.st)
+
+    def universe_args(self):
+        u = self.settings.get("universe") or "nifty50"
+        if isinstance(u, list):
+            return ["--symbols", ",".join(nc.nse_symbol(s) for s in u)]
+        return ["--universe", str(u)]
+
+    # ------------------------------------------------------------ the tick
+
+    def tick(self):
+        status = nc.market_status(self.now, self.cfg)
+        ph = self.st["phases"]
+        if status["phase"] == "closed-day":
+            if not ph.get("closed"):
+                ph["closed"] = status.get("reason") or "closed"
+                self.runner.note("closed", reason=ph["closed"])
+                self.save()
+            return 0
+        if not self.at_least(self.settings["premarket_from"]) or (ph.get("eod") or {}).get("done"):
+            return 0
+        minute = hm(self.ist)
+        if not self.st["ticks"] or self.st["ticks"][-1] != minute:
+            self.st["ticks"].append(minute)
+        if not ph.get("premarket") and not self.at_least(self.settings["eod_at"]):
+            self.premarket()
+        if self.at_least(PAPER_FROM) and not ph.get("eod"):
+            self.paper_check()
+        bar = self.orb_due()
+        if bar:
+            self.orb(bar)
+        if self.at_least(self.settings["eod_at"]) and not (ph.get("eod") or {}).get("done"):
+            self.eod()
+        self.save()
+        return 0
+
+    # ------------------------------------------------------------ pre-market
+
+    def premarket(self):
+        ph = self.st["phases"]
+        ph["premarket"] = {"started": self.stamp()}
+        self.save()
+        if not nc.test_mode():
+            self.runner.run("holidays", "alerts", ["holidays", "--refresh", "--if-stale"], parse=False, now=False)
+        syms, names = self.universe()
+        ph["premarket"]["universe"] = len(syms)
+        if self.settings.get("daily_scan"):
+            self.runner.run("scan_daily", "scan", ["daily"] + self.universe_args() +
+                            ["--json", "--out", self.path("daily.json")])
+        news = None
+        if self.settings.get("news") and syms:
+            r = self.runner.run("news", "news", ["--tickers"] + syms + ["--json"], timeout=900)
+            news = r.data
+            if news is not None:
+                ac.write_json(self.path("news.json"), news)
+            ph["premarket"]["news"] = {"code": r.code, "items": len((news or {}).get("items") or [])}
+        claude = self.settings.get("claude") or {}
+        if not claude.get("enabled"):
+            ph["premarket"]["veto"] = "off"
+        elif self.at_least(self.settings["veto_by"]):
+            ph["premarket"]["veto"] = "skipped: the pre-market started after %s" % self.settings["veto_by"]
+            self.runner.note("veto", skipped=ph["premarket"]["veto"])
+        else:
+            brief = premarket_brief(self.day, syms, names, news, ac.read_json(self.path("daily.json")))
+            ac.write_json(self.path("premarket-brief.json"), brief)
+            out = self.claude("premarket", brief, self.settings, self.path("claude-premarket.json"))
+            vetoes = clean_vetoes((out or {}).get("vetoes"), syms) if out and out.get("ok") else []
+            ac.write_json(self.path("vetoes.json"), {"vetoes": vetoes, "summary": (out or {}).get("summary"),
+                                                      "ok": bool(out and out.get("ok")),
+                                                      "error": (out or {}).get("error")})
+            ph["premarket"]["veto"] = ("%d vetoed" % len(vetoes)) if out and out.get("ok") else \
+                "Claude failed: %s" % (out or {}).get("error")
+            self.runner.note("veto", vetoes=vetoes, ok=bool(out and out.get("ok")), error=(out or {}).get("error"))
+        ph["premarket"]["done"] = self.stamp()
+        self.save()
+
+    def universe(self):
+        """(symbols, {symbol: name}) for the news and the veto."""
+        u = self.settings.get("universe") or "nifty50"
+        if isinstance(u, list):
+            syms = [nc.nse_symbol(s) for s in u]
+            return syms, {}
+        out = self.path("universe.txt")
+        self.runner.run("universe", "scan", ["universe", str(u), "--json", "--out", out], now=False)
+        syms, names = [], {}
+        try:
+            with open(out, encoding="utf-8") as fh:
+                for line in fh:
+                    sym, _, name = line.strip().partition("|")
+                    if sym:
+                        syms.append(sym)
+                        names[sym] = name
+        except OSError:
+            pass
+        return syms, names
+
+    def vetoes(self):
+        doc = ac.read_json(self.path("vetoes.json")) or {}
+        return {v["symbol"]: v.get("reason") or "" for v in doc.get("vetoes") or [] if v.get("symbol")}
+
+    # ------------------------------------------------------------ paper trades
+
+    def live_trades(self):
+        paper = ac.read_json(self.home_path("state", "paper.json")) or {}
+        return [t for t in paper.get("trades") or [] if t.get("status") in ("open", "filled")]
+
+    def paper_check(self, force=False):
+        if not force and not self.live_trades():
+            return None
+        return self.runner.run("paper_check", "ticket", ["paper-check"], parse=False)
+
+    # ------------------------------------------------------------ opening-range breakouts
+
+    def orb_due(self):
+        """The 5-minute bar that closed at least a minute ago, if it has not been scanned yet."""
+        now_m = minutes(hm(self.ist))
+        if now_m < minutes(ORB_FIRST_BAR) + 1 or now_m > minutes(self.settings["orb_until"]):
+            return None
+        m = now_m - 1
+        bar = m - m % 5
+        text = "%02d:%02d" % divmod(bar, 60)
+        if self.st["phases"].get("orb_last_bar") == text:
+            return None
+        return text
+
+    def orb(self, bar):
+        ph = self.st["phases"]
+        r = self.runner.run("scan_orb", "scan", ["orb"] + self.universe_args() +
+                            ["--json", "--out", self.path("orb.json")])
+        ph["orb_last_bar"] = bar
+        hits = (r.data or {}).get("hits") or []
+        ph.setdefault("orb_scans", []).append({"bar": bar, "code": r.code, "hits": len(hits),
+                                               "failed": r.code not in (0, 1)})
+        self.save()
+        for h in sorted(hits, key=lambda h: (h.get("at") or "", h.get("symbol") or "")):
+            if h.get("symbol"):
+                try:
+                    self.candidate(h)
+                except Exception as e:     # one bad symbol never stops the day
+                    self.finish(self.st["candidates"].setdefault(h["symbol"], {"symbol": h["symbol"]}),
+                                "error", "%s: %s" % (type(e).__name__, e))
+
+    def finish(self, c, outcome, reason=None):
+        c["outcome"] = outcome
+        c["final"] = True
+        c["decided_at"] = hm(self.ist)
+        if reason:
+            c["reason"] = ac.tail(plain_reason(reason), SAFE_REASON_CHARS)
+        self.runner.note("candidate", symbol=c.get("symbol"), outcome=outcome, reason=c.get("reason"))
+        self.save()
+
+    def candidate(self, h):
+        sym = nc.nse_symbol(h["symbol"])
+        c = self.st["candidates"].get(sym)
+        if c and c.get("final"):
+            return
+        if not c:
+            c = {"symbol": sym, "name": h.get("name"), "first_seen": hm(self.ist), "scan_at": h.get("at"),
+                 "scan_price": h.get("price"), "or_high": h.get("or_high"), "or_low": h.get("or_low"),
+                 "pct_over": h.get("pct_over"), "tries": 0, "daily_setups": self.daily_setups(sym)}
+            self.st["candidates"][sym] = c
+        c["tries"] = c.get("tries", 0) + 1
+        run = self.runner.run
+
+        entry_file = self.path("entries", sym + ".json")
+        os.makedirs(os.path.dirname(entry_file), exist_ok=True)
+        r = run("entry", "entry", ["check", sym, "--setup", "orb", "--json", "--write", entry_file], sym)
+        e = r.data or {}
+        status = e.get("status")
+        if status != "triggered":
+            c["entry_status"] = status or "error"
+            if status == "expired" or c["tries"] >= ENTRY_RETRIES:
+                self.finish(c, "entry_" + (status or "error"), e.get("reason") or r.err or r.out)
+            else:
+                self.save()
+            return
+        trig = e.get("trigger") or {}
+        c["trigger"] = {"at": trig.get("time"), "price": trig.get("price"), "triggered_at": e.get("triggered_at"),
+                        "late_by_minutes": e.get("late_by_minutes"), "volume_x": trig.get("volume_x")}
+
+        plan_path = self.home_path("plan.json")
+        r = run("exit", "exit", ["plan", "--from", entry_file, "--write", plan_path, "--json"], sym)
+        plan = r.data if r.ok else None
+        if not plan:
+            why = r.err or r.out
+            # first seen over trigger_max_age_minutes after it fired: the runner was not running (Mac off/asleep)
+            stale = "trigger_max_age_minutes" in (why or "")
+            self.finish(c, "stale_trigger" if stale else "plan_refused", why)
+            return
+        ac.write_json(self.path("plans", sym + ".json"), plan)
+        ch = plan.get("charges") or {}
+        c["plan"] = {"entry": plan.get("entry"), "stop": plan.get("stop"), "target": plan.get("target"),
+                     "worst_exit": plan.get("worst_exit"), "quantity": plan.get("quantity"),
+                     "risk_per_share": plan.get("risk_per_share"),
+                     "risk_per_share_worst": plan.get("risk_per_share_worst"),
+                     "reward_risk": plan.get("reward_risk"), "flat_by": plan.get("flat_by"),
+                     "max_loss": ch.get("max_loss_worst_with_charges"), "break_even": ch.get("break_even"),
+                     "reward_risk_after_charges": ch.get("reward_risk_after_charges")}
+
+        vetoed = self.vetoes()
+        if sym in vetoed:
+            self.finish(c, "vetoed", "Claude's pre-market veto: %s" % (vetoed[sym] or "no reason given"))
+            return
+        cap = self.cap_reason()
+        if cap:
+            self.finish(c, "shadow", cap)
+            return
+
+        tm_file = self.path("tm", sym + ".json")
+        os.makedirs(os.path.dirname(tm_file), exist_ok=True)
+        r = run("timemachine", "timemachine", ["run", "--plan", plan_path, "--json", "--write", tm_file], sym,
+                timeout=600)
+        c["tm"] = tm_summary(r.data) if r.ok and r.data else {"error": ac.tail(r.err or r.out, 300)}
+
+        r = run("size", "size", ["--plan", plan_path, "--write", "--json"], sym)
+        sizing = (r.data or {}).get("sizing") or {}
+        if not r.ok:
+            self.finish(c, "size_refused", "; ".join((r.data or {}).get("notes") or []) or r.err or r.out)
+            return
+        c["order"] = {"qty": sizing.get("qty"), "entry": sizing.get("entry"), "stop_limit": sizing.get("stop_limit"),
+                      "bound_by": sizing.get("bound_by"), "cost": sizing.get("cost")}
+
+        run("quote", "alerts", ["quote", sym, "--write", self.home_path("prices.json"), "--json"], sym)
+
+        r = run("risk", "risk", ["--json"], sym)
+        res = ((r.data or {}).get("results") or [{}])[0]
+        c["risk"] = {"verdict": res.get("verdict"), "reasons": res.get("reasons") or [],
+                     "warnings": res.get("warnings") or [], "max_loss": res.get("max_loss")}
+        if res.get("verdict") != "PASS":
+            self.finish(c, "risk_block", "; ".join(res.get("reasons") or []) or r.err or "no verdict")
+            return
+
+        r = run("approve", "ticket", ["autopilot-approve", "--index", "1"], sym, parse=False)
+        if not r.ok:
+            self.finish(c, "approve_refused", r.err or r.out)
+            return
+        r = run("paper_fill", "ticket", ["paper-fill", "--index", "1"], sym, parse=False)
+        if not r.ok:
+            self.finish(c, "fill_refused", r.err or r.out)
+            return
+        c["fill"] = ac.tail(r.out, 300)
+        self.finish(c, "traded")
+
+    def daily_setups(self, sym):
+        doc = ac.read_json(self.path("daily.json")) or {}
+        for h in doc.get("hits") or []:
+            if h.get("symbol") == sym:
+                return h.get("setups") or []
+        return []
+
+    def cap_reason(self):
+        """Why no more trades today (the trade cap or the loss limit), else None. nse-risk is the authority;
+        this only saves running the Time Machine on a trade that cannot be taken."""
+        state = ac.read_json(self.home_path("state", "broker.json")) or {}
+        rows = [r for r in state.get("orders") or [] if isinstance(r, dict) and r.get("date") == self.day]
+        taken = sum(1 for r in rows if r.get("status") == "approved" and r.get("kind") == "entry")
+        cap = int(self.cfg.get("max_trades_per_day") or 0)
+        if cap and taken >= cap:
+            return "the day's cap of %d trades is used" % cap
+        realised = sum(float(r.get("pnl_net") or 0) for r in rows if r.get("status") == "closed")
+        limit = float(self.cfg.get("max_daily_loss_inr") or 0)
+        if limit and realised <= -limit:
+            return "the day's loss limit of %s is reached (%s realised)" % (nc.inr(limit), nc.inr(realised))
+        return None
+
+    # ------------------------------------------------------------ end of day
+
+    def eod(self):
+        """The end of the day; None if it failed. A failure is retried on the next ticks, at most
+        EOD_ATTEMPTS times in all, so a bug can never mean a Claude run every minute."""
+        ph = self.st["phases"]
+        attempts = int((ph.get("eod") or {}).get("attempts") or 0) + 1
+        ph["eod"] = {"started": self.stamp(), "attempts": attempts}
+        self.save()
+        try:
+            return self._eod(ph)
+        except Exception as e:
+            ph["eod"]["error"] = "%s: %s" % (type(e).__name__, ac.tail(str(e), 300))
+            self.runner.note("eod", error=ph["eod"]["error"], attempt=attempts)
+            if attempts >= EOD_ATTEMPTS:
+                ph["eod"]["done"] = self.stamp()          # give up for today: the error is in the state and log
+                ac.notify(self.settings, "NSE autopilot: the report failed", ph["eod"]["error"])
+            self.save()
+            return None
+
+    def _eod(self, ph):
+        self.paper_check(force=True)
+        r = self.runner.run("journal", "ticket", ["journal", "--days", "7", "--json"])
+        if r.data is not None:
+            ac.write_json(self.path("journal.json"), r.data)
+        r = self.runner.run("status", "ticket", ["status", "--json"])
+        if r.data is not None:
+            ac.write_json(self.path("status.json"), r.data)
+        # a report caught up on a later day must not show that day's Nifty move
+        index_move = self.index_move if self.day == self.ist.date().isoformat() else False
+        rep = report.build(self.home, self.day, self.settings, self.cfg, bars=self.bars, index_move=index_move)
+        ph["eod"]["report"] = rep["paths"]
+        analysis = None
+        claude = self.settings.get("claude") or {}
+        if claude.get("enabled"):
+            out = self.claude("eod", report.for_claude(self.home, self.day), self.settings,
+                              self.path("claude-eod.json"))
+            if out and out.get("ok") and out.get("text"):
+                analysis = out["text"]
+                ph["eod"]["analysis"] = "ok"
+            else:
+                ph["eod"]["analysis"] = "failed: %s" % (out or {}).get("error")
+            self.runner.note("analysis", ok=bool(analysis), error=(out or {}).get("error"))
+        else:
+            ph["eod"]["analysis"] = "off"
+        rep = report.write_outputs(self.home, self.day, rep["report"],
+                                   analysis if analysis else (False if claude.get("enabled") else None))
+        ph["eod"]["report"] = rep["paths"]
+        m = self.settings.get("mail") or {}
+        if m.get("enabled"):
+            ok, why = self.send_mail(self.settings, rep["report"], rep["paths"], analysis)
+            ph["eod"]["mail"] = "sent" if ok else "failed: %s" % why
+            self.runner.note("mail", ok=ok, error=None if ok else why)
+            if not ok:
+                ac.notify(self.settings, "NSE autopilot: email failed", str(why))
+        else:
+            ph["eod"]["mail"] = "off"
+        ac.notify(self.settings, "NSE autopilot (paper)", report.headline(rep["report"]))
+        ph["eod"]["done"] = self.stamp()
+        self.save()
+        return rep
+
+
+# ---------------------------------------------------------------- pieces the tests reach directly
+
+def tm_summary(doc):
+    mc = doc.get("mc") or {}
+    hist = doc.get("history") or {}
+    verdict = doc.get("verdict") or ""
+    return {"p_target": mc.get("p_target"), "p_stop": mc.get("p_stop"), "p_neither": mc.get("p_neither"),
+            "avg_R": mc.get("avg_R"), "avg_R_net": mc.get("avg_R_net"), "r_at_target": mc.get("r_at_target"),
+            "history": {k: hist.get(k) for k in ("sessions", "triggered", "target", "stop", "close", "avg_R",
+                                                 "avg_R_net")},
+            "verdict": verdict, "category": verdict.split(":")[0].strip() if verdict else None}
+
+
+def premarket_brief(day, syms, names, news, daily):
+    """What Claude reads before the open: compact, so the prompt stays small."""
+    items = []
+    for i in (news or {}).get("items") or []:
+        items.append({"ticker": i.get("ticker"), "time_ist": i.get("time_ist"), "kind": i.get("kind"),
+                      "source": i.get("source"), "title": (i.get("title") or "")[:240], "tags": i.get("tags") or [],
+                      "important": bool(i.get("important"))})
+    items.sort(key=lambda x: (not x["important"], x.get("time_ist") or ""), reverse=False)
+    return {"date": day, "universe": [{"symbol": s, "name": names.get(s)} for s in syms],
+            "news_status": (news or {}).get("status") if news else "not run or failed",
+            "news_failure": (news or {}).get("failure"),
+            "news_items": items[:400], "results_calendar": ((news or {}).get("calendar") or [])[:100],
+            "moves": ((news or {}).get("moves") or [])[:100],
+            "daily_setups": [{"symbol": h.get("symbol"), "setups": h.get("setups")}
+                             for h in (daily or {}).get("hits") or []]}
+
+
+def plain_reason(text):
+    """A script's refusal without its file paths ("exit.py: /Users/.../RELIANCE.json: the trigger is ...")."""
+    text = re.sub(r"(?:~|/)[^\n]*?\.(?:json|gz|csv|txt)(?::\s*|\b)", "", str(text or ""))
+    return " ".join(text.split())
+
+
+def clean_vetoes(raw, universe):
+    allowed = set(universe)
+    out, seen = [], set()
+    for v in raw or []:
+        if not isinstance(v, dict):
+            continue
+        sym = nc.nse_symbol(v.get("symbol") or "")
+        if sym and sym in allowed and sym not in seen:
+            seen.add(sym)
+            out.append({"symbol": sym, "reason": str(v.get("reason") or "")[:300]})
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+class Lock(object):
+    def __init__(self, home):
+        self.path = os.path.join(home, "autopilot", ".lock")
+        self.fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+        except ImportError:                # pragma: no cover
+            return True
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def __exit__(self, *exc):
+        if self.fh:
+            self.fh.close()
+
+
+def setup(a):
+    home = ac.trader_home()
+    settings = ac.load_settings(home)
+    cfg = ac.load_cfg(home)
+    problem = ac.guard(cfg)
+    if problem:
+        raise ac.AutopilotError(problem)
+    return home, settings, cfg
+
+
+def unfinished_day(home, today):
+    """The latest earlier day whose report never went out (the Mac was off at 15:35), or None."""
+    root = os.path.join(home, "autopilot")
+    if not os.path.isdir(root):
+        return None
+    for d in sorted(os.listdir(root), reverse=True):
+        if len(d) == 10 and d < today:
+            st = ac.load_day(home, d)
+            ph = st["phases"]
+            if ph.get("premarket") and not (ph.get("eod") or {}).get("done"):
+                return d
+            return None
+    return None
+
+
+def cmd_tick(a):
+    home, settings, cfg = setup(a)
+    now = ac.parse_clock(a.now)
+    with Lock(home) as got:
+        if not got:
+            print("another tick is running; nothing to do")
+            return 0
+        today = nc.to_ist(now).date().isoformat()
+        late = unfinished_day(home, today)
+        if late:
+            Day(home, now, settings, cfg, day=late).eod()
+        return Day(home, now, settings, cfg).tick()
+
+
+def cmd_eod(a):
+    home, settings, cfg = setup(a)
+    now = ac.parse_clock(a.now)
+    day = a.date or nc.to_ist(now).date().isoformat()
+    rep = Day(home, now, settings, cfg, day=day).eod()
+    if rep is None:
+        st = ac.load_day(home, day)
+        print("the report for %s failed: %s" % (day, (st["phases"].get("eod") or {}).get("error")), file=sys.stderr)
+        return 1
+    print(report.headline(rep["report"]))
+    for k, v in sorted(rep["paths"].items()):
+        print("  %s: %s" % (k, v))
+    return 0
+
+
+def cmd_replay(a):
+    if not nc.test_mode():
+        raise ac.AutopilotError("replay pins the clock, so it needs NSE_TEST_MODE=1 (and \"offline\" in "
+                                "autopilot.json for the data)")
+    home, settings, cfg = setup(a)
+    times = [t.strip() for t in a.times.split(",") if t.strip()]
+    for t in times:
+        now = nc.parse_now("%s %s" % (a.date, t))
+        Day(home, now, settings, cfg).tick()
+        print("tick %s %s done" % (a.date, t))
+    return 0
+
+
+def cmd_status(a):
+    home = ac.trader_home()
+    cfg = ac.load_cfg(home)
+    now = ac.parse_clock(a.now)
+    day = a.date or nc.to_ist(now).date().isoformat()
+    st = ac.load_day(home, day)
+    problem = ac.guard(cfg)
+    print("NSE autopilot (paper only), %s, trader folder %s" % (day, home))
+    print("  config: %s" % ("OK: paper, autopilot on" if not problem else "OFF: " + problem))
+    ph = st["phases"]
+    if ph.get("closed"):
+        print("  market closed: %s" % ph["closed"])
+    for k in ("premarket", "eod"):
+        if ph.get(k):
+            print("  %s: %s" % (k, json.dumps(ph[k], ensure_ascii=False)))
+    scans = ph.get("orb_scans") or []
+    if scans:
+        print("  ORB scans: %d (last bar %s), %d failed" % (len(scans), ph.get("orb_last_bar"),
+                                                            sum(1 for s in scans if s.get("failed"))))
+    for sym, c in sorted(st["candidates"].items(), key=lambda kv: kv[1].get("first_seen") or ""):
+        print("  %-11s %-15s %s" % (sym, c.get("outcome") or "pending", c.get("reason") or ""))
+    paper = ac.read_json(os.path.join(home, "state", "paper.json")) or {}
+    for t in paper.get("trades") or []:
+        if t.get("date") == day:
+            print("  paper %s %s %s qty %s fill %s exit %s %s net %s" % (
+                t.get("id"), t.get("status"), t.get("symbol"), t.get("qty"), t.get("fill_price"),
+                t.get("exit_price"), t.get("exit_reason") or "", t.get("pnl_net")))
+    return 0
+
+
+def cmd_selftest(a):
+    home = ac.trader_home()
+    ok = True
+    print("NSE autopilot selftest, trader folder %s" % home)
+    print("  python %s at %s" % (sys.version.split()[0], sys.executable))
+    try:
+        settings = ac.load_settings(home)
+        cfg = ac.load_cfg(home)
+    except (ac.AutopilotError, ValueError, OSError) as e:
+        print("  FAIL config: %s" % e)
+        return 1
+    problem = ac.guard(cfg)
+    print("  %s config: %s" % ("FAIL" if problem else "OK", problem or "paper, autopilot on"))
+    ok = ok and not problem
+    st = nc.market_status(nc.utc_now(), cfg)
+    print("  OK clock: %s IST, NSE %s, next open %s" % (st["now_ist"], st["phase"], st["next_open"]))
+    if (settings.get("claude") or {}).get("enabled"):
+        good, why = claude_run.selftest(settings)
+        print("  %s claude: %s" % ("OK" if good else "FAIL", why))
+        ok = ok and good
+    else:
+        print("  -- claude: off in autopilot.json")
+    if (settings.get("mail") or {}).get("enabled"):
+        good, why = mail.send_test(settings) if a.send_mail else mail.check(settings)
+        print("  %s mail: %s" % ("OK" if good else "FAIL", why))
+        ok = ok and good
+    else:
+        print("  -- mail: off in autopilot.json")
+    ac.notify(settings, "NSE autopilot", "selftest %s" % ("passed" if ok else "FAILED"))
+    print("selftest %s" % ("passed" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    nc.utf8_stdout()
+    ap = argparse.ArgumentParser(description="The day-trader-india paper autopilot (paper only).")
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("tick", help="do whatever is due now (launchd runs this every minute)")
+    p.add_argument("--now", help="test only (NSE_TEST_MODE=1): an IST time like \"2026-11-13 10:05\"")
+    p = sub.add_parser("eod", help="build (or rebuild) a day's report, ask Claude, send the email")
+    p.add_argument("--date", help="YYYY-MM-DD (default today, IST)")
+    p.add_argument("--now", help="test only")
+    p = sub.add_parser("replay", help="test only: tick at the given IST times of a past day, on offline data")
+    p.add_argument("--date", required=True)
+    p.add_argument("--times", required=True, help="comma separated, like 08:45,10:05,15:35")
+    p = sub.add_parser("status", help="a day's state in plain words")
+    p.add_argument("--date")
+    p.add_argument("--now", help="test only")
+    p = sub.add_parser("selftest", help="check python, the config, headless Claude and Gmail")
+    p.add_argument("--send-mail", action="store_true", help="also send a test email")
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return 1
+    try:
+        return {"tick": cmd_tick, "eod": cmd_eod, "replay": cmd_replay, "status": cmd_status,
+                "selftest": cmd_selftest}[a.cmd](a)
+    except (ac.AutopilotError, ValueError, OSError) as e:
+        print("run_day.py: %s" % e, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

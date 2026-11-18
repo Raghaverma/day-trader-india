@@ -1850,5 +1850,97 @@ class RealRiskCheck(FlowBase):
         self.assertEqual(code, 0, text)
 
 
+class AutopilotApprove(FlowBase):
+    """The unattended paper run's approval: paper only, by code, and never dressed up as the user's yes."""
+
+    def auto(self, now=NOW):
+        return run(self.args("autopilot-approve", "--index", "1", now=now))
+
+    def test_refused_without_the_flag(self):
+        self.write_risk()
+        code, _, err = self.auto()
+        self.assertEqual(code, 1)
+        self.assertIn("autopilot is off", err)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_refused_in_manual_and_kite_even_with_the_flag(self):
+        for mode in ("manual", "kite"):
+            self.set_cfg(broker=mode, autopilot=True)
+            self.write_risk()
+            code, _, err = self.auto()
+            self.assertEqual(code, 1, mode)
+            self.assertIn("paper only", err, mode)
+            self.assertIn('"broker": "%s"' % mode, err, mode)
+            self.assertFalse(os.path.exists(self.state), mode)
+
+    def test_a_truthy_flag_that_is_not_true_does_not_count(self):
+        for val in ("true", 1, "yes"):
+            self.set_cfg(autopilot=val)
+            self.write_risk()
+            code, _, err = self.auto()
+            self.assertEqual(code, 1, val)
+            self.assertIn("autopilot is off", err)
+
+    def test_needs_a_ready_ticket(self):
+        self.set_cfg(autopilot=True)
+        code, _, err = self.auto()                                  # no risk check yet
+        self.assertEqual(code, 1)
+        self.assertIn("not ready", err)
+        self.write_risk(verdict="BLOCK")
+        code, _, err = self.auto()
+        self.assertEqual(code, 1)
+        self.assertIn("not ready", err)
+        self.write_risk()
+        code, _, err = self.auto(now="2026-11-13 10:12")            # the PASS is 7 minutes old
+        self.assertEqual(code, 1)
+        self.assertIn("not ready", err)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_paper_fill_follows_and_the_record_says_who_approved(self):
+        self.set_cfg(autopilot=True)
+        self.write_risk()
+        code, text, err = self.auto()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Autopilot (paper only) approved order 1", text)
+        rec = self.doc(self.state)["orders"][0]
+        self.assertEqual((rec["status"], rec["approved_by"], rec["reply"], rec["reply_verified"], rec["kind"],
+                          rec["broker"], rec["max_loss"]), ("approved", "autopilot", None, False, "entry", "paper",
+                                                            739.91))
+        self.assertNotIn("legs", rec)
+        code, _, err = self.auto()                                  # one approval per order
+        self.assertEqual(code, 1)
+        self.assertIn("APPROVED", err)
+        code, text, err = run(self.paper_args("paper-fill", "--index", "1"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("Paper: bought 56 RELIANCE at 1,334.00", text)
+        run(self.check_args("2026-11-13 15:30"))
+        out = json.loads(run(["journal", "--state", self.state, "--now", "2026-11-13 15:30", "--json"])[1])
+        self.assertEqual((out["trades"][0]["approved_by"], out["trades"][0]["net"]), ("autopilot", 502.93))
+        code, text, _ = run(["log", "--state", self.state, "--now", "2026-11-13 15:30"])
+        self.assertIn("by the paper autopilot (no yes asked)", text)
+
+    def test_the_users_own_yes_is_unchanged(self):
+        self.set_cfg(autopilot=True)
+        self.approve_paper()
+        rec = self.doc(self.state)["orders"][0]
+        self.assertEqual((rec["reply"], rec.get("approved_by")), ("yes", None))
+        run(self.paper_args("paper-fill", "--index", "1"))
+        run(self.check_args("2026-11-13 15:30"))
+        out = json.loads(run(["journal", "--state", self.state, "--now", "2026-11-13 15:30", "--json"])[1])
+        self.assertEqual(out["trades"][0]["approved_by"], "user")
+
+    def test_only_entries(self):
+        self.set_cfg(autopilot=True)
+
+        def to_sell(d):
+            d["orders"][0]["entry"]["transaction_type"] = "SELL"
+            d["orders"][0].pop("stop", None)
+        self.edit_orders(to_sell)
+        self.write_risk()
+        code, _, err = self.auto()
+        self.assertEqual(code, 1)
+        self.assertIn("entries (a BUY) only", err)
+
+
 if __name__ == "__main__":
     unittest.main()

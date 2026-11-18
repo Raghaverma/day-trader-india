@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.0
+
+### Autopilot: paper trading with nobody at the keyboard (new `autopilot/`)
+
+- `run_day.py tick`, run by a launchd LaunchAgent every minute on an always-on Mac. One idempotent tick at a
+  time, with all state on disk (`$NSE_TRADER_HOME/autopilot/<date>/`). It covers:
+  - the pre-market (Nifty 50, daily scan, news, Claude's veto)
+  - the opening-range scans every 5 minutes, with each signal chained through nse-entry, nse-exit,
+    nse-timemachine, nse-budget, nse-alerts, nse-risk and the paper broker
+  - `paper-check` every minute
+  - the end of day at 15:35, which runs late if the Mac was off. A crash, a sleep or a reboot only means the
+    next tick carries on.
+- **Paper only, twice.** The runner refuses a config that is not `"broker": "paper"` with `"autopilot": true`.
+  The new `ticket.py autopilot-approve` checks both again. It needs the same READY ticket as `approve` (a fresh
+  nse-risk PASS for that exact order, today's order, the entry window). It records `approved_by: "autopilot"`
+  with no reply, and refuses in manual and kite mode with no override. `journal` and `log` say who approved
+  each trade.
+- **`report.py`.** The day's trades, every signal from scan to exit, and the Time Machine's forecasts against
+  outcomes (Brier score, calibration buckets, by verdict). Signals not taken (vetoed, capped, blocked) are
+  replayed with the paper broker's own rules (`ticket.walk`). Also execution, health (failed steps, missed
+  minutes) and the Nifty 50's move. It writes JSON, Markdown, HTML and a running `scorecard.json`. Every number
+  is computed in Python.
+- **`claude_run.py`.** Headless `claude -p` on the logged-in account, with `--tools ""`, no MCP servers and no
+  settings: Claude only answers, and the runner saves the answer. Two runs a day: the pre-market veto (JSON)
+  and the EOD analysis (Markdown). If either fails, the day goes on.
+- **`mail.py`.** Gmail over SMTP with an app password read from the macOS login keychain.
+- **`install.sh` and `uninstall.sh`.** `install.sh` writes the paper config and settings, stores the
+  Keychain entry, installs the LaunchAgent and runs a selftest inside launchd.
+- **Tests.** About 30 new offline tests. A replay of 13 November 2026 through the real scripts reproduces the
+  README's RELIANCE trade: 37 shares, the target at 1,344.30, +₹328.40 net.
+
 ## 1.1.0
 
 A review of 1.0.0 found places where a trade could slip past the safety rules. This release

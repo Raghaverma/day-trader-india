@@ -286,7 +286,10 @@ with day totals and a win rate over the days shown.
 ## What it never does
 
 - Never places an order without the gates, and never two orders on one yes.
-- Never places orders from a scheduled or background task: nobody is there to say yes.
+- Never places orders from a scheduled or background task: nobody is there to say yes. The one
+  exception is the paper autopilot (`autopilot/` in the repo): `ticket.py autopilot-approve` works only
+  with `"broker": "paper"` and `"autopilot": true`, records `approved_by: "autopilot"` (never a
+  yes), and refuses in manual and kite mode, by code. Never set either for the user.
 - Never asks for, reads, stores or repeats API keys, secrets or passwords.
 - Never switches `"broker"` from paper to manual or kite. The user does that themselves.
 - Never leaves a target LIMIT and a stop resting together on Kite.
