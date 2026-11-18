@@ -55,6 +55,8 @@ DEFAULTS = {
     # a JSON file {"as_of": "YYYY-MM-DD", "ranks": {"SYMBOL": 0.0-1.0}} (1 = ranked best), e.g. from Touchstone;
     # recorded as a tag on each signal. null = none.
     "rank_file": None,
+    # the report re-sizes each day's signals for these budgets (rupees), each with its own scaled rules. [] = off.
+    "sizes": [],
     # keep the day's 1- and 5-minute bars (Yahoo drops them after 30 / 60 days) in archive/ in the trader folder
     "archive": {"enabled": False, "pause_s": 0.4},
     # test and replay only (NSE_TEST_MODE=1): extra arguments per step, "{sym}" is replaced by the symbol,

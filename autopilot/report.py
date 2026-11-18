@@ -389,6 +389,10 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
         index_move = False                                   # a replay never reaches for today's index
     move = (index_move or nifty_move)() if index_move is not False else None
     sh = shadows(st, day, cfg, bars)
+    plans = {c["symbol"]: {"entry": (c.get("plan") or {}).get("entry"), "stop": (c.get("plan") or {}).get("stop"),
+                           "at": (c.get("trigger") or {}).get("at")}
+             for c in (st.get("candidates") or {}).values()
+             if (c.get("side") or "long") == "long" and c.get("plan")}
     vetoes = ac.read_json(os.path.join(ac.day_dir(home, day), "vetoes.json")) or {}
     rep = {"date": day, "generated_at": nc.utc_iso(), "paper": True,
            "rules": {k: cfg.get(k) for k in ("budget", "max_loss_per_trade_inr", "max_daily_loss_inr",
@@ -404,8 +408,27 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
                                                       "daily_setups", "tags", "cost_ok")},
                                side=c.get("side") or "long", charges_r=(c.get("plan") or {}).get("charges_r"))
                           for c in sorted((st.get("candidates") or {}).values(),
-                                          key=lambda c: c.get("first_seen") or "")]}
+                                          key=lambda c: c.get("first_seen") or "")],
+           "plans": plans}
+    budgets = settings.get("sizes") or []
+    if budgets:
+        rep["sizes"] = account_sizes(rep, cfg, budgets, (settings.get("cost_filter") or {}).get("max_charges_r"))
     return write_outputs(home, day, rep, None)
+
+
+def account_sizes(rep, cfg, budgets, max_charges_r=None):
+    """Today's signals at each budget (sizes.simulate); one failure never stops the report."""
+    import sizes
+    try:
+        sigs = sizes.from_report(rep)
+        out = []
+        for b in budgets:
+            s = sizes.simulate(sigs, cfg, float(b), None if max_charges_r is None else float(max_charges_r))
+            out.append({"budget": s["budget"], "label": s["label"], "totals": s["totals"], "skipped": s["skipped"],
+                        "trades": s["trades"]})
+        return out
+    except Exception as e:
+        return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
 
 
 # ---------------------------------------------------------------- scorecard (all days)
@@ -433,6 +456,9 @@ def score_row(rep):
             "shadows": {k: {"n": v["n"], "replayed": v["replayed"], "net": v["net"], "wins": v["wins"]}
                         for k, v in rep["shadows"]["by_why"].items()},
             "signal_rs": outcomes,
+            "sizes": {s["label"]: {"budget": s["budget"], "net": s["totals"]["net"], "trades": s["totals"]["trades"],
+                                   "wins": s["totals"]["wins"], "charges": s["totals"]["charges"]}
+                      for s in rep.get("sizes") or [] if isinstance(rep.get("sizes"), list)},
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
 
 
@@ -549,11 +575,32 @@ def scorecard(home, day=None, rep=None):
               "max_drawdown": max_drawdown([e["cumulative"] for e in equity]),
               "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
               "by_setup": setup, "shadows": sh,
-              "edge": edge([o for d in order for o in days[d].get("signal_rs") or []])}
+              "edge": edge([o for d in order for o in days[d].get("signal_rs") or []]),
+              "sizes": size_totals(days, order)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
     return out
+
+
+def size_totals(days, order):
+    """All days at each budget: net, trades, wins, charges, the days counted, and the per-day edge in rupees."""
+    out = {}
+    for d in order:
+        for lab, v in (days[d].get("sizes") or {}).items():
+            s = out.setdefault(lab, {"budget": v.get("budget"), "days": 0, "net": 0.0, "trades": 0, "wins": 0,
+                                     "charges": 0.0, "daily": []})
+            s["days"] += 1
+            s["net"] = round(s["net"] + (v.get("net") or 0), 2)
+            s["charges"] = round(s["charges"] + (v.get("charges") or 0), 2)
+            s["trades"] += v.get("trades") or 0
+            s["wins"] += v.get("wins") or 0
+            s["daily"].append(v.get("net") or 0)
+    for s in out.values():
+        st = edge_stats(s.pop("daily"), unit="days")
+        s["per_day"] = {k: st.get(k) for k in ("mean_r", "ci95", "verdict")}
+        s["return_pct"] = round(100 * s["net"] / s["budget"], 3) if s.get("budget") else None
+    return dict(sorted(out.items(), key=lambda kv: kv[1].get("budget") or 0))
 
 
 def max_drawdown(curve):
@@ -676,6 +723,27 @@ def blocks(rep, card, analysis=None):
                 len(shorts_), "" if len(shorts_) == 1 else "s", len(done), sum(1 for s in done if s["net"] > 0),
                 signed_money(round(sum(s["net"] for s in done), 2)))))
 
+    sz = rep.get("sizes")
+    if isinstance(sz, dict) and sz.get("error"):
+        out.append(("h2", "The same signals at other account sizes"))
+        out.append(("p", "Could not work them out today: %s" % sz["error"]))
+    elif sz:
+        out.append(("h2", "The same signals at other account sizes"))
+        out.append(("p", "Today's long signals re-sized for each budget and run through that budget's own rules (rupee "
+                         "limits scaled with the budget, the cost filter on its own charges, the trade cap, the daily "
+                         "loss limit, the cash left free). Same fills and exits as the paper broker; no market impact, "
+                         "so the biggest orders are optimistic."))
+        out.append(("table", ["Budget", "Trades", "Won", "Net", "Charges", "Return", "Avg R", "Largest order"],
+                    [[s["label"], s["totals"]["trades"], s["totals"]["wins"], signed_money(s["totals"]["net"]),
+                      money(s["totals"]["charges"]), "%+.2f%%" % s["totals"]["return_pct"],
+                      r_text(s["totals"]["avg_r"]), money(s["totals"]["largest_order"])] for s in sz]))
+        rows = [[s["label"], t["symbol"], t["at"], t["qty"], money(t["order_value"]), _px(t["fill"]), _px(t["exit"]),
+                 EXIT_WORDS.get(t["result"], t["result"] or ""),
+                 signed_money(t["net"]) if t["fill"] is not None else "never filled", r_text(t["r"])]
+                for s in sz for t in s["trades"]]
+        if rows:
+            out.append(("table", ["Budget", "Stock", "Signal", "Qty", "Order", "In", "Out", "Exit", "Net", "R"], rows))
+
     out.append(("h2", "Execution"))
     out.append(("ul", ["Average entry slippage vs the plan: %s" % _px(ex["avg_entry_slippage"], signed=True),
                        "Average exit vs the target (target exits): %s" % _px(ex["avg_exit_vs_target"], signed=True),
@@ -719,6 +787,16 @@ def blocks(rep, card, analysis=None):
         out.append(("ul", ["%s: %d signals, %d replayed, %d green, %s net if taken" % (
             WHY.get(k, k), v["n"], v["replayed"], v["wins"], signed_money(v["net"]))
             for k, v in sorted(t["shadows"].items())]))
+
+    if t.get("sizes"):
+        out.append(("p", "At each budget, all days (same signals, each budget's own rules):"))
+        out.append(("table", ["Budget", "Days", "Trades", "Won", "Net", "Charges", "Return", "Average day",
+                              "95% interval a day"],
+                    [[lab, v["days"], v["trades"], v["wins"], signed_money(v["net"]), money(v["charges"]),
+                      ("%+.2f%%" % v["return_pct"]) if v.get("return_pct") is not None else "n/a",
+                      signed_money((v.get("per_day") or {}).get("mean_r")),
+                      ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
+                      if (v.get("per_day") or {}).get("ci95") else "n/a"] for lab, v in t["sizes"].items()]))
 
     ed = t.get("edge") or {}
     if any(g.get("n") for g in (ed.get("groups") or {}).values()):

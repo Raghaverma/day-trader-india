@@ -27,6 +27,7 @@ import autopilot_common as ac  # noqa: E402
 import market  # noqa: E402
 import report  # noqa: E402
 import shorts  # noqa: E402
+import sizes  # noqa: E402
 
 nc = ac.nc
 _SCAN = None
@@ -114,12 +115,32 @@ def study(home, cfg, max_charges_r, days, until="14:30"):
                 continue
             c = {"symbol": h["symbol"], "side": side, "outcome": side, "trigger": {"at": h["at"]}, "plan": p}
             r = report.shadow(c, day, minute_bars(one[h["symbol"]]), cfg)
+            if r.get("result") == "never filled":
+                rows.append({"day": day, "symbol": h["symbol"], "side": side, "at": h["at"], "r": None, "net": 0.0,
+                             "result": "never filled", "charges_r": p["charges_r"], "entry": p["entry"],
+                             "stop": p["stop"], "fill": None, "exit": None, "exit_at": None,
+                             "cost_ok": p["charges_r"] <= max_charges_r,
+                             "bar_volume": bar_volume(five[h["symbol"]], d, h.get("bar_start"))})
+                continue
             if r.get("r") is None:
                 continue
             rows.append({"day": day, "symbol": h["symbol"], "side": side, "at": h["at"], "r": r["r"],
                          "net": r["net"], "result": r["result"], "charges_r": p["charges_r"],
-                         "cost_ok": p["charges_r"] <= max_charges_r})
+                         "cost_ok": p["charges_r"] <= max_charges_r, "entry": p["entry"], "stop": p["stop"],
+                         "fill": r["fill"], "exit": r["exit"], "exit_at": r.get("exit_at"),
+                         "bar_volume": bar_volume(five[h["symbol"]], d, h.get("bar_start"))})
     return rows
+
+
+def bar_volume(bars, day, start):
+    """Shares traded in the 5-minute bar that fired the signal (starting at `start`, IST HH:MM), or None."""
+    if not start:
+        return None
+    want = datetime.datetime.combine(day, nc.parse_hhmm(start))
+    for b in bars:
+        if nc.ist_from_epoch(b[0]) == want:
+            return b[5] or None
+    return None
 
 
 GROUPS = (("Long, every signal", lambda r: r["side"] == "long"),
@@ -133,7 +154,7 @@ GROUPS = (("Long, every signal", lambda r: r["side"] == "long"),
 def summarise(rows):
     out = {}
     for name, keep in GROUPS:
-        sel = [r for r in rows if keep(r)]
+        sel = [r for r in rows if keep(r) and r["r"] is not None]
         by_day = {}
         for r in sel:
             by_day.setdefault(r["day"], []).append(r["r"])
@@ -152,6 +173,10 @@ def main(argv=None):
     ap.add_argument("--to", dest="end")
     ap.add_argument("--max-charges-r", type=float, help="the cost filter to split on (default: autopilot.json, or 0.2)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--sizes", nargs="?", const="default",
+                    help="also run the autopilot's rules (cost filter, 3-trade cap, daily loss, cash) at these budgets, "
+                         "comma separated rupees (default 1 lakh, 10 lakh, 50 lakh, 1 cr, 5 cr), and write every "
+                         "trade to reports/sizes-study.csv and .md")
     a = ap.parse_args(argv)
     home = ac.trader_home()
     cfg = ac.load_cfg(home)
@@ -165,8 +190,15 @@ def main(argv=None):
         return 1
     rows = study(home, cfg, float(mx), days)
     res = summarise(rows)
+    by_size = None
+    if a.sizes:
+        budgets = sizes.DEFAULT_SIZES if a.sizes == "default" else [float(x) for x in a.sizes.split(",")]
+        longs = [r for r in rows if r["side"] == "long"]
+        by_size = [sizes.simulate(longs, cfg, b, float(mx)) for b in budgets]
+        paths = write_sizes(home, by_size, days)
     if a.json:
-        print(json.dumps({"days": days, "max_charges_r": mx, "groups": res, "signals": rows}, indent=2))
+        print(json.dumps({"days": days, "max_charges_r": mx, "groups": res, "signals": rows, "sizes": by_size},
+                         indent=2))
         return 0
     print("ORB study, paper rules, after estimated charges: %d days (%s to %s), %d signals replayed. Cost filter "
           "split at %.2fR. Not advice." % (len(days), days[0], days[-1], len(rows), mx))
@@ -180,7 +212,74 @@ def main(argv=None):
             continue
         print("%-33s %7d %+7.3f %17s  %4d %+7.3f %17s  %s" % (name, s["n"], s["mean_r"], ci(s), dd["n"],
                                                               dd.get("mean_r") or 0, ci(dd), dd["verdict"]))
+    if by_size:
+        print("\nThe autopilot's rules at each budget (long only; cost filter %.2fR, %s trades a day, daily loss "
+              "limit; no market impact):" % (mx, cfg.get("max_trades_per_day")))
+        print(sizes_table(by_size))
+        print("\nEvery trade: %s and %s" % (paths["csv"], paths["md"]))
     return 0
+
+
+def sizes_table(by_size):
+    head = "%-10s %6s %5s %10s %13s %12s %8s %7s %12s %12s %8s %s" % (
+        "budget", "trades", "won", "win rate", "net", "charges", "return", "avg R", "best day", "worst day",
+        "max dd", "order size / bar volume (median, max, >10%)")
+    lines = [head]
+    for s in by_size:
+        t = s["totals"]
+        vol = ("%.1f%%, %.1f%%, %d" % (100 * t["median_volume_share"], 100 * t["max_volume_share"],
+                                         t["over_10pct_of_bar"])) if t.get("max_volume_share") is not None else "n/a"
+        lines.append("%-10s %6d %5d %9s %13s %12s %7.2f%% %+7.2f %12s %12s %8s %s" % (
+            s["label"], t["trades"], t["wins"], ("%.0f%%" % (100.0 * t["wins"] / t["trades"])) if t["trades"] else "-",
+            report.signed_money(t["net"]), report.money(t["charges"]), t["return_pct"], t["avg_r"] or 0,
+            report.signed_money(t["best_day"]), report.signed_money(t["worst_day"]),
+            report.signed_money(t["max_drawdown"]), vol))
+    return "\n".join(lines)
+
+
+def write_sizes(home, by_size, days):
+    """Every trade at every budget, as CSV and Markdown, in reports/."""
+    import csv
+    folder = ac.reports_dir(home)
+    os.makedirs(folder, exist_ok=True)
+    paths = {"csv": os.path.join(folder, "sizes-study.csv"), "md": os.path.join(folder, "sizes-study.md")}
+    cols = ["budget", "day", "symbol", "at", "qty", "order_value", "fill", "exit", "exit_at", "result", "gross",
+            "charges", "net", "r", "charges_r", "volume_share"]
+    with open(paths["csv"], "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for s in by_size:
+            for t in s["trades"]:
+                w.writerow([s["label"]] + [t.get(k) for k in cols[1:]])
+    md = ["# ORB paper trades at five account sizes", "",
+          "%d days, %s to %s, replayed from the bar archive with the paper broker's rules. Long only; cost filter, "
+          "3-trade cap and daily loss limit applied at each size; P&L after estimated Zerodha charges. Fills assume "
+          "no market impact, which is optimistic for the biggest orders (see the last column). Paper; not advice."
+          % (len(days), days[0], days[-1]), "", "```", sizes_table(by_size), "```", ""]
+    for s in by_size:
+        t = s["totals"]
+        md += ["## %s" % s["label"], "",
+               "%d trades (%d won, %d lost, %d limit orders never filled), %s net after %s charges, %.2f%% of the "
+               "budget. Skipped: %s." % (t["trades"], t["wins"], t["losses"], t["unfilled"],
+                                        report.signed_money(t["net"]), report.money(t["charges"]), t["return_pct"],
+                                        ", ".join("%s %d" % kv for kv in sorted(s["skipped"].items())) or "none"), "",
+               "| Day | Stock | Time | Qty | Order | In | Out | Exit | Net | R | Bar vol. |",
+               "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for tr in s["trades"]:
+            md.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                tr["day"], tr["symbol"], tr["at"], tr["qty"], report.money(tr["order_value"]),
+                report._px(tr["fill"]), report._px(tr["exit"]),
+                (tr["result"] or "") + (" " + tr["exit_at"] if tr.get("exit_at") else ""),
+                report.signed_money(tr["net"]) if tr["fill"] is not None else "never filled",
+                report.r_text(tr["r"]), ("%.1f%%" % (100 * tr["volume_share"])) if tr["volume_share"] is not None
+                else "n/a"))
+        md += ["", "| Day | Trades | Net | Equity after |", "|---|---|---|---|"]
+        for d, v in sorted(s["days"].items()):
+            md.append("| %s | %d | %s | %s |" % (d, v["trades"], report.signed_money(v["net"]), report.money(v["equity"])))
+        md.append("")
+    with open(paths["md"], "w", encoding="utf-8") as fh:
+        fh.write("\n".join(md))
+    return paths
 
 
 if __name__ == "__main__":

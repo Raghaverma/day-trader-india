@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0
+
+### The same signals at other account sizes
+
+- **`autopilot/sizes.py`.** `sizes.simulate` re-sizes each day's long signals for other budgets, and each budget
+  gets its own rules:
+  - rupee limits scaled with the budget (every percentage the same)
+  - `nse_common.size_qty` with the cash that open positions leave free
+  - the cost filter on that size's own charges (brokerage's ₹20 cap makes big orders pay a smaller share of
+    their risk)
+  - the trade cap, and nse-risk's daily loss rule
+  Fills and exits are the paper broker's. Market impact is not modelled.
+- **Report and scorecard** (`"sizes": [...]` in autopilot.json; the example lists ₹1 lakh, ₹10 lakh, ₹50 lakh,
+  ₹1 crore and ₹5 crore). Each day's report has a table per budget and every trade at every budget. The scorecard
+  keeps each budget's running net and its per-day 95% interval.
+- **`study.py --sizes`.** Runs the archive through the same rules at each budget and writes every trade to
+  `reports/sizes-study.csv` and `.md`, with each order's share of its entry bar's volume.
+- **Tests.** 10 new. At its own budget, the re-sizing reproduces the live paper trade to the share and the paisa.
+
 ## 1.3.0
 
 ### The autopilot measures what would make it better

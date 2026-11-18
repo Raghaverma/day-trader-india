@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.3.0" src="https://img.shields.io/badge/version-1.3.0-blue?style=flat-square">
+  <img alt="version 1.4.0" src="https://img.shields.io/badge/version-1.4.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="860 offline tests" src="https://img.shields.io/badge/tests-860%20offline-3fb950?style=flat-square">
+  <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
   <img alt="NSE India" src="https://img.shields.io/badge/market-NSE%20India-FF9933?style=flat-square">
   <img alt="paper trading by default" src="https://img.shields.io/badge/broker-paper%20by%20default-58a6ff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat-square">
@@ -145,6 +145,7 @@ claude                                               # log in once
 - **Is there an edge?** The report and the scorecard give the average R of each group (traded, skipped by the filter, other skipped signals, shorts) with a 95% bootstrap interval and a verdict, which stays "too few to tell" below 20.
 - **The bar archive** (`"archive": {"enabled": true}`). After the report, the day's 1- and 5-minute bars for the universe, the Nifty and India VIX go to `archive/` in the trader folder (Yahoo drops them after 30 and 60 days). `run_day.py archive --backfill` saves everything Yahoo still has.
 - **`study.py`** replays every ORB signal in the archive, long and short, with the paper rules, and gives the verdict per signal and per day. Signals on one day move together, so the per-day verdict is the honest one.
+- **Account sizes** (`"sizes": [100000, 1000000, 5000000, 10000000, 50000000]`, 1.4.0). The report re-sizes each day's signals for every budget listed, each with its own rules: rupee limits scaled with the budget, the cost filter on its own charges, the trade cap, the daily loss limit and the cash left free. One paper account trades; the others are the same signals re-sized, so their fills ignore market impact. `study.py --sizes` does the same over the archive and shows each order's share of its entry bar's volume, the point where a big order's paper fill stops being believable.
 
 ## Fine print
 
@@ -176,7 +177,7 @@ nse-<skill>/   SKILL.md + one script each (scan.py, news.py, entry.py, exit.py, 
                the shared NSE clock, tick, charges, loss and sizing rules
 hooks/         the plugin's hooks: gate.py, record_prompt.py, session_status.py
 autopilot/     the paper autopilot: run_day.py (launchd tick), report.py, claude_run.py, mail.py,
-               shorts.py (shadow shorts), market.py (tags, archive), study.py, prompts/, install.sh, ...
+               shorts.py, sizes.py, market.py, study.py, prompts/, install.sh, ...
 tests/         unittest suite + offline fixtures
 CHANGELOG.md   what changed in each version        PORTING.md   how the port was done
 ```

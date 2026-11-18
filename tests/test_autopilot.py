@@ -26,6 +26,7 @@ import mail  # noqa: E402
 import market  # noqa: E402
 import report  # noqa: E402
 import run_day  # noqa: E402
+import sizes  # noqa: E402
 
 nc = ac.nc
 DAY = "2026-11-13"
@@ -831,6 +832,103 @@ class Study(unittest.TestCase):
         g = study.summarise(rows)
         self.assertEqual(g["Long, skipped by the filter"]["signals"]["n"], 1)
         self.assertEqual(g["Long, skipped by the filter"]["days"]["verdict"], "too few to tell (1 of 20 days)")
+
+
+def sig(symbol="RELIANCE", at="10:05", entry=1334.0, stop=1328.8, fill=1334.0, exit=1344.3, exit_at="10:13",
+        result="target", day=DAY, **kw):
+    s = {"day": day, "symbol": symbol, "at": at, "entry": entry, "stop": stop, "fill": fill, "exit": exit,
+         "exit_at": exit_at, "result": result}
+    s.update(kw)
+    return s
+
+
+class Sizes(unittest.TestCase):
+    """sizes.simulate: the same signals at other budgets, each with its own scaled rules."""
+    cfg = nc.load_config(CFG_PATH)            # the README's ₹1,00,000 account: ₹500 a trade, ₹1,500 a day, 3 trades
+
+    def test_scaling_keeps_every_percentage(self):
+        c = sizes.scaled_cfg(self.cfg, 10000000)
+        self.assertEqual((c["budget"], c["max_loss_per_trade_inr"], c["max_daily_loss_inr"], c["max_order_inr"]),
+                         (10000000.0, 50000.0, 150000.0, 8000000.0))
+        for k in ("max_position_pct", "cash_buffer_pct", "max_trades_per_day", "stop_limit_buffer_pct"):
+            self.assertEqual(c[k], self.cfg[k])
+        self.assertEqual(sizes.label(100000), "₹1 lakh")
+        self.assertEqual(sizes.label(50000000), "₹5 cr")
+
+    def test_at_its_own_size_it_is_the_readme_trade(self):
+        s = sizes.simulate([sig()], self.cfg, 100000)
+        t = s["trades"][0]
+        self.assertEqual((t["qty"], t["net"], t["charges"], t["r"]), (37, 328.4, 52.7, 0.667))
+        self.assertEqual(s["totals"]["net"], 328.4)
+
+    def test_ten_times_the_budget(self):
+        s = sizes.simulate([sig()], self.cfg, 1000000)
+        t = s["trades"][0]
+        c = sizes.scaled_cfg(self.cfg, 1000000)
+        self.assertEqual(t["qty"], nc.size_qty(1334.0, 1328.8, "RELIANCE", c, cash=1000000, portfolio_total=1000000))
+        self.assertEqual(t["net"], round(t["qty"] * 10.3 - nc.intraday_charges(t["qty"], 1334.0, 1344.3, c)["total"], 2))
+        self.assertLess(t["charges_r"], 0.2)          # brokerage's ₹20 cap: a big order pays a smaller share
+
+    def test_the_cost_filter_works_on_each_sizes_own_charges(self):
+        small = sizes.simulate([sig()], self.cfg, 100000, max_charges_r=0.2)
+        big = sizes.simulate([sig()], self.cfg, 1000000, max_charges_r=0.2)
+        self.assertEqual((small["trades"], small["skipped"]), ([], {"cost filter": 1}))
+        self.assertEqual(len(big["trades"]), 1)
+
+    def test_the_trade_cap_and_the_veto(self):
+        sigs = [sig(symbol=s, at="10:%02d" % (5 + i), exit_at="10:%02d" % (6 + i)) for i, s in
+                enumerate(("A", "B", "C", "D"))] + [sig(symbol="E", at="09:40", eligible=False, why="Claude's veto")]
+        s = sizes.simulate(sigs, self.cfg, 100000)
+        self.assertEqual([t["symbol"] for t in s["trades"]], ["A", "B", "C"])
+        self.assertEqual(s["skipped"], {"trade cap": 1, "Claude's veto": 1})
+
+    def test_the_daily_loss_rule_counts_each_entrys_max_loss(self):
+        cfg = dict(self.cfg, max_trades_per_day=10)
+        sigs = [sig(symbol=s, at="10:%02d" % (5 + i), exit=1328.8, exit_at="10:%02d" % (6 + i), result="stop")
+                for i, s in enumerate(("A", "B", "C", "D"))]
+        s = sizes.simulate(sigs, cfg, 100000)
+        self.assertEqual(len(s["trades"]), 3)             # 3 x ~₹500 fits ₹1,500; the 4th would not
+        self.assertEqual(s["skipped"], {"daily loss limit": 1})
+
+    def test_open_positions_use_the_cash(self):
+        cfg = dict(self.cfg, max_loss_per_trade_inr=5000, max_order_inr=10 ** 7, max_trades_per_day=10)
+        sigs = [sig(symbol=s, at="10:%02d" % (5 + i), exit_at="14:00") for i, s in enumerate(("A", "B", "C"))]
+        s = sizes.simulate(sigs, cfg, 100000)
+        values = [t["order_value"] for t in s["trades"]]
+        self.assertLessEqual(sum(values), 90000 + 1)       # never more than the cash after the 10% buffer
+        self.assertLess(values[-1], values[0])
+
+    def test_a_losing_day_carries_into_the_next(self):
+        d1 = sig(day="2026-11-12", exit=1328.8, result="stop")
+        d2 = sig(day=DAY)
+        s = sizes.simulate([d1, d2], self.cfg, 100000)
+        self.assertLess(s["days"]["2026-11-12"]["equity"], 100000)
+        self.assertEqual(s["days"][DAY]["equity"], round(s["days"]["2026-11-12"]["equity"] + s["days"][DAY]["net"], 2))
+
+
+class SizesInTheReport(HomeBase):
+    def test_the_live_trade_and_its_re_sizing_agree(self):
+        self.settings["sizes"] = [100000, 1000000]
+        self.write_settings()
+        self.replay()
+        rep = self.doc("reports", DAY + ".json")
+        one, ten = rep["sizes"]
+        live = self.doc("state", "paper.json")["trades"][0]
+        # the ₹1 lakh line is the paper account itself: the same 37 shares, the same +₹328.40
+        self.assertEqual((one["label"], one["trades"][0]["qty"], one["totals"]["net"]),
+                         ("₹1 lakh", live["qty"], live["pnl_net"]))
+        self.assertEqual(ten["label"], "₹10 lakh")
+        self.assertGreater(ten["totals"]["net"], 9 * one["totals"]["net"])
+        card = self.doc("reports", "scorecard.json")["totals"]["sizes"]
+        self.assertEqual(list(card), ["₹1 lakh", "₹10 lakh"])
+        self.assertEqual((card["₹1 lakh"]["days"], card["₹1 lakh"]["net"]), (1, 328.4))
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("## The same signals at other account sizes", md)
+        self.assertIn("At each budget, all days", md)
+
+    def test_off_by_default(self):
+        self.replay()
+        self.assertNotIn("sizes", self.doc("reports", DAY + ".json"))
 
 
 class ArchiveInTheDay(HomeBase):
