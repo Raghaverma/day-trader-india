@@ -44,6 +44,19 @@ DEFAULTS = {
     "mail": {"enabled": False, "from": "", "to": [], "keychain_service": "nse-autopilot-gmail",
              "host": "smtp.gmail.com", "port": 465},
     "notify": True,
+    # Measurements (autopilot.example.json turns them on; without the keys they are off):
+    # skip a long signal whose round-trip charges at the stop exceed this share of its risk (R); every signal
+    # skipped is replayed in the report, so the filter's cost or saving is measured. null = off.
+    "cost_filter": {"max_charges_r": None},
+    # "shadow": scan breakdowns too, plan them and replay them at the close; never traded. "off": long only.
+    "shorts": "off",
+    # record the Nifty trend, the VIX band and the Nifty's move so far on every signal (the report splits by them)
+    "tags": False,
+    # a JSON file {"as_of": "YYYY-MM-DD", "ranks": {"SYMBOL": 0.0-1.0}} (1 = ranked best), e.g. from Touchstone;
+    # recorded as a tag on each signal. null = none.
+    "rank_file": None,
+    # keep the day's 1- and 5-minute bars (Yahoo drops them after 30 / 60 days) in archive/ in the trader folder
+    "archive": {"enabled": False, "pause_s": 0.4},
     # test and replay only (NSE_TEST_MODE=1): extra arguments per step, "{sym}" is replaced by the symbol,
     # e.g. {"entry": ["--offline", "fixtures/{sym}-5m.json"]}. Refused outside test mode.
     "offline": {},

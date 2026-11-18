@@ -10,6 +10,17 @@ forecast was recorded but never used to filter), nse-budget (size to the max los
 BLOCK) and a paper broker driven by Yahoo 1-minute bars. After the day's trade cap or loss limit, signals
 were planned but not traded ("shadows"), then replayed on the day's bars by the same rules.
 
+Three measurements may be switched on (the data shows which):
+- A cost filter skips a long signal whose round-trip charges at the stop exceed a share of its risk
+  ("cost_filter" in the outcomes, "charges_r" on each signal). Skipped signals are replayed, so the data
+  says what the filter saved or cost.
+- Short breakdowns (side "short", outcome "short_shadow") are planned and replayed but NEVER traded. A
+  replay cannot show a short's own risks (an upper-circuit lock, NSE's auction for an uncovered short).
+- Tags on each signal (nifty_trend, vix_band, nifty_today, rank) only record what was true when it fired;
+  nothing was skipped on them.
+"all_days.totals.edge" has the average R per group with a 95% interval and a verdict; quote the verdict
+rather than judging the averages yourself.
+
 The data below has today's report ("today") and the running totals ("all_days"). Every number you quote
 must come from the data: do not compute new figures beyond simple comparisons, and say "not enough data
 yet" when a sample is small (under about 20 trades, it nearly always is; say so plainly).
@@ -23,7 +34,8 @@ Write Markdown, 250-450 words, with these headings:
 Compare its forecasts with what happened (today and all days: Brier vs the base line, buckets, verdict
 categories). Be honest about sample size.
 ## The vetoes and the caps
-What did the shadow replays say: would the vetoed or capped signals have made or lost money?
+What did the shadow replays say: would the vetoed, capped or cost-filtered signals have made or lost
+money? If there are shorts, how did the breakdowns do (shadow only)?
 ## Suggestions
 At most three concrete, testable changes to the rules or settings (for example the trade cap, the stop
 rule, the entry window, using the Time Machine as a filter, the universe). Suggest only; the owner decides.

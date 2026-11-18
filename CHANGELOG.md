@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.0
+
+### The autopilot measures what would make it better
+
+Only the cost filter changes what is traded. Everything else records and replays. Each is off unless
+`autopilot.json` turns it on, and `autopilot.example.json` turns them all on.
+
+- **Cost filter** (`cost_filter.max_charges_r`). A long signal whose round-trip charges at the stop exceed this
+  share of its risk is skipped (outcome `cost_filter`) and replayed. Measured on 5 fixture days, the median ORB
+  signal pays 0.16R in charges. 0.1R would skip about 90% of signals; 0.2R skips the worst third.
+- **Short side, shadow only** (`shorts: "shadow"`).
+  - `nse-scanner orb --side short|both` finds breakdowns. Long stays the default, and its output is unchanged.
+  - `autopilot/shorts.py` plans each breakdown as the mirror of nse-exit's ORB plan, sized by
+    `nse_common.size_qty(long=False)`.
+  - `report.shadow` replays a short on mirrored bars, so `ticket.walk`'s rules apply unchanged.
+  - Nothing short is approved, sized by nse-budget, checked by nse-risk or paper-filled.
+- **Tags** (`tags`, `rank_file`). Each signal records:
+  - the Nifty vs its 50-day average
+  - India VIX's one-year band
+  - the Nifty's move so far that day
+  - a rank from a file, when there is one
+  The scorecard splits results by each tag.
+- **Edge statistics.** `report.edge_stats` gives the average R, a 95% bootstrap interval, t, and the trades
+  needed. It reports by group (traded, cost-filtered, other skipped signals, shorts) and by tag, in the report,
+  the scorecard and Claude's EOD prompt.
+- **Bar archive** (`archive.enabled`). The day's 1- and 5-minute bars go to `archive/<interval>/<date>/`, and
+  a day is only ever replaced by a fuller copy. `run_day.py archive --backfill` saves what Yahoo still has.
+- **`study.py`.** Replays every archived ORB signal, long and short, and gives the verdict per signal and per
+  day. On an archive cut from the 13 November fixtures, it reproduces the README's RELIANCE trade.
+- **Tests.** 27 new offline tests, covering:
+  - the scanner's short side
+  - mirrored replays: target, stop, a gap through the SL limit, an unfilled sell limit
+  - the cost filter on the README trade
+  - shorts never reaching the order path
+  - the tags, with no network in tests
+  - the edge verdicts and the rank file
+  - the archive
+  - the study
+
 ## 1.2.0
 
 ### Autopilot: paper trading with nobody at the keyboard (new `autopilot/`)

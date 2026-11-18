@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "autopilot"))
 import autopilot_common as ac  # noqa: E402
 import claude_run  # noqa: E402
 import mail  # noqa: E402
+import market  # noqa: E402
 import report  # noqa: E402
 import run_day  # noqa: E402
 
@@ -506,6 +507,351 @@ class KeychainArgvTest(unittest.TestCase):
         with mock.patch.object(ac.subprocess, "run", fake_run):
             self.assertEqual(ac.keychain("svc", "sender-account"), "pw")
         self.assertEqual(seen[0], ["security", "find-generic-password", "-s", "svc", "-a", "sender-account", "-w"])
+
+
+# ---------------------------------------------------------------- 1.3: the cost filter, shorts in shadow, tags, edge
+
+def chart_doc(sym, points):
+    """A Yahoo v8 chart doc from [(naive IST datetime, open, high, low, close)]."""
+    ts = [int((nc.to_utc(p[0]) - datetime.datetime(1970, 1, 1)).total_seconds()) for p in points]
+    return {"chart": {"result": [{"meta": {"symbol": nc.yahoo_symbol(sym)}, "timestamp": ts,
+                                  "indicators": {"quote": [{"open": [p[1] for p in points],
+                                                            "high": [p[2] for p in points],
+                                                            "low": [p[3] for p in points],
+                                                            "close": [p[4] for p in points],
+                                                            "volume": [1000] * len(points)}]}}],
+                      "error": None}}
+
+
+def market_fake(trend_up=True, vix_low=True, index_up=True):
+    """fetch(sym, interval, rng, period) for the tags: daily Nifty and VIX before 13 Nov, the Nifty's 5-minute bars."""
+    calls = []
+
+    def fetch(sym, interval, rng=None, period=None):
+        calls.append((sym, interval, rng))
+        if interval == "1d":
+            days = [datetime.datetime(2026, 7, 1, 9, 15) + datetime.timedelta(days=i) for i in range(130)]
+            if sym == market.NIFTY:
+                closes = [20000 + (i if trend_up else -i) * 10 for i in range(130)]
+            else:
+                closes = [20 - (0.1 * i if vix_low else -0.1 * i) for i in range(130)]
+            return chart_doc(sym, [(d, c, c, c, c) for d, c in zip(days, closes)])
+        start = datetime.datetime(2026, 11, 13, 9, 15)
+        step = 5 if index_up else -5
+        return chart_doc(sym, [(start + datetime.timedelta(minutes=5 * i), 26000 + step * i, 26000 + step * i + 2,
+                                26000 + step * i - 2, 26000 + step * (i + 1)) for i in range(20)])
+    fetch.calls = calls
+    return fetch
+
+
+class CostFilterAndShorts(HomeBase):
+    def tick_all(self, times, fetch=None):
+        for t in times:
+            settings, cfg = ac.load_settings(self.d), ac.load_cfg(self.d)
+            self.claude = getattr(self, "claude", None) or ClaudeStub()
+            self.mail = getattr(self, "mail", None) or MailStub()
+            day = run_day.Day(self.d, utc("%s %s" % (DAY, t)), settings, cfg, claude=self.claude,
+                              send_mail=self.mail, fetch=fetch)
+            self.assertEqual(day.tick(), 0)
+
+    def test_the_cost_filter_skips_the_readme_trade_and_replays_it(self):
+        self.settings["cost_filter"] = {"max_charges_r": 0.2}
+        self.write_settings()
+        self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual(c["outcome"], "cost_filter")
+        self.assertEqual(c["plan"]["charges_r"], 0.271)             # ₹1.41 a share at the stop against ₹5.20 of risk
+        self.assertIn("0.27R of the risk, over the 0.20R limit", c["reason"])
+        self.assertFalse(c["cost_ok"])
+        self.assertNotIn("tm", c)
+        self.assertEqual(self.doc("state", "paper.json")["trades"], [])
+        rep = self.doc("reports", DAY + ".json")
+        row = rep["shadows"]["rows"][0]
+        # what the filter cost today: the same +328.40 the trade made
+        self.assertEqual((row["why"], row["side"], row["result"], row["net"], row["r"], row["charges_r"]),
+                         ("cost_filter", "long", "target", 328.4, 0.67, 0.271))
+        g = self.doc("reports", "scorecard.json")["totals"]["edge"]["groups"]
+        self.assertEqual((g["Long, skipped by the cost filter (replayed)"]["n"],
+                          g["Long, skipped by the cost filter (replayed)"]["mean_r"]), (1, 0.67))
+        self.assertEqual(g["Long, traded (paper)"]["n"], 0)
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("skipped by the cost filter", md)
+        self.assertIn("## Is there an edge? (all days, in R)", md)
+
+    def test_a_signal_inside_the_limit_is_traded_as_before(self):
+        self.settings["cost_filter"] = {"max_charges_r": 0.3}
+        self.write_settings()
+        self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual((c["outcome"], c["cost_ok"]), ("traded", True))
+        g = self.doc("reports", "scorecard.json")["totals"]["edge"]["groups"]
+        self.assertEqual((g["Long, traded (paper)"]["n"], g["Long, traded (paper)"]["mean_r"]), (1, 0.67))
+
+    def test_shorts_are_off_by_default(self):
+        self.settings["universe"] = ["HDFCLIFE"]
+        self.write_settings()
+        self.replay(("08:45", "09:36"))
+        self.assertEqual(self.state()["candidates"], {})
+        scans = [e for e in ac.read_log(self.d, DAY) if e.get("step") == "scan_orb"]
+        self.assertNotIn("--side", scans[0]["args"])
+
+    def test_a_breakdown_is_planned_in_shadow_and_never_traded(self):
+        self.settings.update(universe=["HDFCLIFE"], shorts="shadow", cost_filter={"max_charges_r": 0.2})
+        self.write_settings()
+        self.replay(("08:45", "09:36", "15:35"))
+        st = self.state()
+        c = st["candidates"]["short:HDFCLIFE"]
+        self.assertEqual((c["side"], c["outcome"], c["symbol"]), ("short", "short_shadow", "HDFCLIFE"))
+        p = c["plan"]
+        # entry the breakdown close; stop the range midpoint (594.40 + 601.85) / 2 = 598.125, rounded UP; 2R under
+        self.assertEqual((p["entry"], p["stop"], p["target"], p["side"]), (593.4, 598.15, 583.9, "short"))
+        cfg = ac.load_cfg(self.d)
+        self.assertEqual(p["quantity"], nc.size_qty(593.4, 598.15, "HDFCLIFE", cfg, long=False))
+        self.assertEqual(p["worst_exit"], float(nc.worst_exit_price(598.15, "HDFCLIFE", cfg, long=False)))
+        self.assertTrue(c["cost_ok"])
+        self.assertEqual(self.doc("state", "paper.json")["trades"], [])
+        broker = ac.read_json(os.path.join(self.d, "state", "broker.json")) or {}
+        self.assertFalse([r for r in broker.get("orders") or [] if r.get("status") == "approved"])
+        steps = {e.get("step") for e in ac.read_log(self.d, DAY)}
+        self.assertFalse(steps & {"entry", "exit", "size", "risk", "approve", "paper_fill"})
+        rep = self.doc("reports", DAY + ".json")
+        self.assertEqual((rep["funnel"]["signals"], rep["funnel"]["short_signals"]), (0, 1))
+        self.assertEqual(rep["shadows"]["rows"][0]["side"], "short")
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("## The short side (shadow only)", md)
+        self.assertIn("upper circuit", md)
+
+    def test_tags_record_what_was_true_when_the_signal_fired(self):
+        self.settings["tags"] = True
+        self.write_settings()
+        fetch = market_fake(trend_up=True, vix_low=True, index_up=True)
+        self.tick_all(("08:45", "10:05", "10:10", "15:35"), fetch=fetch)
+        st = self.state()
+        reg = st["phases"]["premarket"]["regime"]
+        self.assertEqual((reg["nifty_trend"], reg["vix_band"]), ("up", "low"))
+        self.assertEqual(st["candidates"]["RELIANCE"]["tags"],
+                         {"nifty_trend": "up", "vix_band": "low", "nifty_today": "up"})
+        self.assertEqual(st["phases"]["index_by_bar"]["10:05"]["tag"], "up")
+        by_tag = self.doc("reports", "scorecard.json")["totals"]["edge"]["by_tag"]
+        self.assertEqual(by_tag["long / nifty_trend"]["up"]["n"], 1)
+        self.assertIn(("^NSEI", "1d", "1y"), fetch.calls)
+
+    def test_tags_never_reach_the_network_in_a_test(self):
+        self.settings["tags"] = True
+        self.write_settings()
+        with mock.patch.object(market, "fetch_chart", side_effect=AssertionError("network in a test")):
+            self.replay()
+        self.assertIn("errors", self.state()["phases"]["premarket"]["regime"])
+        self.assertEqual(self.state()["candidates"]["RELIANCE"]["outcome"], "traded")
+
+
+def short_candidate(entry=100.0, stop=102.0, target=96.0, worst=102.55, qty=50, at="10:00"):
+    return {"symbol": "TESTSTOCK", "side": "short", "outcome": "short_shadow", "trigger": {"at": at},
+            "plan": {"entry": entry, "stop": stop, "target": target, "worst_exit": worst, "quantity": qty,
+                     "flat_by": "15:10", "max_loss": 150.0, "charges_r": 0.12}}
+
+
+def minute_bars(rows, start="09:58"):
+    """[(o, h, l, c)] one a minute from `start` on 13 Nov -> walk()'s bar tuples."""
+    t0 = datetime.datetime.strptime(DAY + " " + start, "%Y-%m-%d %H:%M")
+    return [(t0 + datetime.timedelta(minutes=i), o, h, l, c) for i, (o, h, l, c) in enumerate(rows)]
+
+
+class ShortReplay(unittest.TestCase):
+    """report.shadow() replays a short with the paper broker's long rules on mirrored bars. These pin down that
+    the mirror really is the short's rules: fills on the way up, the stop above, the target below."""
+
+    cfg = dict(json.load(open(CFG_PATH)))
+
+    def replay(self, rows, **kw):
+        return report.shadow(short_candidate(**kw), DAY, minute_bars(rows), self.cfg)
+
+    def test_target_reached_on_a_low_exits_at_the_next_bars_open(self):
+        row = self.replay([(100.2, 100.4, 100.0, 100.1),      # 09:58
+                           (100.1, 100.3, 99.9, 100.0),       # 09:59: closes at the entry, so the SELL LIMIT is filled
+                           (100.0, 100.2, 98.0, 98.5),        # 10:00
+                           (98.5, 98.6, 95.9, 96.1),          # 10:01: low reaches the 96.00 target
+                           (96.3, 96.5, 96.0, 96.2)])         # 10:02: bought back at this open
+        self.assertEqual((row["result"], row["fill"], row["exit"], row["exit_at"]), ("target", 100.0, 96.3, "10:02"))
+        self.assertEqual(row["gross"], round(50 * (100.0 - 96.3), 2))
+        self.assertEqual(row["charges"], nc.intraday_charges(50, 96.3, 100.0, self.cfg)["total"])  # STT on the sale
+        self.assertEqual(row["net"], round(row["gross"] - row["charges"], 2))
+
+    def test_a_high_through_the_stop_buys_back_at_the_trigger(self):
+        row = self.replay([(100.2, 100.4, 100.0, 100.1), (100.1, 100.3, 99.9, 100.0),
+                           (100.0, 101.0, 99.8, 100.9), (100.9, 102.2, 100.8, 101.9)])
+        self.assertEqual((row["result"], row["exit"]), ("stop", 102.0))
+        self.assertLess(row["net"], 0)
+
+    def test_the_same_bar_touching_both_counts_as_the_stop(self):
+        row = self.replay([(100.2, 100.4, 100.0, 100.1), (100.1, 100.3, 99.9, 100.0),
+                           (100.0, 102.5, 95.5, 99.0)])
+        self.assertEqual(row["result"], "stop")
+
+    def test_a_gap_over_the_sl_limit_waits_for_the_limit(self):
+        row = self.replay([(100.2, 100.4, 100.0, 100.1), (100.1, 100.3, 99.9, 100.0),
+                           (103.0, 103.5, 102.8, 103.2),      # opens over the 102.55 limit: the stop cannot fill
+                           (103.2, 103.4, 102.5, 102.6)])     # comes back down to the limit: bought back there
+        self.assertEqual((row["result"], row["exit"]), ("stop", 102.55))
+
+    def test_a_sell_limit_under_the_market_waits_and_can_go_unfilled(self):
+        rows = [(99.0, 99.2, 98.8, 99.0)] * 5                 # never back up to the 100.00 entry
+        row = report.shadow(short_candidate(), DAY, minute_bars(rows, "09:58") +
+                            minute_bars([(99.0, 99.2, 98.8, 99.0)], "15:11"), self.cfg)
+        self.assertEqual(row["result"], "never filled")
+
+    def test_a_long_still_replays_as_before(self):
+        c = dict(short_candidate(entry=100.0, stop=98.0, target=104.0, worst=97.5), side="long", outcome="vetoed")
+        row = report.shadow(c, DAY, minute_bars([(100.0, 100.1, 99.9, 100.0), (100.0, 100.1, 99.9, 100.0),
+                                                 (100.0, 104.2, 99.9, 104.0), (104.1, 104.3, 104.0, 104.2)]), self.cfg)
+        self.assertEqual((row["result"], row["exit"], row["side"]), ("target", 104.1, "long"))
+
+
+class Edge(unittest.TestCase):
+    def test_too_few_is_always_too_few(self):
+        s = report.edge_stats([2.0] * 19)
+        self.assertEqual(s["n"], 19)
+        self.assertTrue(s["verdict"].startswith("too few to tell"))
+
+    def test_the_three_verdicts(self):
+        self.assertTrue(report.edge_stats([1.0] * 15 + [-0.2] * 15)["verdict"].startswith("an edge"))
+        self.assertTrue(report.edge_stats([-1.0] * 20 + [0.5] * 5)["verdict"].startswith("losing"))
+        s = report.edge_stats([1.0] * 10 + [-1.0] * 10 + [0.1] * 5)
+        self.assertTrue(s["verdict"].startswith("no evidence either way"))
+        self.assertLess(s["ci95"][0], 0)
+        self.assertGreater(s["ci95"][1], 0)
+        self.assertGreater(s["trades_needed"], 1000)                   # a 0.02R average takes thousands to tell
+
+    def test_deterministic(self):
+        rs = [0.67, -1.0, 2.0, -1.0, 0.3, -0.5] * 5
+        self.assertEqual(report.edge_stats(rs), report.edge_stats(rs))
+
+    def test_groups_and_tags(self):
+        rs = [{"side": "long", "why": "traded", "r": 1.0, "tags": {"nifty_trend": "up"}},
+              {"side": "long", "why": "cost_filter", "r": -1.0, "tags": {"nifty_trend": "down"}},
+              {"side": "short", "why": "short_shadow", "r": 0.5, "cost_ok": True, "tags": None}]
+        e = report.edge(rs)
+        g = e["groups"]
+        self.assertEqual([g[k]["n"] for k in ("Long, traded (paper)", "Long, skipped by the cost filter (replayed)",
+                                              "Long, every signal (traded or replayed)",
+                                              "Short, every breakdown (shadow)",
+                                              "Short, charges within the cost filter (shadow)")], [1, 1, 2, 1, 1])
+        self.assertEqual(sorted(e["by_tag"]["long / nifty_trend"]), ["down", "up"])
+
+
+class RankTag(unittest.TestCase):
+    def test_rank_file(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        path = os.path.join(d, "ranks.json")
+        with open(path, "w") as fh:
+            json.dump({"as_of": "2026-11-12", "ranks": {"RELIANCE": 0.81, "TCS": 0.2}}, fh)
+        fri = datetime.date(2026, 11, 13)
+        self.assertEqual(run_day.rank_tag(path, "RELIANCE", fri), "top half")
+        self.assertEqual(run_day.rank_tag(path, "TCS", fri), "bottom half")
+        self.assertIsNone(run_day.rank_tag(path, "INFY", fri))
+        self.assertEqual(run_day.rank_tag(path, "RELIANCE", datetime.date(2026, 11, 20)), "stale")
+        self.assertIsNone(run_day.rank_tag(None, "RELIANCE", fri))
+        self.assertIsNone(run_day.rank_tag(os.path.join(d, "missing.json"), "RELIANCE", fri))
+
+
+class Archive(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d)
+
+    def fetch_for(self, n_last):
+        def fetch(sym, interval, rng=None, period=None):
+            thu = [(datetime.datetime(2026, 11, 12, 9, 15) + datetime.timedelta(minutes=i), 10, 11, 9, 10)
+                   for i in range(3)]
+            fri = [(datetime.datetime(2026, 11, 13, 9, 15) + datetime.timedelta(minutes=i), 10, 11, 9, 10 + i)
+                   for i in range(n_last)]
+            return chart_doc(sym, thu + fri)
+        return fetch
+
+    def test_bars_are_filed_by_day_and_only_a_fuller_copy_replaces_one(self):
+        out = market.archive(self.d, ["RELIANCE", "^NSEI"], self.fetch_for(5), [("1m", "5d", None)],
+                             sleep=lambda s: None)
+        self.assertEqual((out["requests"], out["written"], out["days"], out["failed"]),
+                         (2, 4, ["2026-11-12", "2026-11-13"], {}))
+        doc = market.read_day(market.archive_path(self.d, "1m", "2026-11-13", "RELIANCE"))
+        self.assertEqual((doc["symbol"], doc["interval"], len(doc["bars"]), doc["bars"][-1][4]), ("RELIANCE", "1m", 5, 14))
+        self.assertTrue(os.path.isfile(market.archive_path(self.d, "1m", "2026-11-13", "^NSEI")))
+        again = market.archive(self.d, ["RELIANCE"], self.fetch_for(3), [("1m", "5d", None)], sleep=lambda s: None)
+        self.assertEqual(again["written"], 0)                              # a shorter copy never replaces a day
+        more = market.archive(self.d, ["RELIANCE"], self.fetch_for(9), [("1m", "5d", None)], sleep=lambda s: None)
+        self.assertEqual(more["written"], 1)
+        self.assertEqual(len(market.read_day(market.archive_path(self.d, "1m", "2026-11-13", "RELIANCE"))["bars"]), 9)
+
+    def test_a_failed_symbol_is_named_and_the_rest_carry_on(self):
+        def fetch(sym, interval, rng=None, period=None):
+            if sym == "TCS":
+                raise market.MarketError("Yahoo chart TCS 1m: HTTP Error 429")
+            return self.fetch_for(2)(sym, interval)
+        out = market.archive(self.d, ["TCS", "RELIANCE"], fetch, [("1m", "5d", None)], sleep=lambda s: None)
+        self.assertEqual(list(out["failed"]), ["TCS"])
+        self.assertEqual(out["written"], 2)
+
+    def test_backfill_windows_fit_yahoos_limits(self):
+        now = datetime.datetime(2026, 11, 18, 11, 0)
+        plan = market.backfill_plan(now)
+        self.assertEqual(plan[0], ("5m", "60d", None))
+        end = (now - datetime.datetime(1970, 1, 1)).total_seconds()
+        for interval, rng, (lo, hi) in plan[1:]:
+            self.assertEqual(interval, "1m")
+            self.assertLess(hi - lo, 7 * 86400)
+            self.assertLessEqual(end - lo, 29 * 86400)
+
+
+class Study(unittest.TestCase):
+    """study.py on an archive cut from the 13 Nov fixtures reproduces the README's RELIANCE trade."""
+
+    def test_the_readme_trade_from_the_archive(self):
+        import study
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        scan = study.scanner()
+        five, _ = scan.load_offline(os.path.join(FIX, "nse-scanner", "wall5m-nifty50-5d-2026-11-13.json.gz"))
+        for sym, s in five.items():
+            by_day = {}
+            for i, t in enumerate(s["t"]):
+                if s["c"][i] is not None:
+                    row = (t, s["c"][i], s["h"][i], s["l"][i], s["c"][i], (s.get("v") or [0] * len(s["t"]))[i])
+                    by_day.setdefault(nc.ist_from_epoch(t).date().isoformat(), []).append(row)
+            for day, rows in by_day.items():
+                market.write_day(d, sym, "5m", day, rows, "test")
+        with open(os.path.join(FIX, "nse-entry", "RELIANCE-2026-11-13-1m.json")) as fh:
+            market.write_day(d, "RELIANCE", "1m", DAY, market.rows(json.load(fh)), "test")
+        self.assertEqual(study.days_with_both(d), [DAY])
+        cfg = nc.load_config(CFG_PATH)
+        rows = study.study(d, cfg, 0.2, [DAY])
+        rel = [r for r in rows if r["symbol"] == "RELIANCE"]
+        self.assertEqual([(r["side"], r["at"], r["result"], r["net"], r["r"], r["cost_ok"]) for r in rel],
+                         [("long", "10:05", "target", 328.4, 0.67, False)])
+        g = study.summarise(rows)
+        self.assertEqual(g["Long, skipped by the filter"]["signals"]["n"], 1)
+        self.assertEqual(g["Long, skipped by the filter"]["days"]["verdict"], "too few to tell (1 of 20 days)")
+
+
+class ArchiveInTheDay(HomeBase):
+    def test_the_archive_runs_after_the_report_and_never_in_a_test(self):
+        self.settings["archive"] = {"enabled": True}
+        self.write_settings()
+        with mock.patch.object(market, "fetch_chart", side_effect=AssertionError("network in a test")):
+            self.replay()
+        self.assertEqual(self.state()["phases"]["eod"]["archive"], "skipped: no market data (test or replay)")
+        self.assertEqual(len(self.mail.sent), 1)
+
+    def test_with_market_data_the_day_is_filed(self):
+        self.settings["archive"] = {"enabled": True, "pause_s": 0}
+        self.write_settings()
+        fetch = Archive.fetch_for(None, 4)
+        for t in ("08:45", "10:05", "10:10", "15:35"):
+            run_day.Day(self.d, utc("%s %s" % (DAY, t)), ac.load_settings(self.d), ac.load_cfg(self.d),
+                        claude=ClaudeStub(), send_mail=MailStub(), fetch=fetch).tick()
+        self.assertIn("day files written", self.state()["phases"]["eod"]["archive"])
+        for sym in ("RELIANCE", "^NSEI", "^INDIAVIX"):
+            self.assertTrue(os.path.isfile(market.archive_path(self.d, "5m", DAY, sym)), sym)
 
 
 if __name__ == "__main__":

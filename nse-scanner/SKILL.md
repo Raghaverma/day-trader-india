@@ -222,7 +222,9 @@ Nifty 50: BAJFINANCE, BSE and MAXHEALTH a 20-day breakout and a bull flag,
 - Say "matched a rule", never "a buy", "a winner" or "a good trade".
 - Never print a P&L or a return figure. Money is in rupees.
 - A hit is stale once the price has moved on. Re-run before acting on it.
-- Long side, cash equity (series EQ), intraday MIS only. No F&O, no shorts.
+- Long side, cash equity (series EQ), intraday MIS only. No F&O, no shorts. `orb --side short` (or `both`)
+  also lists opening-range breakdowns, for research and the paper autopilot's shadow-only short side; the
+  order path stays long-only, so never offer a breakdown as a trade.
 
 ## What it never does
 

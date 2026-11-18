@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.2.0" src="https://img.shields.io/badge/version-1.2.0-blue?style=flat-square">
+  <img alt="version 1.3.0" src="https://img.shields.io/badge/version-1.3.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="832 offline tests" src="https://img.shields.io/badge/tests-832%20offline-3fb950?style=flat-square">
+  <img alt="860 offline tests" src="https://img.shields.io/badge/tests-860%20offline-3fb950?style=flat-square">
   <img alt="NSE India" src="https://img.shields.io/badge/market-NSE%20India-FF9933?style=flat-square">
   <img alt="paper trading by default" src="https://img.shields.io/badge/broker-paper%20by%20default-58a6ff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat-square">
@@ -135,6 +135,17 @@ claude                                               # log in once
 - **Every signal is judged.** Signals that were vetoed, capped or blocked are replayed on the day's bars by the same paper rules, so you can see whether the caps and the veto earn their keep. The scorecard tracks the Time Machine's forecasts against outcomes (Brier score, calibration buckets).
 - **A small sample proves little.** One good week is noise; read the scorecard after 20 or more trades.
 
+### Measuring what would make it better (1.3.0)
+
+`autopilot.example.json` (what `install.sh` copies) switches these on. Only the first one changes what is traded; every other one only measures.
+
+- **Cost filter** (`"cost_filter": {"max_charges_r": 0.2}`). A long signal whose round-trip charges at the stop are over 0.2R of its risk is skipped and replayed. Tight stops make charges a big share of the risk: the README's RELIANCE trade paid 0.27R, and the median ORB signal about 0.16R. 0.1R would skip almost every signal.
+- **The short side, in shadow** (`"shorts": "shadow"`). `scan.py orb --side both` also finds breakdowns (the first close under the range low). Each is planned the mirror image of the long plan, with the same shared sizing, and replayed at the close by the paper broker's rules turned upside down. None is ever traded: the order path stays long-only. A replay can't show a short's own risks (an upper-circuit lock, NSE's auction for an uncovered short).
+- **Tags** (`"tags": true`). Every signal records the Nifty against its 50-day average, India VIX's band over the past year and the Nifty's move so far that day, plus a rank from `"rank_file"` (for example Touchstone's) when there is one. Nothing is skipped on them: the scorecard splits the results by each.
+- **Is there an edge?** The report and the scorecard give the average R of each group (traded, skipped by the filter, other skipped signals, shorts) with a 95% bootstrap interval and a verdict, which stays "too few to tell" below 20.
+- **The bar archive** (`"archive": {"enabled": true}`). After the report, the day's 1- and 5-minute bars for the universe, the Nifty and India VIX go to `archive/` in the trader folder (Yahoo drops them after 30 and 60 days). `run_day.py archive --backfill` saves everything Yahoo still has.
+- **`study.py`** replays every ORB signal in the archive, long and short, with the paper rules, and gives the verdict per signal and per day. Signals on one day move together, so the per-day verdict is the honest one.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does arithmetic. It doesn't know your situation and can't see the future. SEBI's [study of intraday trading in the equity cash segment](https://www.business-standard.com/markets/news/7-in-10-intraday-traders-in-equity-cash-suffered-losses-in-fy23-sebi-study-124072400975_1.html) (July 2024) found that 71% of individual intraday traders lost money in FY2022-23, and the losers paid trading costs equal to another 57% of their losses. That's why every number here counts charges. You can lose money; talk to a SEBI-registered adviser if you need advice.
@@ -165,7 +176,7 @@ nse-<skill>/   SKILL.md + one script each (scan.py, news.py, entry.py, exit.py, 
                the shared NSE clock, tick, charges, loss and sizing rules
 hooks/         the plugin's hooks: gate.py, record_prompt.py, session_status.py
 autopilot/     the paper autopilot: run_day.py (launchd tick), report.py, claude_run.py, mail.py,
-               prompts/, install.sh, uninstall.sh, run.sh
+               shorts.py (shadow shorts), market.py (tags, archive), study.py, prompts/, install.sh, ...
 tests/         unittest suite + offline fixtures
 CHANGELOG.md   what changed in each version        PORTING.md   how the port was done
 ```

@@ -899,15 +899,28 @@ def usable(bars, day, cutoff, n_range, cfg=None):
     return True
 
 
-def orb_candidate(bars, n_range):
+SIDES = ("long", "short", "both")
+
+
+def sides_of(side):
+    return ("long", "short") if side == "both" else (side,)
+
+
+def orb_candidate(bars, n_range, side="long"):
     """Stage 1, closes only: some completed bar after the range closed at or above
-    the highest close of the range. Necessary for a breakout (range high >= any range close)."""
+    the highest close of the range. Necessary for a breakout (range high >= any range close).
+    side="short" is the mirror: some close at or below the lowest close of the range."""
+    if side == "short":
+        bottom = min(b["c"] for b in bars if b["slot"] < n_range)
+        return any(b["c"] <= bottom for b in bars if b["slot"] >= n_range)
     top = max(b["c"] for b in bars if b["slot"] < n_range)
     return any(b["c"] >= top for b in bars if b["slot"] >= n_range)
 
 
-def orb_hit(bars, n_range):
-    """Stage 2, real highs and lows: the first completed bar to CLOSE above the range high."""
+def orb_hit(bars, n_range, side="long"):
+    """Stage 2, real highs and lows: the first completed bar to CLOSE above the range high.
+    side="short": the first completed bar to CLOSE under the range low (a breakdown); the hit says
+    "side": "short" and pct_over is negative (how far under the low). A long hit has no "side" key."""
     rng = [b for b in bars if b["slot"] < n_range]
     if len(rng) < n_range or any(b["h"] is None or b["l"] is None for b in rng):
         return None
@@ -916,12 +929,16 @@ def orb_hit(bars, n_range):
     for b in bars:
         if b["slot"] < n_range:
             continue
-        if b["c"] > oh:
+        if (b["c"] < ol) if side == "short" else (b["c"] > oh):
             closes_at = b["start"] + datetime.timedelta(minutes=BAR_MIN)
-            return {"price": round(b["c"], 2), "at": hm(closes_at),
-                    "bar_start": hm(b["start"]), "bar_index": b["slot"],
-                    "or_high": round(oh, 2), "or_low": round(ol, 2),
-                    "pct_over": round((b["c"] / oh - 1) * 100, 2) + 0.0, "_t": closes_at}
+            edge = ol if side == "short" else oh
+            hit = {"price": round(b["c"], 2), "at": hm(closes_at),
+                   "bar_start": hm(b["start"]), "bar_index": b["slot"],
+                   "or_high": round(oh, 2), "or_low": round(ol, 2),
+                   "pct_over": round((b["c"] / edge - 1) * 100, 2) + 0.0, "_t": closes_at}
+            if side == "short":
+                hit["side"] = "short"
+            return hit
     return None
 
 
@@ -984,13 +1001,15 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None, cfg=None, holi
 
 
 def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_value_cr=0.0, confirm=None,
-             max_confirm=None, cfg=None, names=None):
+             max_confirm=None, cfg=None, names=None, side="long"):
     """stage1 = {SYMBOL: series} with closes (spark or v8). confirm(sym) -> series with highs/lows
     (None = use the stage-1 series). With confirm and max_confirm, only the max_confirm most
     traded candidates (rupees traded so far) are confirmed; the rest are counted as unconfirmed.
     names: {SYMBOL: company name}, written to each hit that has one.
-    Returns (hits, counts, failed {sym: why})."""
+    side: "long" (breakouts, the default), "short" (breakdowns) or "both"; with both a stock can be a hit
+    on each side. Returns (hits, counts, failed {sym: why})."""
     names = names or {}
+    sides = sides_of(side)
     n_range = or_minutes // BAR_MIN
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
               "candidates": 0, "gappy": 0, "confirmed": 0, "unconfirmed": 0}
@@ -1019,7 +1038,7 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_value_
         if not complete:
             counts["gappy"] += 1
             cands.append((sym, bars, value))
-        elif orb_candidate(bars, n_range):
+        elif any(orb_candidate(bars, n_range, s) for s in sides):
             cands.append((sym, bars, value))
     counts["candidates"] = len(cands)
     if confirm is not None and max_confirm and len(cands) > max_confirm:
@@ -1039,12 +1058,13 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_value_
                 failed[sym] = "the v8 chart has a missing bar"
                 continue
         counts["confirmed"] += 1
-        h = orb_hit(full, n_range)
-        if h:
-            hit = {"symbol": sym, "setups": ["orb"]}
-            if sym in names:
-                hit["name"] = names[sym]
-            hits.append(dict(hit, **h))
+        for s in sides:
+            h = orb_hit(full, n_range, s)
+            if h:
+                hit = {"symbol": sym, "setups": ["orb"]}
+                if sym in names:
+                    hit["name"] = names[sym]
+                hits.append(dict(hit, **h))
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
     for h in hits:
         del h["_t"]
@@ -1392,7 +1412,7 @@ def cmd_orb(a):
     unread, why = unread_symbols(symbols, data, failed)
     require_read(symbols, unread, why)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_value_cr,
-                                     confirm, a.max_confirm, cfg, names=info["names"])
+                                     confirm, a.max_confirm, cfg, names=info["names"], side=a.side)
     # The same for stage 2: every candidate's v8 chart failing leaves hits missing, not absent.
     asked = counts["confirmed"] + len(failed2)
     if confirm is not None and asked:
@@ -1411,6 +1431,8 @@ def cmd_orb(a):
            "filters": {"min_price": a.min_price, "min_value_cr": a.min_value_cr},
            "dropped": reason_counts(info["dropped"]), "dropped_symbols": info["dropped"],
            "note": NOTE, "hits": hits}
+    if a.side != "long":
+        doc["side"] = a.side
     doc.update(error_fields(errors_why))
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
@@ -1438,18 +1460,26 @@ def cmd_orb(a):
     if counts["unconfirmed"]:
         print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
               "checks all)." % (_c(counts["unconfirmed"]), _c(a.max_confirm)))
+    where = {"long": "above their opening-range high", "short": "under their opening-range low",
+             "both": "outside their opening range"}[a.side]
     if hits:
-        print("%d of %s charts closed above their opening-range high by %s IST:"
+        print("%d hit%s: of %s charts, these closed %s by %s IST:"
+              % (len(hits), "" if len(hits) == 1 else "s",
+                 ("the %s checked" % _c(counts["confirmed"])) if counts["unconfirmed"] else _c(counts["scanned"]),
+                 where, hm(cutoff)) if a.side != "long" else
+              "%d of %s charts closed above their opening-range high by %s IST:"
               % (len(hits), ("the %s checked" % _c(counts["confirmed"])) if counts["unconfirmed"]
                  else _c(counts["scanned"]), hm(cutoff)))
         for h in hits[:a.show]:
-            print("  %5s  %-10s %12s  range %s to %s  %+.2f%% over" % (
+            short = h.get("side") == "short"
+            print("  %5s  %-10s %12s  range %s to %s  %+.2f%% %s%s" % (
                 h["at"], h["symbol"], nc.inr(h["price"], keep_zeros=True), _p(h["or_low"]), _p(h["or_high"]),
-                h["pct_over"]))
+                h["pct_over"], "under" if short else "over", "  SHORT (breakdown)" if short else ""))
         if len(hits) > a.show:
             print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     else:
-        print("No chart closed above its opening-range high by %s IST." % hm(cutoff))
+        print("No chart closed %s by %s IST." % (where if a.side != "long" else "above its opening-range high",
+                                                 hm(cutoff)))
     if not a.no_write:
         print("Wrote %s (mode orb, %d hit%s)." % (a.out, len(hits), "" if len(hits) == 1 else "s"))
     print(config_line(a.config))
@@ -1507,6 +1537,9 @@ def main(argv=None):
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this IST time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM IST (default: config no_entries_after, 14:30)")
+    p.add_argument("--side", choices=SIDES, default="long",
+                   help="long: breakouts (the default). short: breakdowns, the first close under the range low, "
+                        "for research (the order path is long-only). both: each")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

@@ -1314,5 +1314,49 @@ class SkillDoc(unittest.TestCase):
             self.assertNotIn(never, src)
 
 
+class ShortSide(unittest.TestCase):
+    """orb --side short|both: breakdowns, for the autopilot's shadow-only short side. Long stays the default and
+    its output does not change."""
+
+    def orb(self, *extra):
+        code, out, _ = run(["orb", "--offline", WALL, "--lists", SDIR, "--universe", "nifty50", "--at", "10:05",
+                            "--no-write", "--json", "--config", os.devnull] + list(extra))
+        return code, json.loads(out)
+
+    def test_long_is_the_default_and_unchanged(self):
+        _, long_only = self.orb()
+        _, explicit = self.orb("--side", "long")
+        self.assertEqual(long_only["hits"], explicit["hits"])
+        self.assertEqual(len(long_only["hits"]), 31)
+        self.assertTrue(all("side" not in h for h in long_only["hits"]))
+        self.assertNotIn("side", long_only)
+
+    def test_both_adds_the_breakdowns_and_keeps_every_long(self):
+        _, long_only = self.orb()
+        _, both = self.orb("--side", "both")
+        self.assertEqual([h for h in both["hits"] if h.get("side") != "short"], long_only["hits"])
+        shorts = [h for h in both["hits"] if h.get("side") == "short"]
+        self.assertEqual(len(shorts), 4)
+        hd = [h for h in shorts if h["symbol"] == "HDFCLIFE"][0]
+        self.assertEqual((hd["at"], hd["price"], hd["or_low"], hd["or_high"], hd["pct_over"]),
+                         ("09:35", 593.4, 594.4, 601.85, -0.17))
+        self.assertEqual(both["side"], "both")
+
+    def test_short_alone(self):
+        _, both = self.orb("--side", "both")
+        _, short = self.orb("--side", "short")
+        self.assertEqual(short["hits"], [h for h in both["hits"] if h.get("side") == "short"])
+
+    def test_breakdown_is_the_first_close_under_the_range_low(self):
+        # range 09:15-09:30 low 99.9; the 09:30 bar closes 100.0 (inside), the 09:35 bar closes 99.5 at 09:40 (under)
+        bars = scan.session_bars(bars_series("2026-11-13", [100.5, 100.2, 100.0, 100.0, 99.5, 99.0]), FRI,
+                                 DT(2026, 11, 13, 9, 50))
+        self.assertTrue(scan.orb_candidate(bars, 3, "short"))
+        self.assertFalse(scan.orb_candidate(bars, 3, "long"))
+        h = scan.orb_hit(bars, 3, "short")
+        self.assertEqual((h["at"], h["price"], h["side"], h["or_low"]), ("09:40", 99.5, "short", 99.9))
+        self.assertIsNone(scan.orb_hit(bars, 3, "long"))
+
+
 if __name__ == "__main__":
     unittest.main()

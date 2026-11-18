@@ -22,5 +22,15 @@
     "host": "smtp.gmail.com",
     "port": 465
   },
-  "notify": true
+  "notify": true,
+  "cost_filter": {
+    "max_charges_r": 0.2
+  },
+  "shorts": "shadow",
+  "tags": true,
+  "rank_file": null,
+  "archive": {
+    "enabled": true,
+    "pause_s": 0.4
+  }
 }

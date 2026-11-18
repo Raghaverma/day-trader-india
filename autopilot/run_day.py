@@ -27,6 +27,7 @@ Not financial advice.
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -36,7 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autopilot_common as ac  # noqa: E402
 import claude_run  # noqa: E402
 import mail  # noqa: E402
+import market  # noqa: E402
 import report  # noqa: E402
+import shorts  # noqa: E402
 
 nc = ac.nc
 
@@ -62,7 +65,7 @@ class Day(object):
     `send_mail` are swapped out in tests."""
 
     def __init__(self, home, now, settings, cfg, runner=None, claude=None, send_mail=None, bars=None,
-                 index_move=None, day=None):
+                 index_move=None, day=None, fetch=None):
         self.home, self.now, self.settings, self.cfg = home, now, settings, cfg
         self.ist = nc.to_ist(now)
         self.day = day or self.ist.date().isoformat()
@@ -74,6 +77,9 @@ class Day(object):
         self.send_mail = send_mail or mail.send_report
         self.bars = bars                    # report.py's 1-minute bar loader (tests pass a fake)
         self.index_move = index_move        # report.py's Nifty 50 move (tests pass a fake)
+        # Yahoo charts for the tags and the archive; a test or replay never reaches the network unless it
+        # passes a fake
+        self.fetch = fetch or (None if nc.test_mode() else market.fetch_chart)
 
     # ------------------------------------------------------------ helpers
 
@@ -136,6 +142,11 @@ class Day(object):
             self.runner.run("holidays", "alerts", ["holidays", "--refresh", "--if-stale"], parse=False, now=False)
         syms, names = self.universe()
         ph["premarket"]["universe"] = len(syms)
+        if self.settings.get("tags"):
+            reg = market.regime(self.fetch, self.ist.date()) if self.fetch else {"errors": ["no market data"]}
+            ph["premarket"]["regime"] = reg
+            self.runner.note("regime", **reg)
+            self.save()
         if self.settings.get("daily_scan"):
             self.runner.run("scan_daily", "scan", ["daily"] + self.universe_args() +
                             ["--json", "--out", self.path("daily.json")])
@@ -186,6 +197,17 @@ class Day(object):
             pass
         return syms, names
 
+    def universe_symbols(self):
+        """The day's universe from the pre-market's universe.txt, else asked for again."""
+        try:
+            with open(self.path("universe.txt"), encoding="utf-8") as fh:
+                syms = [line.split("|")[0].strip() for line in fh if line.split("|")[0].strip()]
+            if syms:
+                return syms
+        except OSError:
+            pass
+        return self.universe()[0]
+
     def vetoes(self):
         doc = ac.read_json(self.path("vetoes.json")) or {}
         return {v["symbol"]: v.get("reason") or "" for v in doc.get("vetoes") or [] if v.get("symbol")}
@@ -215,22 +237,98 @@ class Day(object):
             return None
         return text
 
+    def shorts_on(self):
+        return str(self.settings.get("shorts") or "off").lower() == "shadow"
+
     def orb(self, bar):
         ph = self.st["phases"]
-        r = self.runner.run("scan_orb", "scan", ["orb"] + self.universe_args() +
+        side = ["--side", "both"] if self.shorts_on() else []
+        r = self.runner.run("scan_orb", "scan", ["orb"] + self.universe_args() + side +
                             ["--json", "--out", self.path("orb.json")])
         ph["orb_last_bar"] = bar
         hits = (r.data or {}).get("hits") or []
         ph.setdefault("orb_scans", []).append({"bar": bar, "code": r.code, "hits": len(hits),
                                                "failed": r.code not in (0, 1)})
+        if hits and self.settings.get("tags") and self.fetch:
+            close = "%02d:%02d" % divmod(minutes(bar) + 5, 60)     # the scanned bar closed 5 minutes after it began
+            try:
+                ph.setdefault("index_by_bar", {})[close] = market.index_move(self.fetch, self.ist.date(), close)
+            except Exception as e:
+                ph.setdefault("index_by_bar", {})[close] = {"error": ac.tail(str(e), 160)}
         self.save()
         for h in sorted(hits, key=lambda h: (h.get("at") or "", h.get("symbol") or "")):
             if h.get("symbol"):
+                short = h.get("side") == "short"
                 try:
-                    self.candidate(h)
+                    self.candidate_short(h) if short else self.candidate(h)
                 except Exception as e:     # one bad symbol never stops the day
-                    self.finish(self.st["candidates"].setdefault(h["symbol"], {"symbol": h["symbol"]}),
-                                "error", "%s: %s" % (type(e).__name__, e))
+                    key = ("short:" if short else "") + nc.nse_symbol(h["symbol"])
+                    c = self.st["candidates"].setdefault(key, {"symbol": nc.nse_symbol(h["symbol"])})
+                    if short:
+                        c["side"] = "short"
+                    self.finish(c, "error", "%s: %s" % (type(e).__name__, e))
+
+    def tags_for(self, sym, at):
+        """What was true when the signal fired: the regime before the open, the Nifty's move so far, the rank."""
+        if not self.settings.get("tags") and not self.settings.get("rank_file"):
+            return None
+        tags = {}
+        ph = self.st["phases"]
+        if self.settings.get("tags"):
+            reg = (ph.get("premarket") or {}).get("regime") or {}
+            for k in ("nifty_trend", "vix_band"):
+                if reg.get(k):
+                    tags[k] = reg[k]
+            idx = (ph.get("index_by_bar") or {}).get(at or "")
+            if not idx:              # the hit fired on an earlier bar: the nearest bar at or before it
+                earlier = sorted(k for k in (ph.get("index_by_bar") or {}) if at and k <= at)
+                idx = (ph.get("index_by_bar") or {}).get(earlier[-1]) if earlier else None
+            if idx and idx.get("tag"):
+                tags["nifty_today"] = idx["tag"]
+        rank = rank_tag(self.settings.get("rank_file"), sym, self.ist.date())
+        if rank:
+            tags["rank"] = rank
+        return tags
+
+    def charges_r_limit(self):
+        v = (self.settings.get("cost_filter") or {}).get("max_charges_r")
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def candidate_short(self, h):
+        """A breakdown, in shadow: planned (shorts.plan) and replayed by the report, never traded."""
+        sym = nc.nse_symbol(h["symbol"])
+        key = "short:" + sym
+        c = self.st["candidates"].get(key)
+        if c and c.get("final"):
+            return
+        c = {"symbol": sym, "side": "short", "name": h.get("name"), "first_seen": hm(self.ist),
+             "scan_at": h.get("at"), "scan_price": h.get("price"), "or_high": h.get("or_high"),
+             "or_low": h.get("or_low"), "pct_over": h.get("pct_over"), "daily_setups": self.daily_setups(sym),
+             "trigger": {"at": h.get("at"), "price": h.get("price")}}
+        self.st["candidates"][key] = c
+        tags = self.tags_for(sym, h.get("at"))
+        if tags is not None:
+            c["tags"] = tags
+        age = minutes(hm(self.ist)) - minutes(h.get("at") or hm(self.ist))
+        limit = int(self.cfg.get("trigger_max_age_minutes") or 30)
+        if age > limit:
+            self.finish(c, "stale_trigger", "the breakdown fired at %s, %d minutes before the runner saw it "
+                                            "(over trigger_max_age_minutes, %d)" % (h.get("at"), age, limit))
+            return
+        try:
+            p = shorts.plan(h, self.cfg)
+        except shorts.ShortPlanError as e:
+            self.finish(c, "short_refused", str(e))
+            return
+        c["plan"] = p
+        mx = self.charges_r_limit()
+        c["cost_ok"] = None if mx is None else p["charges_r"] <= mx
+        self.finish(c, "short_shadow", "shadow only, never traded: entry %s, stop %s, target %s, %d shares, "
+                                       "charges %.2fR" % (p["entry"], p["stop"], p["target"], p["quantity"],
+                                                          p["charges_r"]))
 
     def finish(self, c, outcome, reason=None):
         c["outcome"] = outcome
@@ -250,6 +348,9 @@ class Day(object):
             c = {"symbol": sym, "name": h.get("name"), "first_seen": hm(self.ist), "scan_at": h.get("at"),
                  "scan_price": h.get("price"), "or_high": h.get("or_high"), "or_low": h.get("or_low"),
                  "pct_over": h.get("pct_over"), "tries": 0, "daily_setups": self.daily_setups(sym)}
+            tags = self.tags_for(sym, h.get("at"))
+            if tags is not None:
+                c["tags"] = tags
             self.st["candidates"][sym] = c
         c["tries"] = c.get("tries", 0) + 1
         run = self.runner.run
@@ -287,12 +388,20 @@ class Day(object):
                      "risk_per_share_worst": plan.get("risk_per_share_worst"),
                      "reward_risk": plan.get("reward_risk"), "flat_by": plan.get("flat_by"),
                      "max_loss": ch.get("max_loss_worst_with_charges"), "break_even": ch.get("break_even"),
-                     "reward_risk_after_charges": ch.get("reward_risk_after_charges")}
+                     "reward_risk_after_charges": ch.get("reward_risk_after_charges"),
+                     "charges_r": shorts.charges_r_of_long(plan)}
 
         vetoed = self.vetoes()
         if sym in vetoed:
             self.finish(c, "vetoed", "Claude's pre-market veto: %s" % (vetoed[sym] or "no reason given"))
             return
+        mx, cr = self.charges_r_limit(), c["plan"]["charges_r"]
+        if mx is not None:
+            c["cost_ok"] = cr is None or cr <= mx
+            if not c["cost_ok"]:
+                self.finish(c, "cost_filter", "round-trip charges at the stop are %.2fR of the risk, over the "
+                                              "%.2fR limit (cost_filter.max_charges_r)" % (cr, mx))
+                return
         cap = self.cap_reason()
         if cap:
             self.finish(c, "shadow", cap)
@@ -413,9 +522,28 @@ class Day(object):
         else:
             ph["eod"]["mail"] = "off"
         ac.notify(self.settings, "NSE autopilot (paper)", report.headline(rep["report"]))
+        ph["eod"]["archive"] = self.archive()
         ph["eod"]["done"] = self.stamp()
         self.save()
         return rep
+
+    def archive(self, plan=None, force=False):
+        """Keep the day's bars (and fill any of the last 5 sessions that are missing). After the report and the
+        email, and never able to fail them: the outcome is a line in the state."""
+        a = self.settings.get("archive") or {}
+        if not a.get("enabled") and not force:
+            return "off"
+        if not self.fetch:
+            return "skipped: no market data (test or replay)"
+        syms = self.universe_symbols() + [market.NIFTY, market.VIX]
+        try:
+            out = market.archive(self.home, syms, self.fetch, plan or market.daily_plan(),
+                                 pause=float(a.get("pause_s") or 0.4))
+        except Exception as e:
+            return "failed: %s" % ac.tail(str(e), 200)
+        self.runner.note("archive", **{k: out[k] for k in ("symbols", "requests", "written", "days")},
+                         failed=len(out["failed"]))
+        return "%d symbols, %d day files written, %d failed" % (out["symbols"], out["written"], len(out["failed"]))
 
 
 # ---------------------------------------------------------------- pieces the tests reach directly
@@ -452,6 +580,31 @@ def plain_reason(text):
     """A script's refusal without its file paths ("exit.py: /Users/.../RELIANCE.json: the trigger is ...")."""
     text = re.sub(r"(?:~|/)[^\n]*?\.(?:json|gz|csv|txt)(?::\s*|\b)", "", str(text or ""))
     return " ".join(text.split())
+
+
+RANK_MAX_AGE_DAYS = 4        # a Friday evening's ranks still describe Monday; a week-old file does not
+
+
+def rank_tag(path, sym, today):
+    """"top half" / "bottom half" from a rank file {"as_of": "YYYY-MM-DD", "ranks": {SYMBOL: 0..1}} (1 = best),
+    "stale" when it is over RANK_MAX_AGE_DAYS old, None without a file or without the symbol."""
+    if not path:
+        return None
+    doc = ac.read_json(os.path.expanduser(str(path)))
+    if not isinstance(doc, dict):
+        return None
+    v = (doc.get("ranks") or {}).get(sym)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    try:
+        age = (today - datetime.date.fromisoformat(str(doc.get("as_of")))).days
+    except ValueError:
+        return "stale"
+    if age > RANK_MAX_AGE_DAYS:
+        return "stale"
+    return "top half" if v >= 0.5 else "bottom half"
 
 
 def clean_vetoes(raw, universe):
@@ -559,6 +712,23 @@ def cmd_replay(a):
     return 0
 
 
+def cmd_archive(a):
+    """Save bars into archive/ now: the last 5 sessions, or with --backfill everything Yahoo still has (60 days
+    of 5-minute bars, 28 days of 1-minute bars). Safe to repeat: a day is only rewritten by a fuller copy."""
+    home, settings, cfg = setup(a)
+    now = ac.parse_clock(None)
+    with Lock(home) as got:
+        if not got:
+            print("a tick is running; try again in a minute", file=sys.stderr)
+            return 1
+        d = Day(home, now, settings, cfg)
+        plan = market.backfill_plan(now) if a.backfill else market.daily_plan()
+        print("archiving %s ..." % ("everything Yahoo still has" if a.backfill else "the last 5 sessions"))
+        print(d.archive(plan=plan, force=True))
+    print("in %s" % os.path.join(home, "archive"))
+    return 0
+
+
 def cmd_status(a):
     home = ac.trader_home()
     cfg = ac.load_cfg(home)
@@ -639,13 +809,16 @@ def main(argv=None):
     p.add_argument("--now", help="test only")
     p = sub.add_parser("selftest", help="check python, the config, headless Claude and Gmail")
     p.add_argument("--send-mail", action="store_true", help="also send a test email")
+    p = sub.add_parser("archive", help="save the last 5 sessions' 1- and 5-minute bars into archive/ now")
+    p.add_argument("--backfill", action="store_true",
+                   help="everything Yahoo still has: 60 days of 5-minute bars, 28 days of 1-minute bars")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
         return {"tick": cmd_tick, "eod": cmd_eod, "replay": cmd_replay, "status": cmd_status,
-                "selftest": cmd_selftest}[a.cmd](a)
+                "selftest": cmd_selftest, "archive": cmd_archive}[a.cmd](a)
     except (ac.AutopilotError, ValueError, OSError) as e:
         print("run_day.py: %s" % e, file=sys.stderr)
         return 2

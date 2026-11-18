@@ -15,7 +15,9 @@ import datetime
 import html
 import importlib.util
 import json
+import math
 import os
+import random
 import re
 import sys
 import urllib.request
@@ -41,7 +43,12 @@ WHY = {
     "approve_refused": "autopilot-approve refused",
     "fill_refused": "paper-fill refused",
     "error": "the runner hit an error",
+    "cost_filter": "skipped by the cost filter: charges too large a share of the risk",
+    "short_shadow": "short (breakdown), shadow only: never traded",
+    "short_refused": "short (breakdown): no plan fits",
 }
+SHORT_NOTE = ("Shorts are replayed, never traded. A replay cannot show a short's own risks: a stock locked at its "
+              "upper circuit cannot be bought back, and a short not covered by the close goes to NSE's auction.")
 EXIT_WORDS = {"target": "target", "stop": "stop", "flat_by": "flat by 15:10", "sold": "sold", "partial": "partial",
               "cancelled": "LIMIT never filled"}
 # a step's exit code that is a decision, not a failure (no hits, nothing new, not triggered, a refusal)
@@ -161,9 +168,10 @@ def funnel(st, trades):
                                                                                                  t.get("status"))
         exits[k] = exits.get(k, 0) + 1
     pre = ph.get("premarket") or {}
+    shorts = sum(1 for c in cands.values() if c.get("side") == "short")
     return {"universe": pre.get("universe"), "orb_scans": len(scans),
-            "orb_scans_failed": sum(1 for s in scans if s.get("failed")), "signals": len(cands),
-            "outcomes": outcomes, "risk_blocks": blocks, "exits": exits,
+            "orb_scans_failed": sum(1 for s in scans if s.get("failed")), "signals": len(cands) - shorts,
+            "short_signals": shorts, "outcomes": outcomes, "risk_blocks": blocks, "exits": exits,
             "stop_gaps": sum(1 for t in trades if t.get("stop_gap"))}
 
 
@@ -216,30 +224,49 @@ def calibration(pairs):
             "avg_predicted": round(sum(p for p, _ in pairs) / n, 4), "buckets": buckets}
 
 
+def mirror(bars):
+    """A short on these bars is a long on their mirror image: prices negated, highs and lows swapped. The paper
+    broker's long rules (ticket.walk) then read a SELL LIMIT that fills when a bar's high reaches it, a buy-stop
+    that triggers on a bar's high and gaps when a bar opens over its limit, and a target reached on a bar's low."""
+    return [(t, -o, -l, -h, -c) for t, o, h, l, c in bars]
+
+
 def shadow(c, day, bars, cfg):
     """Replay a signal that was not traded with the paper broker's own rules (ticket.walk): a LIMIT at the
-    plan's entry from the trigger, the SL stop, the 2R target as an alert, flat by 15:10."""
+    plan's entry from the trigger, the SL stop, the 2R target as an alert, flat by 15:10. A short is replayed
+    on the mirrored bars (mirror()), so it gets exactly the same rules, the other way up."""
     p = c.get("plan") or {}
     trig = c.get("trigger") or {}
+    short = c.get("side") == "short"
     entry, stop, target, qty = _f(p.get("entry")), _f(p.get("stop")), _f(p.get("target")), p.get("quantity")
-    row = {"symbol": c.get("symbol"), "why": c.get("outcome"), "reason": c.get("reason"), "entry": entry,
-           "stop": stop, "target": target, "qty": qty, "at": trig.get("at") or c.get("decided_at")}
+    row = {"symbol": c.get("symbol"), "side": "short" if short else "long", "why": c.get("outcome"),
+           "reason": c.get("reason"), "entry": entry, "stop": stop, "target": target, "qty": qty,
+           "at": trig.get("at") or c.get("decided_at"), "tags": c.get("tags"), "charges_r": p.get("charges_r"),
+           "cost_ok": c.get("cost_ok")}
     if not (entry and stop and target and qty and row["at"]):
         row["result"] = "no plan"
         return row
     tk = ticket()
     d = datetime.date.fromisoformat(day)
     ordered = datetime.datetime.combine(d, nc.parse_hhmm(row["at"]))
+    worst = _f(p.get("worst_exit")) or stop
+    if short:
+        # the one tick walk() uses (target minus a tick with no next bar) must be the stock's, not a negative price's
+        cfg = dict(cfg, tick_sizes=dict(cfg.get("tick_sizes") or {},
+                                        **{row["symbol"]: float(nc.order_tick(entry, row["symbol"], cfg))}))
+        bars, entry_w, stop_w, target_w, worst_w = mirror(bars), -entry, -stop, -target, -worst
+    else:
+        entry_w, stop_w, target_w, worst_w = entry, stop, target, worst
     done = [b for b in bars if b[0].date() == d and b[0] + datetime.timedelta(minutes=1) <= ordered]
     if not done:
         row["result"] = "no data"
         return row
     stamp = ordered.strftime(tk.STAMP)
-    t = {"id": "shadow-" + row["symbol"], "date": day, "symbol": row["symbol"], "qty": int(qty), "limit": entry,
-         "ordered_at": stamp, "target": target, "flat_by": p.get("flat_by") or cfg.get("flat_by") or "15:10",
-         "stop": {"type": "SL", "trigger": stop, "price": _f(p.get("worst_exit")) or stop}}
+    t = {"id": "shadow-" + row["symbol"], "date": day, "symbol": row["symbol"], "qty": int(qty), "limit": entry_w,
+         "ordered_at": stamp, "target": target_w, "flat_by": p.get("flat_by") or cfg.get("flat_by") or "15:10",
+         "stop": {"type": "SL", "trigger": stop_w, "price": worst_w}}
     fill = None
-    if done[-1][4] <= entry + 1e-9:
+    if done[-1][4] <= entry_w + 1e-9:
         fill = done[-1][4]
         t.update(status="filled", fill_time=stamp, fill_price=fill)
     else:
@@ -258,8 +285,13 @@ def shadow(c, day, bars, cfg):
     if fill is None or exit_ is None:
         row["result"] = row.get("result") or "no exit in the bars"
         return row
-    gross = round(int(qty) * (exit_ - fill), 2)
-    ch = nc.intraday_charges(int(qty), fill, exit_, cfg)["total"]
+    if short:
+        fill, exit_ = round(-fill, 2), round(-exit_, 2)
+        gross = round(int(qty) * (fill - exit_), 2)
+        ch = nc.intraday_charges(int(qty), exit_, fill, cfg)["total"]      # bought back at the exit, sold at the fill
+    else:
+        gross = round(int(qty) * (exit_ - fill), 2)
+        ch = nc.intraday_charges(int(qty), fill, exit_, cfg)["total"]
     row.update(fill=fill, exit=exit_, gross=gross, charges=ch, net=round(gross - ch, 2))
     ml = _f(p.get("max_loss"))
     row["r"] = round(row["net"] / ml, 2) if ml else None
@@ -272,13 +304,15 @@ def shadows(st, day, cfg, bars=None):
     for c in sorted((st.get("candidates") or {}).values(), key=lambda c: c.get("first_seen") or ""):
         if c.get("outcome") in (None, "traded") or not c.get("plan"):
             continue
-        sym = c["symbol"]
+        sym = c["symbol"]          # a stock can be a long and a short signal on one day: one bar fetch for both
         try:
             if sym not in cache:
                 cache[sym] = loader(sym)
             rows.append(shadow(c, day, cache[sym], cfg))
         except Exception as e:
-            rows.append({"symbol": sym, "why": c.get("outcome"), "result": "could not replay: %s" % ac.tail(str(e), 120)})
+            rows.append({"symbol": sym, "side": c.get("side") or "long", "why": c.get("outcome"),
+                         "at": (c.get("trigger") or {}).get("at"), "charges_r": (c.get("plan") or {}).get("charges_r"),
+                         "result": "could not replay: %s" % ac.tail(str(e), 120)})
     by_why = {}
     for r in rows:
         w = by_why.setdefault(r.get("why") or "?", {"n": 0, "replayed": 0, "net": 0.0, "wins": 0, "targets": 0,
@@ -365,8 +399,10 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
            "time_machine": calibration([(t["tm_p_target"], t["hit"]) for t in tl]),
            "shadows": sh, "execution": execution(tl), "health": health(st, log), "benchmark": move,
            "vetoes": vetoes.get("vetoes") or [], "veto_summary": vetoes.get("summary"),
-           "candidates": [{k: c.get(k) for k in ("symbol", "first_seen", "scan_at", "outcome", "reason",
-                                                 "daily_setups")}
+           "regime": ((st.get("phases") or {}).get("premarket") or {}).get("regime"),
+           "candidates": [dict({k: c.get(k) for k in ("symbol", "first_seen", "scan_at", "outcome", "reason",
+                                                      "daily_setups", "tags", "cost_ok")},
+                               side=c.get("side") or "long", charges_r=(c.get("plan") or {}).get("charges_r"))
                           for c in sorted((st.get("candidates") or {}).values(),
                                           key=lambda c: c.get("first_seen") or "")]}
     return write_outputs(home, day, rep, None)
@@ -376,14 +412,95 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
 
 def score_row(rep):
     d = rep["day"]
+    cands = {(c.get("side") or "long", c.get("symbol")): c for c in rep.get("candidates") or []}
+    outcomes = []          # every signal with an R, traded or replayed: what the edge statistics are built on
+    for t in rep["trades"]:
+        if t.get("r") is not None:
+            c = cands.get(("long", t["symbol"])) or {}
+            outcomes.append({"symbol": t["symbol"], "side": "long", "why": "traded", "r": t["r"],
+                             "tags": c.get("tags"), "charges_r": c.get("charges_r"), "cost_ok": c.get("cost_ok")})
+    for s in rep["shadows"]["rows"]:
+        if s.get("r") is not None:
+            outcomes.append({"symbol": s["symbol"], "side": s.get("side") or "long", "why": s.get("why"),
+                             "r": s["r"], "tags": s.get("tags"), "charges_r": s.get("charges_r"),
+                             "cost_ok": s.get("cost_ok")})
     return {"net": d["net"], "charges": d["charges"], "closed": d["closed"], "wins": d["wins"],
             "losses": d["losses"], "total_r": d["total_r"], "signals": rep["funnel"]["signals"],
+            "short_signals": rep["funnel"].get("short_signals") or 0,
             "outcomes": rep["funnel"]["outcomes"], "nifty_pct": (rep.get("benchmark") or {}).get("pct"),
             "tm": [{"symbol": t["symbol"], "p": t["tm_p_target"], "hit": t["hit"], "category": t["tm_category"],
                     "r": t["r"], "daily_setup": bool(t["daily_setups"])} for t in rep["trades"]],
             "shadows": {k: {"n": v["n"], "replayed": v["replayed"], "net": v["net"], "wins": v["wins"]}
                         for k, v in rep["shadows"]["by_why"].items()},
+            "signal_rs": outcomes,
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
+
+
+# ---------------------------------------------------------------- is there an edge? (every number in R)
+
+MIN_TRADES = 20
+BOOT = 4000
+
+
+def edge_stats(rs, seed=20261113, boot=BOOT, unit="trades"):
+    """Average R with a 95% bootstrap interval (resampling the trades), the t statistic, the bootstrap share of
+    averages above zero, and how many trades it would take for the interval to clear zero if the average and
+    the spread held. A verdict in words; under MIN_TRADES it is always "too few to tell"."""
+    rs = [float(r) for r in rs if r is not None]
+    n = len(rs)
+    if not n:
+        return {"n": 0, "verdict": "no %s yet" % unit}
+    m = sum(rs) / n
+    out = {"n": n, "mean_r": round(m, 3), "total_r": round(sum(rs), 2),
+           "win_rate": round(sum(1 for r in rs if r > 0) / float(n), 3)}
+    if n > 1:
+        sd = math.sqrt(sum((r - m) ** 2 for r in rs) / (n - 1))
+        out["sd_r"] = round(sd, 3)
+        out["t"] = round(m / (sd / math.sqrt(n)), 2) if sd > 0 else None
+        rng = random.Random(seed)
+        means = sorted(sum(rng.choice(rs) for _ in range(n)) / n for _ in range(boot))
+        lo, hi = means[int(0.025 * boot)], means[int(0.975 * boot) - 1]
+        out["ci95"] = [round(lo, 3), round(hi, 3)]
+        out["p_above_zero"] = round(sum(1 for x in means if x > 0) / float(boot), 3)
+        if m != 0 and sd > 0:
+            out["trades_needed"] = int(math.ceil((1.96 * sd / abs(m)) ** 2))
+    if n < MIN_TRADES:
+        out["verdict"] = "too few to tell (%d of %d %s)" % (n, MIN_TRADES, unit)
+    elif out.get("ci95") and out["ci95"][0] > 0:
+        out["verdict"] = "an edge: the 95% interval is above zero"
+    elif out.get("ci95") and out["ci95"][1] < 0:
+        out["verdict"] = "losing: the 95% interval is below zero"
+    else:
+        out["verdict"] = "no evidence either way: the 95% interval spans zero"
+    return out
+
+
+EDGE_GROUPS = (
+    ("Long, traded (paper)", lambda o: o["side"] == "long" and o["why"] == "traded"),
+    ("Long, skipped by the cost filter (replayed)", lambda o: o["side"] == "long" and o["why"] == "cost_filter"),
+    ("Long, other signals not taken (replayed)",
+     lambda o: o["side"] == "long" and o["why"] not in ("traded", "cost_filter")),
+    ("Long, every signal (traded or replayed)", lambda o: o["side"] == "long"),
+    ("Short, every breakdown (shadow)", lambda o: o["side"] == "short"),
+    ("Short, charges within the cost filter (shadow)", lambda o: o["side"] == "short" and o.get("cost_ok") is True),
+)
+TAGS = ("nifty_trend", "vix_band", "nifty_today", "rank")
+
+
+def edge(signal_rs):
+    """The edge statistics by group, and every long and short signal split by each tag."""
+    groups = {name: edge_stats([o["r"] for o in signal_rs if keep(o)]) for name, keep in EDGE_GROUPS}
+    by_tag = {}
+    for side in ("long", "short"):
+        for tag in TAGS:
+            vals = {}
+            for o in signal_rs:
+                v = (o.get("tags") or {}).get(tag)
+                if o["side"] == side and v:
+                    vals.setdefault(v, []).append(o["r"])
+            if vals:
+                by_tag["%s / %s" % (side, tag)] = {v: edge_stats(rs) for v, rs in sorted(vals.items())}
+    return {"groups": groups, "by_tag": by_tag}
 
 
 def scorecard(home, day=None, rep=None):
@@ -431,7 +548,8 @@ def scorecard(home, day=None, rep=None):
               "avg_r": round(sum(rs) / len(rs), 2) if rs else None,
               "max_drawdown": max_drawdown([e["cumulative"] for e in equity]),
               "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
-              "by_setup": setup, "shadows": sh}
+              "by_setup": setup, "shadows": sh,
+              "edge": edge([o for d in order for o in days[d].get("signal_rs") or []])}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
@@ -527,18 +645,36 @@ def blocks(rep, card, analysis=None):
 
     out.append(("h2", "Signals not taken, replayed"))
     sh = rep["shadows"]
-    if sh["rows"]:
+    longs = [s for s in sh["rows"] if s.get("side") != "short"]
+    if longs:
         out.append(("p", "Each signal that was planned but not traded, replayed on the day's 1-minute bars with the "
                          "paper broker's own rules (LIMIT at the plan's entry, SL stop, 2R target as an alert, "
                          "flat by 15:10)."))
-        out.append(("table", ["Stock", "Why not traded", "Signal", "In", "Result", "Net", "R"],
-                    [[s["symbol"], WHY.get(s.get("why"), s.get("why")), s.get("at") or "", _px(s.get("fill")),
-                      s.get("result") or "", signed_money(s.get("net")), r_text(s.get("r"))] for s in sh["rows"]]))
+        out.append(("table", ["Stock", "Why not traded", "Signal", "Charges", "In", "Result", "Net", "R"],
+                    [[s["symbol"], WHY.get(s.get("why"), s.get("why")), s.get("at") or "", r_text(s.get("charges_r"))
+                      .lstrip("+"), _px(s.get("fill")), s.get("result") or "", signed_money(s.get("net")),
+                      r_text(s.get("r"))] for s in longs]))
         out.append(("ul", ["%s: %d signals, %d replayed, %d green, %s net if taken" % (
             WHY.get(k, k), v["n"], v["replayed"], v["wins"], signed_money(v["net"]))
-            for k, v in sorted(sh["by_why"].items())]))
+            for k, v in sorted(sh["by_why"].items()) if not k.startswith("short")]))
     else:
         out.append(("p", "Every planned signal was traded, or there were none."))
+
+    shorts_ = [s for s in sh["rows"] if s.get("side") == "short"]
+    if shorts_ or fn.get("short_signals"):
+        out.append(("h2", "The short side (shadow only)"))
+        out.append(("p", "Opening-range breakdowns (the first 5-minute close under the range low), planned the mirror "
+                         "image of the long plan and replayed with the same paper rules, the other way up. " +
+                         SHORT_NOTE))
+        if shorts_:
+            out.append(("table", ["Stock", "Signal", "Charges", "Sold", "Result", "Bought back", "Net", "R"],
+                        [[s["symbol"], s.get("at") or "", r_text(s.get("charges_r")).lstrip("+"), _px(s.get("fill")),
+                          s.get("result") or "", _px(s.get("exit")), signed_money(s.get("net")), r_text(s.get("r"))]
+                         for s in shorts_]))
+            done = [s for s in shorts_ if s.get("net") is not None]
+            out.append(("p", "Today: %d breakdown%s, %d replayed, %d green, %s net if taken." % (
+                len(shorts_), "" if len(shorts_) == 1 else "s", len(done), sum(1 for s in done if s["net"] > 0),
+                signed_money(round(sum(s["net"] for s in done), 2)))))
 
     out.append(("h2", "Execution"))
     out.append(("ul", ["Average entry slippage vs the plan: %s" % _px(ex["avg_entry_slippage"], signed=True),
@@ -584,6 +720,25 @@ def blocks(rep, card, analysis=None):
             WHY.get(k, k), v["n"], v["replayed"], v["wins"], signed_money(v["net"]))
             for k, v in sorted(t["shadows"].items())]))
 
+    ed = t.get("edge") or {}
+    if any(g.get("n") for g in (ed.get("groups") or {}).values()):
+        out.append(("h2", "Is there an edge? (all days, in R)"))
+        out.append(("p", "Average R per signal after charges, with a 95%% bootstrap interval. An edge needs the whole "
+                         "interval above zero and at least %d trades; until then any average is mostly noise. "
+                         "\"Needed\" is roughly how many trades it would take to tell, if today's average and spread "
+                         "held." % MIN_TRADES))
+        out.append(("table", ["Group", "Trades", "Average", "95% interval", "Win rate", "Needed", "Verdict"],
+                    [edge_row(name, g) for name, g in ed["groups"].items() if g.get("n")]))
+        tag_rows = []
+        for key, vals in sorted((ed.get("by_tag") or {}).items()):
+            for v, g in vals.items():
+                tag_rows.append(edge_row("%s = %s" % (key, v), g))
+        if tag_rows:
+            out.append(("p", "The same, split by what was true when each signal fired. Nothing was skipped on these "
+                             "tags: they only show whether a filter on them would have helped."))
+            out.append(("table", ["Signals where", "Trades", "Average", "95% interval", "Win rate", "Needed",
+                                  "Verdict"], tag_rows))
+
     if analysis:
         out.append(("h2", "Claude's analysis"))
         out.append(("markdown", analysis))
@@ -591,6 +746,13 @@ def blocks(rep, card, analysis=None):
         out.append(("h2", "Claude's analysis"))
         out.append(("p", "Claude's analysis is unavailable today; the numbers above are complete without it."))
     return out
+
+
+def edge_row(name, g):
+    ci = g.get("ci95")
+    return [name, g["n"], r_text(g.get("mean_r")), ("%+.2f to %+.2f" % tuple(ci)) if ci else "n/a",
+            pct(g.get("win_rate"), 0), g.get("trades_needed") if g.get("trades_needed") is not None else "n/a",
+            g.get("verdict")]
 
 
 def news_words(n):
