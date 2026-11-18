@@ -194,7 +194,8 @@ def trade_rows(st, rows, trades):
                     "fill": t.get("fill_price"), "fill_time": t.get("fill_time"), "exit": t.get("exit_price"),
                     "exit_time": t.get("exit_time"), "exit_reason": t.get("exit_reason") or t.get("status"),
                     "net": (j or {}).get("net", t.get("pnl_net")), "charges": (j or {}).get("charges", t.get("charges")),
-                    "r": (j or {}).get("r"), "entry_slippage": (j or {}).get("entry_slippage"),
+                    "r": (j or {}).get("r"), "max_loss": (j or {}).get("planned_max_loss"),
+                    "entry_slippage": (j or {}).get("entry_slippage"),
                     "exit_vs_ref": (j or {}).get("exit_vs_ref"), "minutes_held": (j or {}).get("minutes_held"),
                     "tm_p_target": tm.get("p_target"), "tm_p_stop": tm.get("p_stop"),
                     "tm_category": tm.get("category"), "tm_avg_R_net": tm.get("avg_R_net"),
@@ -231,10 +232,11 @@ def mirror(bars):
     return [(t, -o, -l, -h, -c) for t, o, h, l, c in bars]
 
 
-def shadow(c, day, bars, cfg):
+def shadow(c, day, bars, cfg, step=1):
     """Replay a signal that was not traded with the paper broker's own rules (ticket.walk): a LIMIT at the
     plan's entry from the trigger, the SL stop, the 2R target as an alert, flat by 15:10. A short is replayed
-    on the mirrored bars (mirror()), so it gets exactly the same rules, the other way up."""
+    on the mirrored bars (mirror()), so it gets exactly the same rules, the other way up. step is the bar
+    length in minutes (1, or 5 for the archive study's 5-minute replay)."""
     p = c.get("plan") or {}
     trig = c.get("trigger") or {}
     short = c.get("side") == "short"
@@ -257,7 +259,7 @@ def shadow(c, day, bars, cfg):
         bars, entry_w, stop_w, target_w, worst_w = mirror(bars), -entry, -stop, -target, -worst
     else:
         entry_w, stop_w, target_w, worst_w = entry, stop, target, worst
-    done = [b for b in bars if b[0].date() == d and b[0] + datetime.timedelta(minutes=1) <= ordered]
+    done = [b for b in bars if b[0].date() == d and b[0] + datetime.timedelta(minutes=step) <= ordered]
     if not done:
         row["result"] = "no data"
         return row
@@ -273,7 +275,7 @@ def shadow(c, day, bars, cfg):
         t["status"] = "open"
     end = datetime.datetime.combine(d, datetime.time(23, 59))
     exit_ = None
-    for kind, when, price, _note in tk.walk(t, bars, end, cfg):
+    for kind, when, price, _note in tk.walk(t, bars, end, cfg, step=step):
         if kind == "fill":
             fill = price
         elif kind == "cancel":
@@ -295,7 +297,75 @@ def shadow(c, day, bars, cfg):
     row.update(fill=fill, exit=exit_, gross=gross, charges=ch, net=round(gross - ch, 2))
     ml = _f(p.get("max_loss"))
     row["r"] = round(row["net"] / ml, 2) if ml else None
+    row["max_loss"] = ml
+    row["bp_r"] = bp_r(qty, fill, exit_, ml)
     return row
+
+
+# ---------------------------------------------------------------- slippage (every paper fill is exact)
+
+SLIP_BPS = (0, 1, 2, 3, 5)
+
+
+def bp_r(qty, fill, exit_, max_loss):
+    """The R one basis point of slippage on each side costs a trade: the entry 0.01% worse and the exit 0.01%
+    worse, long or short, over the trade's max loss. The paper broker fills a LIMIT on a touch and a stop at
+    its trigger, so real fills can only be worse; R at s bps a side is r - s * bp_r. Charges are held at the
+    paper fills (a few bps moves them by a fraction of a paisa)."""
+    try:
+        q, f, x, ml = int(qty), float(fill), float(exit_), float(max_loss)
+    except (TypeError, ValueError):
+        return None
+    if q <= 0 or ml <= 0 or f <= 0 or x <= 0:
+        return None
+    return round((f + x) * q / 1e4 / ml, 5)
+
+
+def breakeven_bps(pairs):
+    """pairs: [(r, bp_r)]. The slippage a side, in bps, at which the average R reaches zero: mean(r) / mean(bp_r).
+    0 when the average is not above zero even with exact fills; None with no pairs."""
+    pairs = [(float(r), float(k)) for r, k in pairs if r is not None and k]
+    if not pairs:
+        return None
+    m = sum(r for r, _ in pairs) / len(pairs)
+    k = sum(k for _, k in pairs) / len(pairs)
+    return round(m / k, 1) if m > 0 else 0.0
+
+
+def by_day_means(rows, bps=0):
+    """rows: [{"day", "r", "bp_r"}] -> each day's average R at `bps` a side, in date order."""
+    days = {}
+    for o in rows:
+        days.setdefault(o.get("day") or "?", []).append(o["r"] - bps * (o.get("bp_r") or 0))
+    return [sum(v) / len(v) for _, v in sorted(days.items())]
+
+
+def slippage(rows, levels=SLIP_BPS):
+    """The edge at each slippage level, a side: rows are [{"day", "r", "bp_r"}]; a row without bp_r (an old
+    scorecard day) is left out. Per signal and per day (the per-day verdict is the honest one)."""
+    rows = [o for o in rows if o.get("r") is not None and o.get("bp_r")]
+    out = {"n": len(rows), "days": len({o.get("day") for o in rows}),
+           "breakeven_bps": breakeven_bps([(o["r"], o["bp_r"]) for o in rows]),
+           "avg_bp_r": round(sum(o["bp_r"] for o in rows) / len(rows), 4) if rows else None, "levels": []}
+    if not rows:
+        return out
+    for s in levels:
+        rs = [o["r"] - s * o["bp_r"] for o in rows]
+        day = edge_stats(by_day_means(rows, s), unit="days")        # the bootstrap runs over days: cheap
+        out["levels"].append(dict(_mean_needed(rs), bps=s, day_mean_r=day.get("mean_r"), day_ci95=day.get("ci95"),
+                                  days_needed=day.get("trades_needed"), verdict=day.get("verdict")))
+    return out
+
+
+def _mean_needed(rs):
+    """The average and the (1.96 sd / mean)^2 trades it would take to tell, without a bootstrap."""
+    n = len(rs)
+    m = sum(rs) / n
+    out = {"mean_r": round(m, 3), "trades_needed": None}
+    if n > 1 and m:
+        sd = math.sqrt(sum((r - m) ** 2 for r in rs) / (n - 1))
+        out["trades_needed"] = int(math.ceil((1.96 * sd / abs(m)) ** 2)) if sd > 0 else None
+    return out
 
 
 def shadows(st, day, cfg, bars=None):
@@ -441,12 +511,13 @@ def score_row(rep):
         if t.get("r") is not None:
             c = cands.get(("long", t["symbol"])) or {}
             outcomes.append({"symbol": t["symbol"], "side": "long", "why": "traded", "r": t["r"],
-                             "tags": c.get("tags"), "charges_r": c.get("charges_r"), "cost_ok": c.get("cost_ok")})
+                             "tags": c.get("tags"), "charges_r": c.get("charges_r"), "cost_ok": c.get("cost_ok"),
+                             "bp_r": bp_r(t.get("qty"), t.get("fill"), t.get("exit"), t.get("max_loss"))})
     for s in rep["shadows"]["rows"]:
         if s.get("r") is not None:
             outcomes.append({"symbol": s["symbol"], "side": s.get("side") or "long", "why": s.get("why"),
                              "r": s["r"], "tags": s.get("tags"), "charges_r": s.get("charges_r"),
-                             "cost_ok": s.get("cost_ok")})
+                             "cost_ok": s.get("cost_ok"), "bp_r": s.get("bp_r")})
     return {"net": d["net"], "charges": d["charges"], "closed": d["closed"], "wins": d["wins"],
             "losses": d["losses"], "total_r": d["total_r"], "signals": rep["funnel"]["signals"],
             "short_signals": rep["funnel"].get("short_signals") or 0,
@@ -514,8 +585,20 @@ TAGS = ("nifty_trend", "vix_band", "nifty_today", "rank")
 
 
 def edge(signal_rs):
-    """The edge statistics by group, and every long and short signal split by each tag."""
-    groups = {name: edge_stats([o["r"] for o in signal_rs if keep(o)]) for name, keep in EDGE_GROUPS}
+    """The edge statistics by group, and every long and short signal split by each tag. signal_rs carry "day"
+    (the scorecard adds it). Each group keeps its per-signal statistics at the top level and adds "per_day"
+    (each day's average R: signals on one day move together, so this is the verdict that counts) and
+    "slippage" (the edge at 0-5 bps a side, and the break-even slippage)."""
+    def with_days(rows):
+        g = edge_stats([o["r"] for o in rows])
+        g["per_day"] = edge_stats(by_day_means(rows), unit="days")
+        return g
+
+    groups = {}
+    for name, keep in EDGE_GROUPS:
+        sel = [o for o in signal_rs if keep(o)]
+        groups[name] = with_days(sel)
+        groups[name]["slippage"] = slippage(sel)
     by_tag = {}
     for side in ("long", "short"):
         for tag in TAGS:
@@ -523,9 +606,9 @@ def edge(signal_rs):
             for o in signal_rs:
                 v = (o.get("tags") or {}).get(tag)
                 if o["side"] == side and v:
-                    vals.setdefault(v, []).append(o["r"])
+                    vals.setdefault(v, []).append(o)
             if vals:
-                by_tag["%s / %s" % (side, tag)] = {v: edge_stats(rs) for v, rs in sorted(vals.items())}
+                by_tag["%s / %s" % (side, tag)] = {v: with_days(rows) for v, rows in sorted(vals.items())}
     return {"groups": groups, "by_tag": by_tag}
 
 
@@ -575,7 +658,7 @@ def scorecard(home, day=None, rep=None):
               "max_drawdown": max_drawdown([e["cumulative"] for e in equity]),
               "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
               "by_setup": setup, "shadows": sh,
-              "edge": edge([o for d in order for o in days[d].get("signal_rs") or []]),
+              "edge": edge([dict(o, day=d) for d in order for o in days[d].get("signal_rs") or []]),
               "sizes": size_totals(days, order)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
@@ -733,10 +816,13 @@ def blocks(rep, card, analysis=None):
                          "limits scaled with the budget, the cost filter on its own charges, the trade cap, the daily "
                          "loss limit, the cash left free). Same fills and exits as the paper broker; no market impact, "
                          "so the biggest orders are optimistic."))
-        out.append(("table", ["Budget", "Trades", "Won", "Net", "Charges", "Return", "Avg R", "Largest order"],
+        out.append(("table", ["Budget", "Trades", "Won", "Net", "Charges", "Return", "Avg R", "Break-even slippage",
+                              "Largest order"],
                     [[s["label"], s["totals"]["trades"], s["totals"]["wins"], signed_money(s["totals"]["net"]),
                       money(s["totals"]["charges"]), "%+.2f%%" % s["totals"]["return_pct"],
-                      r_text(s["totals"]["avg_r"]), money(s["totals"]["largest_order"])] for s in sz]))
+                      r_text(s["totals"]["avg_r"]),
+                      "n/a" if s["totals"].get("breakeven_bps") is None else "%.1f bps" % s["totals"]["breakeven_bps"],
+                      money(s["totals"]["largest_order"])] for s in sz]))
         rows = [[s["label"], t["symbol"], t["at"], t["qty"], money(t["order_value"]), _px(t["fill"]), _px(t["exit"]),
                  EXIT_WORDS.get(t["result"], t["result"] or ""),
                  signed_money(t["net"]) if t["fill"] is not None else "never filled", r_text(t["r"])]
@@ -801,21 +887,29 @@ def blocks(rep, card, analysis=None):
     ed = t.get("edge") or {}
     if any(g.get("n") for g in (ed.get("groups") or {}).values()):
         out.append(("h2", "Is there an edge? (all days, in R)"))
-        out.append(("p", "Average R per signal after charges, with a 95%% bootstrap interval. An edge needs the whole "
-                         "interval above zero and at least %d trades; until then any average is mostly noise. "
-                         "\"Needed\" is roughly how many trades it would take to tell, if today's average and spread "
-                         "held." % MIN_TRADES))
-        out.append(("table", ["Group", "Trades", "Average", "95% interval", "Win rate", "Needed", "Verdict"],
-                    [edge_row(name, g) for name, g in ed["groups"].items() if g.get("n")]))
+        out.append(("p", "R after charges. Signals on one day move together (a falling market stops most breakouts at "
+                         "once), so the sample is days, not trades: each day's average R, with a 95%% bootstrap "
+                         "interval over days. An edge needs that whole interval above zero and at least %d days. Every "
+                         "paper fill is exact (a LIMIT fills on a touch, a stop at its trigger), so real fills can only "
+                         "be worse: \"Break-even\" is the slippage a side, in basis points (0.01%%), that would take "
+                         "the average to zero." % MIN_TRADES))
+        out.append(("table", EDGE_HEAD, [edge_row(name, g) for name, g in ed["groups"].items() if g.get("n")]))
+        slip = [slip_row(name, lv) for name in SLIP_GROUPS
+                for lv in ((ed["groups"].get(name) or {}).get("slippage") or {}).get("levels") or []]
+        if slip:
+            out.append(("p", "The same with slippage: the entry and the exit each that many bps worse than the paper "
+                             "fill. \"Needed\" is roughly how many trades, or days, it would take to tell if the "
+                             "average and spread held."))
+            out.append(("table", ["Group", "Slippage a side", "Avg R", "Trades needed", "Avg day",
+                                  "95% interval a day", "Days needed", "Verdict (days)"], slip))
         tag_rows = []
         for key, vals in sorted((ed.get("by_tag") or {}).items()):
             for v, g in vals.items():
-                tag_rows.append(edge_row("%s = %s" % (key, v), g))
+                tag_rows.append(edge_row("%s = %s" % (key, v), g, breakeven=False))
         if tag_rows:
-            out.append(("p", "The same, split by what was true when each signal fired. Nothing was skipped on these "
-                             "tags: they only show whether a filter on them would have helped."))
-            out.append(("table", ["Signals where", "Trades", "Average", "95% interval", "Win rate", "Needed",
-                                  "Verdict"], tag_rows))
+            out.append(("p", "The same, split by what was true when each signal fired (the market conditions). Nothing "
+                             "was skipped on these tags: they only show whether a filter on them would have helped."))
+            out.append(("table", ["Signals where"] + EDGE_HEAD[1:7] + ["Verdict (days)"], tag_rows))
 
     if analysis:
         out.append(("h2", "Claude's analysis"))
@@ -826,11 +920,34 @@ def blocks(rep, card, analysis=None):
     return out
 
 
-def edge_row(name, g):
-    ci = g.get("ci95")
-    return [name, g["n"], r_text(g.get("mean_r")), ("%+.2f to %+.2f" % tuple(ci)) if ci else "n/a",
-            pct(g.get("win_rate"), 0), g.get("trades_needed") if g.get("trades_needed") is not None else "n/a",
-            g.get("verdict")]
+EDGE_HEAD = ["Group", "Signals", "Avg R", "Win rate", "Days", "Avg day", "95% interval a day", "Break-even",
+             "Verdict (days)"]
+SLIP_GROUPS = ("Long, traded (paper)", "Long, every signal (traded or replayed)")
+
+
+def _ci(ci):
+    return ("%+.2f to %+.2f" % tuple(ci)) if ci else "n/a"
+
+
+def _na(x):
+    return "n/a" if x is None else x
+
+
+def edge_row(name, g, breakeven=True):
+    """One group: per signal, then per day (the verdict is the per-day one), then the break-even slippage."""
+    d = g.get("per_day") or {}
+    row = [name, g["n"], r_text(g.get("mean_r")), pct(g.get("win_rate"), 0), d.get("n") or 0,
+           r_text(d.get("mean_r")), _ci(d.get("ci95"))]
+    if breakeven:
+        be = (g.get("slippage") or {}).get("breakeven_bps")
+        row.append("n/a" if be is None else "%.1f bps" % be)
+    row.append(d.get("verdict") or g.get("verdict"))
+    return row
+
+
+def slip_row(name, lv):
+    return [name, "%d bps" % lv["bps"], r_text(lv.get("mean_r")), _na(lv.get("trades_needed")),
+            r_text(lv.get("day_mean_r")), _ci(lv.get("day_ci95")), _na(lv.get("days_needed")), lv.get("verdict")]
 
 
 def news_words(n):

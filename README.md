@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.4.0" src="https://img.shields.io/badge/version-1.4.0-blue?style=flat-square">
+  <img alt="version 1.5.0" src="https://img.shields.io/badge/version-1.5.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
@@ -144,7 +144,8 @@ claude                                               # log in once
 - **Tags** (`"tags": true`). Every signal records the Nifty against its 50-day average, India VIX's band over the past year and the Nifty's move so far that day, plus a rank from `"rank_file"` (for example Touchstone's) when there is one. Nothing is skipped on them: the scorecard splits the results by each.
 - **Is there an edge?** The report and the scorecard give the average R of each group (traded, skipped by the filter, other skipped signals, shorts) with a 95% bootstrap interval and a verdict, which stays "too few to tell" below 20.
 - **The bar archive** (`"archive": {"enabled": true}`). After the report, the day's 1- and 5-minute bars for the universe, the Nifty and India VIX go to `archive/` in the trader folder (Yahoo drops them after 30 and 60 days). `run_day.py archive --backfill` saves everything Yahoo still has.
-- **`study.py`** replays every ORB signal in the archive, long and short, with the paper rules, and gives the verdict per signal and per day. Signals on one day move together, so the per-day verdict is the honest one.
+- **`study.py`** replays every ORB signal in the archive, long and short, with the paper rules, and gives the verdict per signal and per day. Signals on one day move together, so the per-day verdict is the honest one. `--bars 5m` replays on 5-minute bars, which Yahoo keeps for 60 days instead of 30, and `--calibrate` measures how far that replay is from the 1-minute one (1.5.0).
+- **Slippage** (1.5.0). Paper fills are exact: a LIMIT fills on a touch and a stop at its trigger. The report, the scorecard and the study show the edge at 0, 1, 2, 3 and 5 bps a side, and the break-even slippage that would take the average to zero.
 - **Account sizes** (`"sizes": [100000, 1000000, 5000000, 10000000, 50000000]`, 1.4.0). The report re-sizes each day's signals for every budget listed, each with its own rules: rupee limits scaled with the budget, the cost filter on its own charges, the trade cap, the daily loss limit and the cash left free. One paper account trades; the others are the same signals re-sized, so their fills ignore market impact. `study.py --sizes` does the same over the archive and shows each order's share of its entry bar's volume, the point where a big order's paper fill stops being believable.
 
 ## Fine print

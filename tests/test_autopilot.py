@@ -804,6 +804,24 @@ class Archive(unittest.TestCase):
             self.assertLessEqual(end - lo, 29 * 86400)
 
 
+def fixture_archive(d):
+    """An archive cut from the 13 Nov fixtures: the Nifty 50's 5-minute bars for 5 days, RELIANCE's 1-minute bars
+    for the 13th."""
+    import study
+    scan = study.scanner()
+    five, _ = scan.load_offline(os.path.join(FIX, "nse-scanner", "wall5m-nifty50-5d-2026-11-13.json.gz"))
+    for sym, s in five.items():
+        by_day = {}
+        for i, t in enumerate(s["t"]):
+            if s["c"][i] is not None:
+                row = (t, s["c"][i], s["h"][i], s["l"][i], s["c"][i], (s.get("v") or [0] * len(s["t"]))[i])
+                by_day.setdefault(nc.ist_from_epoch(t).date().isoformat(), []).append(row)
+        for day, rows in by_day.items():
+            market.write_day(d, sym, "5m", day, rows, "test")
+    with open(os.path.join(FIX, "nse-entry", "RELIANCE-2026-11-13-1m.json")) as fh:
+        market.write_day(d, "RELIANCE", "1m", DAY, market.rows(json.load(fh)), "test")
+
+
 class Study(unittest.TestCase):
     """study.py on an archive cut from the 13 Nov fixtures reproduces the README's RELIANCE trade."""
 
@@ -811,18 +829,7 @@ class Study(unittest.TestCase):
         import study
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
-        scan = study.scanner()
-        five, _ = scan.load_offline(os.path.join(FIX, "nse-scanner", "wall5m-nifty50-5d-2026-11-13.json.gz"))
-        for sym, s in five.items():
-            by_day = {}
-            for i, t in enumerate(s["t"]):
-                if s["c"][i] is not None:
-                    row = (t, s["c"][i], s["h"][i], s["l"][i], s["c"][i], (s.get("v") or [0] * len(s["t"]))[i])
-                    by_day.setdefault(nc.ist_from_epoch(t).date().isoformat(), []).append(row)
-            for day, rows in by_day.items():
-                market.write_day(d, sym, "5m", day, rows, "test")
-        with open(os.path.join(FIX, "nse-entry", "RELIANCE-2026-11-13-1m.json")) as fh:
-            market.write_day(d, "RELIANCE", "1m", DAY, market.rows(json.load(fh)), "test")
+        fixture_archive(d)
         self.assertEqual(study.days_with_both(d), [DAY])
         cfg = nc.load_config(CFG_PATH)
         rows = study.study(d, cfg, 0.2, [DAY])
@@ -832,6 +839,162 @@ class Study(unittest.TestCase):
         g = study.summarise(rows)
         self.assertEqual(g["Long, skipped by the filter"]["signals"]["n"], 1)
         self.assertEqual(g["Long, skipped by the filter"]["days"]["verdict"], "too few to tell (1 of 20 days)")
+        self.assertEqual(rel[0]["bp_r"], report.bp_r(37, 1334.0, 1344.3, rel[0]["max_loss"]))
+        self.assertEqual(g["Long, skipped by the filter"]["slippage"]["breakeven_bps"],
+                         round(0.67 / rel[0]["bp_r"], 1))
+
+    def test_five_minute_bars_replay_every_day_and_the_same_trade(self):
+        import study
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        fixture_archive(d)
+        self.assertEqual(len(study.days_for(d, "5m")), 5)               # 5-minute days need no 1-minute bars
+        self.assertEqual(study.days_for(d, "1m"), [DAY])
+        cfg = nc.load_config(CFG_PATH)
+        rows = study.study(d, cfg, 0.2, [DAY], bars="5m")
+        rel = [r for r in rows if r["symbol"] == "RELIANCE"]
+        # the same target, but the market sell waits for the next 5-minute bar's open (1,344.30 on 1-minute bars)
+        self.assertEqual([(r["side"], r["at"], r["result"], r["fill"], r["exit"], r["exit_at"], r["net"]) for r in rel],
+                         [("long", "10:05", "target", 1334.0, 1343.6, "10:15", 302.51)])
+        self.assertGreater(len(rows), 1)                                  # every stock has 5-minute bars
+        with self.assertRaises(ValueError):
+            study.study(d, cfg, 0.2, [DAY], bars="15m")
+
+    def test_calibrate_pairs_the_two_replays(self):
+        import study
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        fixture_archive(d)
+        c = study.calibrate(d, nc.load_config(CFG_PATH), 0.2, [DAY])
+        self.assertEqual((c["signals"], c["compared"], c["same_result"], c["mean_r_1m"], c["mean_r_5m"]),
+                         (1, 1, 1, 0.67, 0.61))
+        self.assertEqual(c["diff_signals"]["mean_r"], -0.06)
+        self.assertIn("1 of 1 (100%)", study.calibration_text(c))
+
+    def test_the_command_line(self):
+        import study
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        fixture_archive(d)
+        shutil.copy(CFG_PATH, os.path.join(d, "config.json"))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": d}), redirect_stdout(out):
+            self.assertEqual(study.main(["--bars", "5m", "--sizes", "100000"]), 0)
+        text_ = out.getvalue()
+        self.assertIn("5 days", text_)
+        self.assertIn("on 5-minute bars", text_)
+        self.assertIn("break-even slippage", text_)
+        self.assertTrue(os.path.isfile(os.path.join(d, "reports", "sizes-study-5m.csv")))
+        self.assertFalse(os.path.exists(os.path.join(d, "reports", "sizes-study.csv")))   # the 1-minute one is kept
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": d}), redirect_stdout(out):
+            self.assertEqual(study.main(["--calibrate"]), 0)
+        self.assertIn("5-minute replay vs 1-minute replay on the 1 days", out.getvalue())
+
+
+def five_minute_bars(rows, start="09:55"):
+    """[(o, h, l, c)] one every 5 minutes from `start` on 13 Nov -> walk()'s bar tuples."""
+    t0 = datetime.datetime.strptime(DAY + " " + start, "%Y-%m-%d %H:%M")
+    return [(t0 + datetime.timedelta(minutes=5 * i), o, h, l, c) for i, (o, h, l, c) in enumerate(rows)]
+
+
+class FiveMinuteReplay(unittest.TestCase):
+    """ticket.walk(step=5): the paper rules on 5-minute bars, for days whose 1-minute bars Yahoo has dropped."""
+    cfg = dict(json.load(open(CFG_PATH)))
+    bars = five_minute_bars([(99.8, 100.1, 99.7, 100.0),        # 09:55: closes at the entry, so the LIMIT fills
+                             (100.0, 101.0, 99.5, 100.8),        # 10:00
+                             (100.8, 104.2, 100.6, 104.0),       # 10:05: the high reaches the 104.00 target
+                             (103.9, 104.1, 103.5, 103.8)])      # 10:10: sold at this open
+
+    def long_candidate(self):
+        return dict(short_candidate(entry=100.0, stop=98.0, target=104.0, worst=97.5), side="long", outcome="vetoed")
+
+    def test_the_target_sells_at_the_next_five_minute_open(self):
+        row = report.shadow(self.long_candidate(), DAY, self.bars, self.cfg, step=5)
+        self.assertEqual((row["result"], row["fill"], row["exit"], row["exit_at"]), ("target", 100.0, 103.9, "10:10"))
+        self.assertEqual(row["bp_r"], report.bp_r(50, 100.0, 103.9, 150.0))
+        self.assertEqual(row["max_loss"], 150.0)
+
+    def test_one_minute_is_the_default_and_unchanged(self):
+        # read as 1-minute bars, there is no bar a minute after the target: the old rule, the target minus a tick
+        row = report.shadow(self.long_candidate(), DAY, self.bars, self.cfg)
+        self.assertEqual((row["result"], row["exit_at"]), ("target", "10:06"))
+        self.assertLess(row["exit"], 104.0)
+
+    def test_a_bar_touching_both_is_still_the_stop(self):
+        bars = five_minute_bars([(99.8, 100.1, 99.7, 100.0), (100.0, 104.5, 97.9, 101.0), (101.0, 101.2, 100.8, 101.0)])
+        row = report.shadow(self.long_candidate(), DAY, bars, self.cfg, step=5)
+        self.assertEqual((row["result"], row["exit"], row["exit_at"]), ("stop", 98.0, "10:00"))
+
+
+class Slippage(unittest.TestCase):
+    """Every paper fill is exact; the edge at s bps a side is r - s * bp_r."""
+
+    def test_one_bp_on_each_side_over_the_max_loss(self):
+        # 50 shares in at 100, out at 104: a bp a side is ₹0.0204 a share, ₹1.02 in all, on a ₹150 max loss
+        self.assertEqual(report.bp_r(50, 100.0, 104.0, 150.0), 0.0068)
+        for bad in ((None, 100.0, 104.0, 150.0), (50, None, 104.0, 150.0), (50, 100.0, 104.0, 0), (0, 100.0, 104.0, 1)):
+            self.assertIsNone(report.bp_r(*bad))
+
+    def test_breakeven(self):
+        self.assertEqual(report.breakeven_bps([(0.1, 0.02), (0.1, 0.02)]), 5.0)
+        self.assertEqual(report.breakeven_bps([(-0.1, 0.02)]), 0.0)          # losing even with exact fills
+        self.assertIsNone(report.breakeven_bps([]))
+
+    def test_levels_per_signal_and_per_day(self):
+        rows = [{"day": "2026-11-%02d" % (1 + i // 3), "r": r, "bp_r": 0.02}
+                for i, r in enumerate([1.0, -0.5, 0.2] * 10)]
+        s = report.slippage(rows)
+        self.assertEqual((s["n"], s["days"], s["breakeven_bps"]), (30, 10, 11.7))
+        lv = {x["bps"]: x for x in s["levels"]}
+        self.assertEqual(sorted(lv), list(report.SLIP_BPS))
+        self.assertEqual((lv[0]["mean_r"], lv[5]["mean_r"], lv[0]["day_mean_r"]), (0.233, 0.133, 0.233))
+        self.assertTrue(lv[0]["verdict"].startswith("too few to tell (10 of 20 days)"))
+        # a row without bp_r (a scorecard day from before 1.5.0) is left out, never counted as an exact fill
+        self.assertEqual(report.slippage(rows + [{"day": "2026-10-01", "r": 5.0}])["n"], 30)
+        self.assertEqual(report.slippage([])["levels"], [])
+
+    def test_edge_groups_carry_per_day_and_slippage(self):
+        rs = [{"day": "2026-11-12", "side": "long", "why": "traded", "r": 1.0, "bp_r": 0.02},
+              {"day": "2026-11-12", "side": "long", "why": "trade_cap", "r": -1.0, "bp_r": 0.02},
+              {"day": "2026-11-13", "side": "long", "why": "traded", "r": 0.5, "bp_r": 0.02,
+               "tags": {"nifty_trend": "up"}}]
+        e = report.edge(rs)
+        g = e["groups"]["Long, every signal (traded or replayed)"]
+        self.assertEqual((g["n"], g["per_day"]["n"], g["per_day"]["mean_r"]), (3, 2, 0.25))   # days average 0 and 0.5
+        self.assertEqual(g["slippage"]["breakeven_bps"], 8.3)
+        self.assertEqual(e["by_tag"]["long / nifty_trend"]["up"]["per_day"]["n"], 1)
+        row = report.edge_row("x", g)
+        self.assertEqual(len(row), len(report.EDGE_HEAD))
+        self.assertEqual(row[7], "8.3 bps")
+        self.assertEqual(len(report.edge_row("x", g, breakeven=False)), len(report.EDGE_HEAD) - 1)
+
+
+class SlippageInTheReport(HomeBase):
+    def test_the_live_trade_carries_its_slippage_cost(self):
+        self.replay()
+        rep = self.doc("reports", DAY + ".json")
+        t = rep["trades"][0]
+        self.assertGreater(t["max_loss"], 0)                     # the journal's planned max loss
+        card = self.doc("reports", "scorecard.json")
+        o = [o for o in card["days"][DAY]["signal_rs"] if o["why"] == "traded"][0]
+        self.assertEqual(o["bp_r"], report.bp_r(37, 1334.0, 1344.3, t["max_loss"]))
+        g = card["totals"]["edge"]["groups"]["Long, traded (paper)"]
+        self.assertEqual((g["per_day"]["n"], g["slippage"]["n"]), (1, 1))
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("Break-even", md)
+        self.assertIn("Slippage a side", md)
+        self.assertIn("Verdict (days)", md)
+
+    def test_each_size_has_its_break_even(self):
+        self.settings["sizes"] = [100000, 1000000]
+        self.write_settings()
+        self.replay()
+        one, ten = self.doc("reports", DAY + ".json")["sizes"]
+        tr = one["trades"][0]
+        self.assertEqual(one["totals"]["breakeven_bps"], round(tr["r"] / tr["bp_r"], 1))
+        self.assertEqual(sorted(ten["totals"]["avg_r_at_bps"]), ["1", "2", "3", "5"])
+        self.assertIn("Break-even slippage", text(os.path.join(self.d, "reports", DAY + ".md")))
 
 
 def sig(symbol="RELIANCE", at="10:05", entry=1334.0, stop=1328.8, fill=1334.0, exit=1344.3, exit_at="10:13",

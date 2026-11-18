@@ -19,7 +19,10 @@ Three measurements may be switched on (the data shows which):
 - Tags on each signal (nifty_trend, vix_band, nifty_today, rank) only record what was true when it fired;
   nothing was skipped on them.
 "all_days.totals.edge" has the average R per group with a 95% interval and a verdict; quote the verdict
-rather than judging the averages yourself.
+rather than judging the averages yourself. Each group's "per_day" verdict is the one that counts (signals on
+one day move together, so days are the sample, not trades). Paper fills are exact, so each group's
+"slippage" gives the edge at 0-5 bps a side and "breakeven_bps", the slippage that would take the average
+to zero: say how much room that leaves.
 
 The data below has today's report ("today") and the running totals ("all_days"). Every number you quote
 must come from the data: do not compute new figures beyond simple comparisons, and say "not enough data

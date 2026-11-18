@@ -20,6 +20,7 @@ volume, which is where that stops being believable.
 """
 
 import autopilot_common as ac
+import report
 
 nc = ac.nc
 DEFAULT_SIZES = [100000, 1000000, 5000000, 10000000, 50000000]
@@ -113,6 +114,7 @@ def simulate(signals, cfg, budget, max_charges_r=None):
                 t["charges"] = nc.intraday_charges(qty, t["fill"], t["exit"], c)["total"]
                 t["net"] = round(t["gross"] - t["charges"], 2)
                 t["r"] = round(t["net"] / ml, 3) if ml else None
+                t["bp_r"] = report.bp_r(qty, t["fill"], t["exit"], ml)
             taken.append(t)
         day_net = round(sum(t["net"] for t in taken), 2)
         equity = round(equity + day_net, 2)
@@ -134,6 +136,10 @@ def simulate(signals, cfg, budget, max_charges_r=None):
               "best_day": max(nets) if nets else None, "worst_day": min(nets) if nets else None,
               "green_days": sum(1 for x in nets if x > 0), "red_days": sum(1 for x in nets if x < 0),
               "max_drawdown": round(dd, 2), "largest_order": max([t["order_value"] for t in trades] or [0])}
+    slipped = [t for t in closed if t.get("bp_r")]
+    totals["breakeven_bps"] = report.breakeven_bps([(t["r"], t["bp_r"]) for t in slipped])
+    totals["avg_r_at_bps"] = {str(b): round(sum(t["r"] - b * t["bp_r"] for t in slipped) / len(slipped), 3)
+                              for b in report.SLIP_BPS if b} if slipped else {}
     shares = sorted(t["volume_share"] for t in trades if t["volume_share"] is not None)
     if shares:
         totals["median_volume_share"] = shares[len(shares) // 2]
