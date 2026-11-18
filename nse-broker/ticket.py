@@ -1162,9 +1162,10 @@ def bars_for(sym, a, cache):
     return bars
 
 
-def done_bars(bars, now_ist):
-    """Bars complete by now (a 1-minute bar stamped 10:04 is complete at 10:05)."""
-    return [b for b in bars if b[0] + datetime.timedelta(minutes=1) <= now_ist]
+def done_bars(bars, now_ist, step=1):
+    """Bars complete by now (a 1-minute bar stamped 10:04 is complete at 10:05; with step=5, a 5-minute bar
+    stamped 10:00 is complete at 10:05)."""
+    return [b for b in bars if b[0] + datetime.timedelta(minutes=step) <= now_ist]
 
 
 # ---------------------------------------------------------------- paper broker
@@ -1229,10 +1230,15 @@ def _stamp(text):
         return None
 
 
-def walk(t, bars, now_ist, cfg=None):
+def walk(t, bars, now_ist, cfg=None, step=1):
     """Walk 1-minute bars for one paper trade. Returns a list of events
     (kind, bar time, price, note) and leaves the trade as it stands at now. Only bars that are COMPLETE
     by now are used (a bar stamped 10:04 is complete at 10:05).
+
+    step is the bar length in minutes. The paper broker always walks 1-minute bars (step=1). The archive study
+    can replay 5-minute bars (step=5) for days whose 1-minute bars Yahoo has dropped: the rules are the same,
+    but the next bar is 5 minutes on, so a target exit waits up to 5 minutes for its market sell and more bars
+    touch both the stop and the target (counted as the stop).
 
     The paper broker is deliberately no kinder than the real one:
       * the target is an ALERT on Kite (no OCO for MIS): when a bar's high reaches it you cancel the stop and
@@ -1263,8 +1269,9 @@ def walk(t, bars, now_ist, cfg=None):
     stop = t.get("stop") or {}
     trig, lim = _f(stop.get("trigger")), _f(stop.get("price"))
     target = _f(t.get("target"))
-    done = [b for b in done_bars(bars, now_ist) if b[0].date() == day]
+    done = [b for b in done_bars(bars, now_ist, step) if b[0].date() == day]
     by_time = {b[0]: b for b in done}
+    bar = datetime.timedelta(minutes=step)
     last_real = None                      # (time, close) of the last real bar at or before flat_by
 
     def flat_exit():
@@ -1339,7 +1346,7 @@ def walk(t, bars, now_ist, cfg=None):
             state = "closed"
             break
         if target and h >= target - EPS and when < flat_at:
-            nxt = by_time.get(when + datetime.timedelta(minutes=1))
+            nxt = by_time.get(when + bar)
             if nxt is not None:
                 events.append(("target", nxt[0], nxt[1],
                                "the target %s was reached on the %s bar; on Kite it is only an alert, so you cancel "
@@ -1348,7 +1355,7 @@ def walk(t, bars, now_ist, cfg=None):
             else:
                 tick = nc.order_tick(target, t.get("symbol"), cfg)
                 price = float(nc.round_to_tick(nc.dec(target) - tick, tick, "down"))
-                events.append(("target", when + datetime.timedelta(minutes=1), price,
+                events.append(("target", when + bar, price,
                                "the target %s was reached on the %s bar and the next bar is not on Yahoo yet: "
                                "filled at the target minus one tick, %s (the alert-then-market-sell round trip "
                                "is never filled at the target itself)" % (px(target), when.strftime("%H:%M"), px(price))))

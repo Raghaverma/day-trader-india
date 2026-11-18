@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.5.0
+
+### Slippage, days as the sample, and a 5-minute replay
+
+Nothing here changes what is traded. It changes how the results are measured.
+
+- **Slippage.** Every paper fill is exact: a LIMIT fills on a touch and a stop at its trigger. Each signal now
+  carries `bp_r`, the R that one basis point of slippage on each side costs it. `report.slippage` gives:
+  - the edge at 0, 1, 2, 3 and 5 bps a side, per signal and per day
+  - the trades and days it would take to tell
+  - the break-even slippage
+
+  It is in the daily report, the scorecard, Claude's EOD data, `study.py` and each budget in `sizes.simulate`.
+  Live paper trades use the journal's planned max loss (now carried in the report's trades).
+- **Per-day statistics lead.** Signals on one day move together, so each edge group in the report and the
+  scorecard adds `per_day` (each day's average R, bootstrapped over days). The verdict column shown is the
+  per-day one. The tag splits (the market conditions) get the same.
+- **`study.py --bars 5m`.** Yahoo keeps 60 days of 5-minute bars but only 30 of 1-minute bars. The study can
+  now replay on 5-minute bars, which covers every archived day. The bar length is a new `step` argument to
+  `ticket.walk`, `ticket.done_bars` and `report.shadow`. It defaults to 1, so the paper broker is unchanged. On
+  5-minute bars, the target's market sell waits for the next 5-minute open. `--sizes` writes
+  `sizes-study-5m.*` and keeps the 1-minute files.
+- **`study.py --calibrate`.** On days with both bar sizes, it compares the 5-minute replay with the 1-minute
+  one, signal by signal. On the first 19 archived days (1,102 signals), 99% of results agree, and the
+  5-minute replay is 0.003R a signal harsher (95% −0.009 to +0.004).
+- **Tests.** 12 new.
+
 ## 1.4.0
 
 ### The same signals at other account sizes
