@@ -123,9 +123,10 @@ def long_plan(hit, cfg):
             "max_loss": float(worst["total"]), "charges_r": round(float(per / risk), 3)}
 
 
-def study(home, cfg, max_charges_r, days, until="14:30", bars="1m"):
+def study(home, cfg, max_charges_r, days, until="14:30", bars="1m", latency=0, entry_bps=0):
     """Every ORB signal on `days`, found on the 5-minute bars and replayed on `bars` ("1m", or "5m" for days whose
-    1-minute bars are gone)."""
+    1-minute bars are gone). latency: minutes from the breakout bar's close to the order (the live autopilot's
+    scan sees a 09:35 breakout at 09:36: 1); entry_bps: the LIMIT that many bps above the entry (report.shadow)."""
     if bars not in STEP:
         raise ValueError("bars must be 1m or 5m")
     scan = scanner()
@@ -146,7 +147,8 @@ def study(home, cfg, max_charges_r, days, until="14:30", bars="1m"):
             if h["symbol"] not in one:
                 continue
             c = {"symbol": h["symbol"], "side": side, "outcome": side, "trigger": {"at": h["at"]}, "plan": p}
-            r = report.shadow(c, day, minute_bars(one[h["symbol"]]), cfg, step=STEP[bars])
+            r = report.shadow(c, day, minute_bars(one[h["symbol"]]), cfg, step=STEP[bars], latency=latency,
+                              entry_bps=entry_bps)
             if r.get("result") == "never filled":
                 rows.append({"day": day, "symbol": h["symbol"], "side": side, "at": h["at"], "r": None, "net": 0.0,
                              "result": "never filled", "charges_r": p["charges_r"], "entry": p["entry"],
@@ -295,6 +297,15 @@ def main(argv=None):
                          "3,5,8,10), each with a daily loss limit of that many times the max loss a trade, at "
                          "--budget (default config.json's), and write every trade to reports/caps-study.csv and .md")
     ap.add_argument("--budget", type=float, help="the budget for --caps, rupees (default config.json's)")
+    ap.add_argument("--latency", type=int, default=1,
+                    help="minutes from the breakout bar's close to the order (default 1, like the live autopilot; "
+                         "0 is the old, optimistic replay that fills at the breakout close)")
+    ap.add_argument("--entry-bps", type=float, default=0,
+                    help="place the LIMIT this many bps above the plan's entry (a marketable limit), default 0")
+    ap.add_argument("--compare", action="store_true",
+                    help="replay the long signals under each execution assumption (latency 0/1, touch/through "
+                         "fills, no expiry/15-minute expiry, a LIMIT at the entry or 5 and 10 bps above) and print "
+                         "one line each")
     a = ap.parse_args(argv)
     home = ac.trader_home()
     cfg = ac.load_cfg(home)
@@ -312,12 +323,15 @@ def main(argv=None):
         print(json.dumps(c, indent=2) if a.json else calibration_text(c))
         return 0
     days = pick(days_for(home, a.bars))
+    if a.compare and days:
+        print(compare_text(compare(home, cfg, float(mx), days, a.bars), days, a.bars))
+        return 0
     if not days:
         print("no day in %s has %s: run run_day.py archive --backfill first" % (
             os.path.join(home, "archive"), "both 1- and 5-minute bars" if a.bars == "1m" else "5-minute bars"),
             file=sys.stderr)
         return 1
-    rows = study(home, cfg, float(mx), days, bars=a.bars)
+    rows = study(home, cfg, float(mx), days, bars=a.bars, latency=a.latency, entry_bps=a.entry_bps)
     res = summarise(rows)
     by_size = None
     if a.sizes:
@@ -366,6 +380,54 @@ def main(argv=None):
         print(caps_table(by_cap))
         print("\nEvery trade: %s and %s" % (cpaths["csv"], cpaths["md"]))
     return 0
+
+
+EXECUTION_WAYS = (
+    ("the old replay: filled at the breakout close", 0, "touch", None, 0),
+    ("order a minute later, fill on a touch", 1, "touch", None, 0),
+    ("a minute later, trade-through fill", 1, "through", None, 0),
+    ("a minute later, through, 15-minute expiry (live now)", 1, "through", 15, 0),
+    ("the same, LIMIT 5 bps above the entry", 1, "through", 15, 5),
+    ("the same, LIMIT 10 bps above the entry", 1, "through", 15, 10),
+)
+
+
+def compare(home, cfg, max_charges_r, days, bars="1m", ways=EXECUTION_WAYS):
+    """The long signals replayed under each execution assumption: [{label, signals, filled, mean_r, per_day}]."""
+    out = []
+    for label, latency, fill, ttl, bps in ways:
+        c = dict(cfg, paper_fill=fill)
+        if ttl:
+            c["entry_ttl_minutes"] = ttl
+        else:
+            c.pop("entry_ttl_minutes", None)
+        rows = [r for r in study(home, c, max_charges_r, days, bars=bars, latency=latency, entry_bps=bps)
+                if r["side"] == "long"]
+        done = [r for r in rows if r.get("r") is not None]
+        by_day = {}
+        for r in rows:                     # an unfilled signal is 0R: it neither made nor lost money
+            by_day.setdefault(r["day"], []).append(r["r"] if r.get("r") is not None else 0.0)
+        st = report.edge_stats([sum(v) / len(v) for _, v in sorted(by_day.items())], unit="days")
+        out.append({"label": label, "signals": len(rows), "filled": len(done),
+                    "mean_r": round(sum(r["r"] for r in done) / len(done), 3) if done else None,
+                    "per_signal_incl_unfilled": round(sum(r["r"] for r in done) / len(rows), 3) if rows else None,
+                    "per_day": {k: st.get(k) for k in ("mean_r", "ci95", "verdict")}})
+    return out
+
+
+def compare_text(res, days, bars):
+    lines = ["Long ORB signals, %d days (%s to %s) on %s bars, R after charges. \"Per signal\" counts an unfilled "
+             "signal as 0R, so a way that fills fewer runaway winners shows it. Not advice." % (
+                 len(days), days[0], days[-1], "1-minute" if bars == "1m" else "5-minute"),
+             "%-55s %7s %7s %9s %10s %9s %19s  %s" % ("execution", "signals", "filled", "avg R", "per signal",
+                                                    "day avg", "95% per day", "per-day verdict")]
+    for r in res:
+        d = r["per_day"]
+        lines.append("%-55s %7d %6.0f%% %+9.3f %+10.3f %+9.3f %19s  %s" % (
+            r["label"], r["signals"], 100.0 * r["filled"] / r["signals"] if r["signals"] else 0,
+            r["mean_r"] or 0, r["per_signal_incl_unfilled"] or 0, d.get("mean_r") or 0,
+            ("%+.3f to %+.3f" % tuple(d["ci95"])) if d.get("ci95") else "n/a", d.get("verdict") or ""))
+    return "\n".join(lines)
 
 
 def caps_table(by_cap):

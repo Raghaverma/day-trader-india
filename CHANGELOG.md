@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.12.0
+
+### Replays that place the order when the live account would
+
+- **The report's replays** place a signal's LIMIT at the minute the autopilot first saw it (its `first_seen`), as
+  the live account would have, instead of at the breakout bar's close: the old replay filled nearly every breakout
+  at its close, including the runaway winners a live order arrives too late for (19 Nov: M&M).
+- **`study.py --latency N`** (default 1: a 09:35 breakout is seen at 09:36, as live) and **`--entry-bps N`** (the
+  LIMIT N bps above the entry, paid to be filled on a breakout that runs; stop, target, quantity and R are the
+  plan's). `--latency 0` is the old replay.
+- **`study.py --compare`** replays the long signals under six execution assumptions (the old replay; a minute later
+  on a touch; on a trade-through; with the 15-minute expiry now live; a LIMIT 5 and 10 bps above) and prints the
+  share filled, R per filled trade, R per signal counting the unfilled as 0, and the per-day verdict.
+- 4 new tests.
+
 ## 1.11.0
 
 ### Execution closer to a real broker

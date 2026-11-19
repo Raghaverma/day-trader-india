@@ -92,6 +92,46 @@ class WaitingCashAndFreedSlots(unittest.TestCase):
         self.assertIsNotNone(accounts.cap_reason(d, {"max_trades_per_day": 2}, DAY))
 
 
+class ReplayLatency(unittest.TestCase):
+    """report.shadow places the order when the live account would have: the minute it first saw the signal. RELIANCE
+    broke out at 10:05 at 1,334.00; by 10:07 the last bar closed at 1,340.50 and it never came back down."""
+    cfg = nc.load_config(CFG_PATH)
+
+    def cand(self, **kw):
+        c = {"symbol": "RELIANCE", "side": "long", "outcome": "shadow", "trigger": {"at": "10:05"},
+             "plan": {"entry": 1334.0, "stop": 1328.8, "target": 1344.4, "quantity": 37, "worst_exit": 1322.1,
+                      "max_loss": 492.48, "flat_by": "15:10"}}
+        c.update(kw)
+        return c
+
+    def replay(self, c, **kw):
+        return __import__("report").shadow(c, "2026-11-13", tb.BARS, dict(self.cfg, entry_ttl_minutes=15), **kw)
+
+    def test_at_the_trigger_it_fills(self):
+        r = self.replay(self.cand())
+        self.assertEqual((r["ordered_at"], r["fill"], r["result"]), ("10:05", 1334.0, "target"))
+
+    def test_seen_two_minutes_later_it_never_fills(self):
+        self.assertEqual(self.replay(self.cand(first_seen="10:07"))["result"], "never filled")
+        self.assertEqual(self.replay(self.cand(), latency=2)["result"], "never filled")
+
+    def test_a_limit_above_the_entry_pays_up_and_fills(self):
+        r = self.replay(self.cand(first_seen="10:07"), entry_bps=50)
+        self.assertEqual((r["limit"], r["fill"]), (1340.7, 1340.5))     # marketable on the 10:06 close
+        self.assertEqual(r["result"], "target")
+
+    def test_the_study_compares_every_way(self):
+        import study
+        from test_autopilot import fixture_archive
+        d = __import__("tempfile").mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        fixture_archive(d)
+        res = study.compare(d, self.cfg, 0.2, ["2026-11-13"])
+        self.assertEqual([r["label"] for r in res], [w[0] for w in study.EXECUTION_WAYS])
+        self.assertTrue(all(r["signals"] >= 1 for r in res))
+        self.assertIn("the old replay", study.compare_text(res, ["2026-11-13"], "1m"))
+
+
 class VetoCategories(HomeBase):
     def test_a_veto_is_replayed_under_its_category(self):
         self.claude = ClaudeStub(vetoes=[{"symbol": "RELIANCE", "reason": "results today", "category": "RESULTS"}])

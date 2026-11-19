@@ -232,11 +232,18 @@ def mirror(bars):
     return [(t, -o, -l, -h, -c) for t, o, h, l, c in bars]
 
 
-def shadow(c, day, bars, cfg, step=1):
+def shadow(c, day, bars, cfg, step=1, latency=None, entry_bps=0):
     """Replay a signal that was not traded with the paper broker's own rules (ticket.walk): a LIMIT at the
-    plan's entry from the trigger, the SL stop, the 2R target as an alert, flat by 15:10. A short is replayed
-    on the mirrored bars (mirror()), so it gets exactly the same rules, the other way up. step is the bar
-    length in minutes (1, or 5 for the archive study's 5-minute replay)."""
+    plan's entry, the SL stop, the 2R target as an alert, flat by 15:10. A short is replayed on the mirrored
+    bars (mirror()), so it gets exactly the same rules, the other way up. step is the bar length in minutes
+    (1, or 5 for the archive study's 5-minute replay).
+
+    When the order goes in: the minute the autopilot first saw the signal (the candidate's first_seen), as the
+    live account would have placed it, else the trigger plus `latency` minutes (the study passes 1: the
+    breakout bar closes at the trigger time and the scan sees it a minute later). The order fills at once
+    when the last bar complete by then closed at or under the limit (marketable), else it rests.
+    entry_bps > 0 sets the LIMIT that many basis points above the plan's entry (below it for a short):
+    paying up to be filled on a breakout that runs. The stop, target, quantity and R are the plan's."""
     p = c.get("plan") or {}
     trig = c.get("trigger") or {}
     short = c.get("side") == "short"
@@ -251,14 +258,27 @@ def shadow(c, day, bars, cfg, step=1):
     tk = ticket()
     d = datetime.date.fromisoformat(day)
     ordered = datetime.datetime.combine(d, nc.parse_hhmm(row["at"]))
+    if c.get("first_seen"):
+        try:
+            ordered = max(ordered, datetime.datetime.combine(d, nc.parse_hhmm(c["first_seen"])))
+        except ValueError:
+            pass
+    elif latency:
+        ordered += datetime.timedelta(minutes=int(latency))
+    row["ordered_at"] = ordered.strftime("%H:%M")
+    limit = entry
+    if entry_bps:
+        limit = float(nc.round_to_tick(nc.dec(entry) * (1 + nc.dec(entry_bps) / 10000 * (-1 if short else 1)),
+                                       nc.order_tick(entry, row["symbol"], cfg), "down" if short else "up"))
+        row["limit"] = limit
     worst = _f(p.get("worst_exit")) or stop
     if short:
         # the one tick walk() uses (target minus a tick with no next bar) must be the stock's, not a negative price's
         cfg = dict(cfg, tick_sizes=dict(cfg.get("tick_sizes") or {},
                                         **{row["symbol"]: float(nc.order_tick(entry, row["symbol"], cfg))}))
-        bars, entry_w, stop_w, target_w, worst_w = mirror(bars), -entry, -stop, -target, -worst
+        bars, entry_w, stop_w, target_w, worst_w = mirror(bars), -limit, -stop, -target, -worst
     else:
-        entry_w, stop_w, target_w, worst_w = entry, stop, target, worst
+        entry_w, stop_w, target_w, worst_w = limit, stop, target, worst
     done = [b for b in bars if b[0].date() == d and b[0] + datetime.timedelta(minutes=step) <= ordered]
     if not done:
         row["result"] = "no data"
