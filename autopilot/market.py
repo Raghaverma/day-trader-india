@@ -166,6 +166,39 @@ def write_day(home, sym, interval, day, bars, fetched_at):
     return True
 
 
+def or_volume(rows):
+    """Volume of the opening range's 5-minute bars (09:15-09:30) from archive rows. Yahoo's 09:15 bar carries no
+    volume, so in practice this is 09:20-09:30, the same every day: a ratio of two of them is fair."""
+    return sum((r[5] or 0) for r in rows if "09:15" <= nc.ist_from_epoch(r[0]).strftime("%H:%M") < "09:30"
+               and None not in r[1:5])
+
+
+def opening_rvol(home, fetch, sym, day, history=20, min_days=5):
+    """Today's opening-range volume over its median for the `history` archived days before `day` (None with fewer
+    than `min_days` of them, or no volume today). research.py found the signals with 1.5x or more the best."""
+    import statistics
+    root = os.path.join(home, "archive", "5m")
+    past = []
+    for d in sorted(x for x in (os.listdir(root) if os.path.isdir(root) else []) if x < day)[::-1]:
+        doc = read_day(archive_path(home, "5m", d, sym))
+        v = or_volume((doc or {}).get("bars") or [])
+        if v:
+            past.append(v)
+        if len(past) >= history:
+            break
+    if len(past) < min_days:
+        return None
+    today = [r for r in rows(fetch(sym, "5m", "1d")) if nc.ist_from_epoch(r[0]).date().isoformat() == day]
+    v = or_volume(today)
+    return round(v / statistics.median(past), 2) if v else None
+
+
+def rvol_band(x):
+    if x is None:
+        return None
+    return "1.5x or more" if x >= 1.5 else ("0.8x to 1.5x" if x >= 0.8 else "under 0.8x")
+
+
 def read_day(path):
     try:
         with gzip.open(path, "rt", encoding="utf-8") as fh:

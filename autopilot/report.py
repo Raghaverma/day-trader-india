@@ -291,6 +291,7 @@ def shadow(c, day, bars, cfg, step=1, latency=None, entry_bps=0):
     if done[-1][4] <= entry_w + 1e-9:
         fill = done[-1][4]
         t.update(status="filled", fill_time=stamp, fill_price=fill)
+        row["fill_at"], row["fill_immediate"] = ordered.strftime("%H:%M"), True
     else:
         t["status"] = "open"
     end = datetime.datetime.combine(d, datetime.time(23, 59))
@@ -298,6 +299,7 @@ def shadow(c, day, bars, cfg, step=1, latency=None, entry_bps=0):
     for kind, when, price, _note in tk.walk(t, bars, end, cfg, step=step):
         if kind == "fill":
             fill = price
+            row["fill_at"], row["fill_immediate"] = when.strftime("%H:%M"), False
         elif kind == "cancel":
             row["result"] = "never filled"
             return row

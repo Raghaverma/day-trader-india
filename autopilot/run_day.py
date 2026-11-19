@@ -394,6 +394,13 @@ class Day(object):
                 idx = (ph.get("index_by_bar") or {}).get(earlier[-1]) if earlier else None
             if idx and idx.get("tag"):
                 tags["nifty_today"] = idx["tag"]
+            if self.fetch and self.at_least("09:30"):
+                try:            # opening volume against its 20-day median: research.py's lead, measured live
+                    band = market.rvol_band(market.opening_rvol(self.home, self.fetch, sym, self.day))
+                except Exception:
+                    band = None
+                if band:
+                    tags["open_volume"] = band
         rank = rank_tag(self.settings.get("rank_file"), sym, self.ist.date())
         if rank:
             tags["rank"] = rank

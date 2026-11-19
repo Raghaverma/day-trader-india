@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.13.0
+
+### Research on the archive: which signals, which exits, which setups
+
+- **`autopilot/research.py`.** Every long ORB signal on the archived days, with what was known when it fired:
+  opening volume (09:20-09:30, since Yahoo's 09:15 bar has none) over its 20-day median, the share of the 14-day
+  average range the 2R target needs from the day's low, the move against the Nifty since the previous close, the
+  sector (NSE's Nifty 50 list) and a previous close at a 20-day high. Each is replayed with the live execution
+  rules (the order a minute after the breakout bar, a trade-through fill, a 15-minute expiry).
+- **Which signals.** At most 3 filled a day (an unfilled order frees its slot): the first 3 in time order (now),
+  opening volume of 1.5x or more, the target within the stock's typical day, stronger than the Nifty, all three, a
+  rank within each scan batch, and the rank with one stock per sector; and the R by thirds of each feature.
+- **Which exits.** The same fills under the plan (stop, 2R alert, flat by 15:10), a breakeven stop (entry plus the
+  round trip's charges) after +1R, a time stop (out if not +0.5R in 45 minutes) and a trail (no target; after +1R
+  the stop follows the 5-bar low).
+- **Which setups.** A VWAP pullback after a strong open (up 0.8% by 09:45 on 1.5x opening volume; a LIMIT at the
+  VWAP until 12:00, stop under the day's low) and an afternoon breakout (a 12:30-13:30 range within half the
+  14-day range, then the first close above it by 14:15). A news gap-and-go needs past news the archive lacks.
+- **Measured live.** Every signal gets an `open_volume` tag, so the scorecard's edge-by-tag table follows the
+  opening-volume filter on new days (`market.opening_rvol`, one Yahoo request a signal). Nothing traded changes.
+- Stray `trader/` folders the plugin's hooks create inside the repo are ignored. 10 new tests.
+
 ## 1.12.0
 
 ### Replays that place the order when the live account would
