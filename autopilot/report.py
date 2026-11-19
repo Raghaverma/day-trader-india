@@ -503,7 +503,7 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
            "vetoes": vetoes.get("vetoes") or [], "veto_summary": vetoes.get("summary"),
            "regime": ((st.get("phases") or {}).get("premarket") or {}).get("regime"),
            "candidates": [dict({k: c.get(k) for k in ("symbol", "first_seen", "scan_at", "outcome", "reason",
-                                                      "daily_setups", "tags", "cost_ok")},
+                                                      "daily_setups", "tags", "cost_ok", "open_rvol", "accounts")},
                                side=c.get("side") or "long", charges_r=(c.get("plan") or {}).get("charges_r"))
                           for c in sorted((st.get("candidates") or {}).values(),
                                           key=lambda c: c.get("first_seen") or "")],
@@ -520,19 +520,27 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
         rep["caps"] = trade_caps(rep, cfg, tc.get("caps"), tc.get("budget"),
                                  (settings.get("cost_filter") or {}).get("max_charges_r"))
     rep["stocks"] = stock_files(home, day, rep)
-    rep["accounts"] = paper_accounts(home, day, settings, cfg)
+    rep["accounts"] = paper_accounts(home, day, settings, cfg, rep.get("candidates"))
     return write_outputs(home, day, rep, None)
 
 
-def paper_accounts(home, day, settings, cfg):
-    """The main paper account and the others (accounts.py) side by side; None when there are no others."""
+def paper_accounts(home, day, settings, cfg, candidates=None):
+    """The main paper account and the others (accounts.py) side by side; None when there are no others. An account
+    with a filter of its own gets "signals": what the filter let through and kept out, with each opening volume."""
     import accounts
     if not accounts.caps_of(settings):
         return None
     try:
-        return accounts.all_summaries(home, day, settings, cfg)
+        rows = accounts.all_summaries(home, day, settings, cfg)
     except Exception as e:
         return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
+    for a in rows:
+        if a.get("filter"):
+            a["signals"] = [{"symbol": c.get("symbol"), "open_rvol": c.get("open_rvol"),
+                             "outcome": c["accounts"][a["name"]].get("outcome"),
+                             "reason": c["accounts"][a["name"]].get("reason")}
+                            for c in candidates or [] if (c.get("accounts") or {}).get(a["name"])]
+    return rows
 
 
 def trade_caps(rep, cfg, caps=None, budget=None, max_charges_r=None):
@@ -1268,7 +1276,43 @@ def account_blocks(acc):
             for a in acc for t in a["trades"]]
     if rows:
         out.append(("table", ["Trades a day", "Stock", "Ordered", "Qty", "In", "Out", "Exit", "Net"], rows))
+    for a in acc:
+        if a.get("filter"):
+            out.extend(filter_blocks(a))
     return out
+
+
+def _rvol_text(x):
+    return "%.2fx" % x if x is not None else "not known"
+
+
+def filter_blocks(a):
+    """An account's own filter: what it is, and which of the day's signals it let through or kept out."""
+    f = a["filter"]
+    out = [("p", "The %d-a-day account has a filter the others do not: it takes a signal only when the stock's "
+                 "opening volume (09:20-09:30) is at least %gx its median over the last 20 days. research.py found "
+                 "that the one rule that picked better trades in both archives; this account tries it for real. "
+                 "Compare it with the %d-trades-a-day row of the trade-cap replay further down, which has no filter."
+                 % (a["cap"], f["min_open_rvol"], a["cap"]))]
+    sig = a.get("signals") or []
+    kept = [s for s in sig if s.get("outcome") == "filtered"]
+    passed = [s for s in sig if s.get("outcome") != "filtered"]
+    if not sig:
+        out.append(("p", "No signals reached it today."))
+        return out
+    out.append(("table", ["Stock", "Opening volume", "Filter", "What happened"],
+                [[s["symbol"], _rvol_text(s.get("open_rvol")),
+                  "kept out" if s.get("outcome") == "filtered" else "let through",
+                  "" if s.get("outcome") == "filtered" else ACCOUNT_OUTCOMES.get(s.get("outcome"), s.get("outcome") or "")
+                  + (": %s" % s["reason"] if s.get("reason") and s.get("outcome") != "traded" else "")]
+                 for s in sig]))
+    out.append(("p", "Let through %d of %d signals, kept out %d." % (len(passed), len(sig), len(kept))))
+    return out
+
+
+ACCOUNT_OUTCOMES = {"traded": "traded", "shadow": "not taken", "size_refused": "no size fits",
+                    "risk_block": "blocked by nse-risk", "approve_refused": "approval refused",
+                    "fill_refused": "paper fill refused", "error": "error"}
 
 
 def cap_blocks(tc):

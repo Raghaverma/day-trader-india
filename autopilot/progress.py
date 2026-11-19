@@ -446,10 +446,13 @@ def money_lines(s, cfg):
 
 def account_lines(s):
     out = []
-    for a in s.get("accounts") or []:
+    accs = s.get("accounts") or []
+    w = max([34] + [len(a["label"]) + 1 for a in accs])
+    for a in accs:
         used = a["orders"]
-        out.append("%-34s %d of %d trades used, %d open, %d closed (%d won, %d lost), net %s" % (
-            a["label"] + ":", used, a["cap"], a["still_open"], a["closed"], a["wins"], a["losses"], signed(a["net"])))
+        out.append("%-*s %d of %d trades used, %d open, %d closed (%d won, %d lost), net %s" % (
+            w, a["label"] + ":", used, a["cap"], a["still_open"], a["closed"], a["wins"], a["losses"],
+            signed(a["net"])))
     return out
 
 

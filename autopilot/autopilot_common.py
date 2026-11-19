@@ -73,7 +73,7 @@ DEFAULTS = {
     "trade_caps": {"enabled": False, "caps": [3, 5, 8, 10], "budget": None},
     # more paper accounts that trade for real on paper, one per cap, in <trader folder>/accounts/cap<N>/ (accounts.py):
     # the main config with that many trades a day and a daily loss limit of that many times the max loss a trade
-    "accounts": {"enabled": False, "caps": [5, 8, 10]},
+    "accounts": {"enabled": False, "caps": [5, 8, 10], "filters": {}},
     # keep the day's 1- and 5-minute bars (Yahoo drops them after 30 / 60 days) in archive/ in the trader folder
     "archive": {"enabled": False, "pause_s": 0.4},
     # test and replay only (NSE_TEST_MODE=1): extra arguments per step, "{sym}" is replaced by the symbol,

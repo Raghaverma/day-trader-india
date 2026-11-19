@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.14.0
+
+### The opening-volume filter, tried on the 5-a-day paper account
+
+- **A filter per account.** `"accounts": {"filters": {"cap5": {"min_open_rvol": 1.5}}}` in autopilot.json gives one
+  paper account a rule the others do not have. The 5-a-day account now takes a signal only when its opening volume
+  (09:20-09:30) is at least 1.5x its median over the last 20 archived days, the one lead in `research.py`; a signal
+  whose opening volume is not known is left out, as the research does. A filtered signal never reaches the
+  account's sizing, quote or risk check. The main account (3 a day) and the 8- and 10-a-day accounts are unchanged.
+- **One number per signal.** The opening volume is worked out once when the signal is first seen and kept on it
+  (`open_rvol`), so the tag, every account and the report use the same figure.
+- **Report.** The account's label says it is filtered; a table lists each signal that reached it with its opening
+  volume and whether the filter let it through or kept it out. The trade-cap replay's 5-a-day row is the same
+  account without the filter. The progress email's account lines widen to fit the longer label.
+- **What the archive expects** (research rows at 5 filled a day, cash and the daily loss rule not modelled): 1-minute,
+  20 days: +0.19R a trade, +0.80R a day, interval above zero, against +0.10R and +0.51R without it; 5-minute, 61
+  days: +0.04R a trade against -0.02R, interval spans zero.
+
 ## 1.13.0
 
 ### Research on the archive: which signals, which exits, which setups

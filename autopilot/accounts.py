@@ -12,6 +12,11 @@ The main trader folder is the main paper account (its config.json's cap, 3 by de
   * cache/: a link to the main folder's cache (NSE's sec_list, the equity list), so nothing is fetched twice.
   * state/: its own broker.json, paper.json and risk.json: its own orders, fills, stops and P&L.
 
+An account can also have a filter of its own, a rule the others do not have, so a change is tried on one account
+while the rest keep trading as before. "filters": {"cap5": {"min_open_rvol": 1.5}} has the 5-a-day account take only
+signals whose opening volume (09:20-09:30) is at least 1.5x its 20-day median (research.py's one lead; a signal whose
+opening volume is not known is left out too, as research.py does). A filtered signal never reaches nse-budget.
+
 Every long signal the main account plans (after Claude's veto and the cost filter) goes to each account in turn:
 nse-budget sizes it on the account's cash, a fresh quote, nse-risk checks it on the account's rules (its cap, its
 daily loss, its cash), autopilot-approve and the paper broker. Each account's open trades get the same paper-check
@@ -45,6 +50,39 @@ def caps_of(settings):
         if n > 0 and n not in out:
             out.append(n)
     return out
+
+
+def filter_of(settings, cap):
+    """This account's own filter ({"min_open_rvol": 1.5}), or None. Keyed "cap5" (or "5") under accounts.filters."""
+    a = settings_of(settings) or {}
+    fs = a.get("filters") or {}
+    f = fs.get(name_of(cap)) or fs.get(str(int(cap))) or {}
+    out = {}
+    try:
+        x = float(f.get("min_open_rvol"))
+        if x > 0:
+            out["min_open_rvol"] = x
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return out or None
+
+
+def filter_words(f):
+    """The filter in a few words, for the account's label: "opening volume 1.5x or more"."""
+    if not f:
+        return None
+    return "opening volume %gx or more" % f["min_open_rvol"]
+
+
+def filter_reason(f, rvol):
+    """Why the filter keeps this signal out, or None when it lets it through."""
+    if not f or "min_open_rvol" not in f:
+        return None
+    if rvol is None:
+        return "opening volume not known (fewer than 5 archived days, or no volume yet), so the filter leaves it out"
+    if rvol < f["min_open_rvol"]:
+        return "opening volume %.2fx its 20-day median, under the filter's %gx" % (rvol, f["min_open_rvol"])
+    return None
 
 
 def name_of(cap):
@@ -156,6 +194,8 @@ def all_summaries(home, day, settings, main_cfg):
         if not os.path.isdir(path):
             continue
         s = day_summary(path, day)
-        rows.append(dict(s, name=name_of(cap), label="%d trades a day" % cap, cap=cap, main=False))
+        f = filter_of(settings, cap)
+        label = "%d trades a day" % cap + (", %s only" % filter_words(f) if f else "")
+        rows.append(dict(s, name=name_of(cap), label=label, cap=cap, main=False, filter=f))
     rows.sort(key=lambda r: (r["cap"], not r["main"]))
     return rows

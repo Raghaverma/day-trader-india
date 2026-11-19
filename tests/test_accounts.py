@@ -4,6 +4,7 @@ runs the real scripts on the 13 November 2026 fixtures, so every account takes t
 import json
 import os
 import unittest
+from unittest import mock
 
 from _load import ROOT, FIX
 from test_autopilot import HomeBase, CFG_PATH, DAY, text, utc, ac, nc, report, run_day
@@ -25,6 +26,24 @@ class Config(unittest.TestCase):
         self.assertEqual(accounts.caps_of({"accounts": {"enabled": True, "caps": [5, "8", 5, 0, "x", 10]}}), [5, 8, 10])
         self.assertEqual(accounts.caps_of({"accounts": {"enabled": False, "caps": [5]}}), [])
         self.assertEqual(accounts.caps_of({}), [])
+
+    def test_an_accounts_own_filter(self):
+        on = {"accounts": {"enabled": True, "caps": [5, 8], "filters": {"cap5": {"min_open_rvol": 1.5}}}}
+        self.assertEqual(accounts.filter_of(on, 5), {"min_open_rvol": 1.5})
+        self.assertIsNone(accounts.filter_of(on, 8))
+        self.assertEqual(accounts.filter_of({"accounts": {"enabled": True, "filters": {"5": {"min_open_rvol": "2"}}}},
+                                            5), {"min_open_rvol": 2.0})
+        for bad in ({"min_open_rvol": 0}, {"min_open_rvol": "x"}, {}, "1.5"):
+            self.assertIsNone(accounts.filter_of({"accounts": {"enabled": True, "filters": {"cap5": bad}}}, 5))
+        self.assertIsNone(accounts.filter_of(dict(on, accounts=dict(on["accounts"], enabled=False)), 5))
+        f = {"min_open_rvol": 1.5}
+        self.assertIsNone(accounts.filter_reason(f, 1.5))
+        self.assertIsNone(accounts.filter_reason(f, 3.44))
+        self.assertEqual(accounts.filter_reason(f, 1.11),
+                         "opening volume 1.11x its 20-day median, under the filter's 1.5x")
+        self.assertIn("not known", accounts.filter_reason(f, None))
+        self.assertIsNone(accounts.filter_reason(None, 0.2))
+        self.assertEqual(accounts.filter_words(f), "opening volume 1.5x or more")
 
 
 class InTheDay(HomeBase):
@@ -97,6 +116,57 @@ class InTheDay(HomeBase):
         with open(self.acc("config.json"), "w") as fh:
             json.dump(c, fh)
         self.assertEqual(self.day("%s 10:05" % DAY).accounts(), [])
+
+    def with_filter(self):
+        self.settings["accounts"]["filters"] = {"cap5": {"min_open_rvol": 1.5}}
+        self.write_settings()
+
+    def test_a_filter_keeps_out_a_signal_with_too_little_opening_volume(self):
+        self.with_filter()
+        with mock.patch.object(run_day.Day, "open_rvol", return_value=1.11):
+            self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual(c["open_rvol"], 1.11)
+        self.assertEqual(c["outcome"], "traded")                          # the main account has no filter
+        self.assertEqual(c["accounts"]["cap5"], {"outcome": "filtered", "open_rvol": 1.11,
+                                                 "reason": "opening volume 1.11x its 20-day median, under the "
+                                                           "filter's 1.5x"})
+        paper = os.path.join(self.d, "accounts", "cap5", "state", "paper.json")
+        self.assertEqual((ac.read_json(paper) or {}).get("trades") or [], [])
+        self.assertFalse(os.path.exists(self.acc("plan.json")))           # never sized, never asked
+        rep = self.doc("reports", DAY + ".json")
+        a = rep["accounts"][1]
+        self.assertEqual((a["label"], a["filter"], a["orders"]),
+                         ("5 trades a day, opening volume 1.5x or more only", {"min_open_rvol": 1.5}, 0))
+        self.assertEqual(a["signals"], [{"symbol": "RELIANCE", "open_rvol": 1.11, "outcome": "filtered",
+                                         "reason": c["accounts"]["cap5"]["reason"]}])
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("| 5 trades a day, opening volume 1.5x or more only | ₹2,500 | 0 | 0 | 0 | 0 | 0 |", md)
+        self.assertIn("The 5-a-day account has a filter the others do not", md)
+        self.assertIn("| RELIANCE | 1.11x | kept out |", md)
+        self.assertIn("Let through 0 of 1 signals, kept out 1.", md)
+        self.assertIn("5 trades a day, opening volume 1.5x or more only:", progress.account_lines(rep)[1])
+
+    def test_a_filter_lets_a_signal_with_enough_opening_volume_through(self):
+        self.with_filter()
+        with mock.patch.object(run_day.Day, "open_rvol", return_value=2.4):
+            self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual(c["accounts"]["cap5"]["outcome"], "traded")
+        mine = self.doc("accounts", "cap5", "state", "paper.json")["trades"]
+        self.assertEqual([(t["symbol"], t["qty"], t["exit_reason"], t["pnl_net"]) for t in mine],
+                         [("RELIANCE", 37, "target", 328.4)])
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("| RELIANCE | 2.40x | let through | traded |", md)
+
+    def test_a_filter_leaves_out_a_signal_whose_opening_volume_is_not_known(self):
+        self.with_filter()
+        self.replay()                                     # no market data in a test: not known
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertIsNone(c["open_rvol"])
+        self.assertEqual(c["accounts"]["cap5"]["outcome"], "filtered")
+        self.assertIn("not known", c["accounts"]["cap5"]["reason"])
+        self.assertIn("| RELIANCE | not known | kept out |", text(os.path.join(self.d, "reports", DAY + ".md")))
 
     def test_off_by_default(self):
         self.settings.pop("accounts")

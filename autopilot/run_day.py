@@ -284,6 +284,7 @@ class Day(object):
                 self.runner.note("accounts", account=accounts.name_of(cap), error=ac.guard(cfg))
                 continue
             out.append({"name": accounts.name_of(cap), "cap": cap, "home": path, "cfg": cfg,
+                        "filter": accounts.filter_of(self.settings, cap),
                         "runner": ac.Runner(path, self.day, self.settings, getattr(self.runner, "now_text", None))})
         self._accounts = out
         return out
@@ -301,12 +302,17 @@ class Day(object):
             if (out.get(a["name"]) or {}).get("outcome"):
                 continue
             try:
-                out[a["name"]] = self.account_trade(a, sym, plan_path)
+                out[a["name"]] = self.account_trade(a, sym, plan_path, c)
             except Exception as e:                   # an account's error is its own
                 out[a["name"]] = {"outcome": "error", "reason": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
         self.save()
 
-    def account_trade(self, a, sym, plan_path):
+    def account_trade(self, a, sym, plan_path, c=None):
+        if a.get("filter"):              # the account's own rule (accounts.filters), before anything is asked
+            rvol = self.signal_rvol(c, sym)
+            why = accounts.filter_reason(a["filter"], rvol)
+            if why:
+                return {"outcome": "filtered", "reason": why, "open_rvol": rvol}
         why = accounts.cap_reason(a["home"], a["cfg"], self.day)
         if why:
             return {"outcome": "shadow", "reason": why}
@@ -377,6 +383,28 @@ class Day(object):
                         c["side"] = "short"
                     self.finish(c, "error", "%s: %s" % (type(e).__name__, e))
 
+    def open_rvol(self, sym):
+        """Today's opening volume (09:20-09:30) over its 20-day median (market.opening_rvol), once per tick; None
+        before 09:30, without a fetcher, or when it cannot be worked out."""
+        memo = self.__dict__.setdefault("_open_rvol", {})
+        if sym not in memo:
+            v = None
+            if self.fetch and self.at_least("09:30"):
+                try:
+                    v = market.opening_rvol(self.home, self.fetch, sym, self.day)
+                except Exception:
+                    v = None
+            memo[sym] = v
+        return memo[sym]
+
+    def signal_rvol(self, c, sym):
+        """The signal's opening volume, kept on the candidate so every account and the report see the same number."""
+        if c is None:
+            return self.open_rvol(sym)
+        if c.get("open_rvol") is None:
+            c["open_rvol"] = self.open_rvol(sym)
+        return c["open_rvol"]
+
     def tags_for(self, sym, at):
         """What was true when the signal fired: the regime before the open, the Nifty's move so far, the rank."""
         if not self.settings.get("tags") and not self.settings.get("rank_file"):
@@ -394,13 +422,9 @@ class Day(object):
                 idx = (ph.get("index_by_bar") or {}).get(earlier[-1]) if earlier else None
             if idx and idx.get("tag"):
                 tags["nifty_today"] = idx["tag"]
-            if self.fetch and self.at_least("09:30"):
-                try:            # opening volume against its 20-day median: research.py's lead, measured live
-                    band = market.rvol_band(market.opening_rvol(self.home, self.fetch, sym, self.day))
-                except Exception:
-                    band = None
-                if band:
-                    tags["open_volume"] = band
+            band = market.rvol_band(self.open_rvol(sym))    # research.py's lead, measured live
+            if band:
+                tags["open_volume"] = band
         rank = rank_tag(self.settings.get("rank_file"), sym, self.ist.date())
         if rank:
             tags["rank"] = rank
@@ -467,6 +491,8 @@ class Day(object):
             tags = self.tags_for(sym, h.get("at"))
             if tags is not None:
                 c["tags"] = tags
+            if self.settings.get("tags") or any(a.get("filter") for a in self.accounts()):
+                c["open_rvol"] = self.open_rvol(sym)
             self.st["candidates"][sym] = c
         c["tries"] = c.get("tries", 0) + 1
         run = self.runner.run
