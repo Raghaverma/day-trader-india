@@ -503,6 +503,24 @@ def placed_today(state, today):
             if r.get("status") == "placed" and rec_day(r) == today]
 
 
+def cancelled_today(state, today):
+    """Fingerprints of today's entries the paper broker cancelled unfilled (entry_ttl_minutes or flat_by): they
+    bought nothing, so they hold no trade slot and no daily loss."""
+    return {r.get("fingerprint") for r in (state or {}).get("orders", [])
+            if r.get("status") == "cancelled" and rec_day(r) == today and r.get("fingerprint")
+            and str(r.get("side", "buy")).lower() == "buy"}
+
+
+def pending_entries(paper, today):
+    """Rupees in today's paper LIMIT buys still waiting to fill (qty x limit): nse-budget and nse-risk hold this
+    cash back, so two signals in the same minute cannot both be sized on the same money."""
+    total = 0.0
+    for t in (paper or {}).get("trades") or []:
+        if t.get("status") == "open" and t.get("date") == today:
+            total += float(t.get("qty") or 0) * float(_f(t.get("limit")) or 0)
+    return round(total, 2)
+
+
 def realised_today(state, today):
     """{SYMBOL: net P&L of today's closed trades} from nse-broker's log (paper-check, fill)."""
     out = {}
@@ -732,7 +750,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     basis = "trigger" if str(c.get("loss_basis") or "limit").lower() == "trigger" else "limit"
     done_today = placed_today(state, today)
     count_today = len(done_today)
-    entries_today = [r for r in done_today if rec_is_entry(r)]
+    gone = cancelled_today(state, today)
+    entries_today = [r for r in done_today if rec_is_entry(r) and not (r.get("fingerprint") and
+                                                                       r.get("fingerprint") in gone)]
     loss_today = 0.0
     planned = {}
     for r in entries_today:
@@ -1205,6 +1225,8 @@ def main(argv=None):
     ap.add_argument("--portfolio", default=nc.tpath("portfolio.json"),
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default=nc.tpath("prices.json"))
+    ap.add_argument("--paper", default=nc.tpath("state", "paper.json"),
+                    help="the paper broker's trades: LIMIT buys still waiting to fill hold their cash")
     ap.add_argument("--state", default=nc.tpath("state", "broker.json"),
                     help="what nse-broker placed today (its folder also holds the NSE holiday cache)")
     ap.add_argument("--sec-list", help="NSE's sec_list.csv (or .csv.gz) from a file instead of the daily download")
@@ -1241,6 +1263,9 @@ def main(argv=None):
             raise RiskError("no orders in %s" % a.orders)
         created_at = doc.get("created_at") if isinstance(doc, dict) else None
         portfolio = read_json(a.portfolio, "portfolio", required=False)
+        waiting = pending_entries(read_json(a.paper, "paper trades", required=False), clock_day.isoformat())
+        if waiting and isinstance(portfolio, dict) and _f(portfolio.get("cash")) is not None:
+            portfolio = dict(portfolio, cash=_f(portfolio["cash"]) - waiting)
         pdoc = read_json(a.prices, "prices", required=False) or {}
         if not isinstance(pdoc, dict):
             raise RiskError("%s is not a prices.json object (nse-alerts writes it)" % a.prices)
@@ -1255,6 +1280,9 @@ def main(argv=None):
                     created_at=created_at, prices_doc=pdoc, prices_path=a.prices)
         if hnote:
             (res["warnings"] if hnote.startswith("could not") else res["notes"]).append(hnote)
+        if waiting:
+            res["notes"].append("%s of today's paper LIMIT buys are still waiting to fill: that cash is held back"
+                                % money(waiting))
         if not created_at:
             res["warnings"].append("%s has no created_at: only each order's plan date was checked, not how many "
                                    "minutes old it is" % a.orders)

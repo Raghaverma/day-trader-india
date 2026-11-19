@@ -390,8 +390,24 @@ def parse_gnews(data, ticker):
     return out, skipped
 
 
+# Names a news search confuses with something else (the exchange BSE, the footballer Trent, the word "Titan"):
+# the search for these is spelled out. Every other stock is searched by its company name.
+QUERY_OVERRIDES = {
+    "BSE": '"BSE Ltd" OR "BSE shares" OR "BSE stock"',
+    "ITC": '"ITC Ltd" OR "ITC shares" OR "ITC stock"',
+    "TRENT": '"Trent Ltd" OR "Trent shares" OR "Trent stock"',
+    "TITAN": '"Titan Company" OR "Titan shares"',
+    "BEL": '"Bharat Electronics"',
+    "HAL": '"Hindustan Aeronautics"',
+    "LT": '"Larsen & Toubro" OR "L&T shares"',
+    "M&M": '"Mahindra & Mahindra" OR "M&M shares"',
+}
+
+
 def gnews_query(name, symbol, hours):
     days = max(1, min(30, int(math.ceil(hours / 24.0))))
+    if symbol in QUERY_OVERRIDES:
+        return GNEWS % urllib.parse.quote_plus("(%s) when:%dd" % (QUERY_OVERRIDES[symbol], days))
     core = clean_name(name)
     q = ('"%s" when:%dd' % (core, days)) if core else ("%s NSE share when:%dd" % (symbol, days))
     return GNEWS % urllib.parse.quote_plus(q)

@@ -1248,7 +1248,12 @@ def walk(t, bars, now_ist, cfg=None, step=1):
         limit order: if the bar OPENS below its limit (a gap) it does not fill. The position stays open,
         an event ("stop_gap", ...) says so, and the stop fills at the limit only when a later bar's high
         reaches it; otherwise the trade is closed at flat_by at that bar's close;
-      * a bar that touches both the stop and the target counts as the stop.
+      * a bar that touches both the stop and the target counts as the stop;
+      * "entry_ttl_minutes" (config): a LIMIT buy that has not filled that many minutes after the order is
+        cancelled, so a breakout that ran away (or a pullback long after it) never fills late; off when unset;
+      * "paper_fill": "through" (config) fills a resting LIMIT buy only when a bar trades at least one tick
+        BELOW it (a touch at the limit can leave the order unfilled behind the queue); "touch", the default,
+        fills on a touch.
 
     Yahoo leaves many late-session 1-minute bars empty (most of 15:16-15:29), so empty bars are
     skipped. If the flat_by bar itself is empty, the trade closes at the close of the last real bar at
@@ -1260,6 +1265,11 @@ def walk(t, bars, now_ist, cfg=None, step=1):
     except ValueError as e:
         raise TicketError("paper trade %s: %s" % (t.get("id"), e))
     flat_at = datetime.datetime.combine(day, flat)
+    ttl = _f((cfg or {}).get("entry_ttl_minutes"))
+    ordered_at = _stamp(t.get("ordered_at"))
+    expire_at = ordered_at + datetime.timedelta(minutes=ttl) if ttl and ttl > 0 and ordered_at else None
+    through = str((cfg or {}).get("paper_fill") or "touch").lower() == "through"
+    fill_tick = float(nc.order_tick(t["limit"], t.get("symbol"), cfg)) if through and t.get("limit") else 0.0
     start = _stamp(t["fill_time"] if t["status"] == "filled" else t["ordered_at"])
     if t.get("checked_to"):
         start = max(start, _stamp(t["checked_to"]))
@@ -1301,7 +1311,12 @@ def walk(t, bars, now_ist, cfg=None, step=1):
                 events.append(("cancel", when, None, "the LIMIT buy never filled by flat_by %s" % nc.hhmm(flat)))
                 state = "cancelled"
                 break
-            if l <= t["limit"] + EPS:
+            if expire_at is not None and when >= expire_at:
+                events.append(("cancel", when, None, "the LIMIT buy did not fill within %s minutes of the order "
+                                                     "(entry_ttl_minutes)" % _num(ttl)))
+                state = "cancelled"
+                break
+            if l <= t["limit"] - fill_tick + EPS:
                 events.append(("fill", when, min(o, t["limit"]), None))
                 state = "filled"
                 fill_bar = when
@@ -1365,6 +1380,12 @@ def walk(t, bars, now_ist, cfg=None, step=1):
             events.append(("flat_by", when, c, "closed at the %s bar's close" % nc.hhmm(when.time())))
             state = "closed"
             break
+    if state == "open" and expire_at is not None and expire_at < flat_at and \
+            now_ist >= expire_at + datetime.timedelta(minutes=1) and not any(e[0] == "cancel" for e in events):
+        # the order's time ran out but no bar at or after it has data yet
+        events.append(("cancel", expire_at, None, "the LIMIT buy did not fill within %s minutes of the order "
+                                                  "(entry_ttl_minutes)" % _num(ttl)))
+        return events
     if state in ("open", "filled") and now_ist >= flat_at + datetime.timedelta(minutes=1):
         # flat_by has passed but no bar at or after it has data
         if state == "open":

@@ -175,6 +175,16 @@ def at_words(s):
     return "at the SL limit %s" % px(s["worst_exit"])
 
 
+def pending_entries(paper_path, today):
+    """Rupees in today's paper LIMIT buys still waiting to fill (qty x limit), from the paper broker's trades."""
+    doc = nc.read_json(paper_path) if paper_path and os.path.isfile(paper_path) else None
+    total = 0.0
+    for t in (doc or {}).get("trades") or []:
+        if isinstance(t, dict) and t.get("status") == "open" and t.get("date") == today:
+            total += float(t.get("qty") or 0) * float(t.get("limit") or 0)
+    return round(total, 2)
+
+
 def account(portfolio_path, prices_doc=None):
     """(cash, portfolio_total) from trader/portfolio.json, holdings valued at prices.json's prices
     (nse_common.portfolio_total). (None, None) when there is no portfolio file."""
@@ -650,6 +660,11 @@ def run_plan(a, cfg):
                          % (sym, ppath, ("from " + nc.ist_text(t)) if t else "undated",
                             _num(cfg.get("price_fresh_minutes") or 5)))
     cash, total = account(a.portfolio, pdoc)
+    waiting = pending_entries(a.paper, today)
+    if waiting:
+        cash = (cash if cash is not None else float(a.budget or cfg.get("budget") or 0)) - waiting
+        notes.append("%s of today's paper LIMIT buys are still waiting to fill: that cash is held back, so "
+                     "this trade is sized on the rest" % money(waiting))
     s = size_trade(plan, cfg, a.budget, limit, a.market, price, cash, today, portfolio_total=total)
     order = build_order(s)
     if order:
@@ -681,6 +696,8 @@ def main(argv=None):
                     help="a LIMIT buy at PRICE (the default is a LIMIT at the plan's entry)")
     ap.add_argument("--market", action="store_true", help="a MARKET buy instead (only if the user asked)")
     ap.add_argument("--prices", help="prices JSON (default trader/prices.json if it exists)")
+    ap.add_argument("--paper", default=nc.tpath("state", "paper.json"),
+                    help="the paper broker's trades: LIMIT buys still waiting to fill hold their cash")
     ap.add_argument("--portfolio", default=nc.tpath("portfolio.json"),
                     help="your account; its cash and value cap the size if it exists")
     ap.add_argument("--now", help="pretend it is this IST time, e.g. \"2026-11-13 10:05\"")

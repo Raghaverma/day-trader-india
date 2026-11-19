@@ -107,7 +107,9 @@ def cap_reason(path, cfg, day):
     only saves the requests for a trade that cannot be taken."""
     state = ac.read_json(os.path.join(path, "state", "broker.json")) or {}
     rows = [r for r in state.get("orders") or [] if isinstance(r, dict) and r.get("date") == day]
-    taken = sum(1 for r in rows if r.get("status") == "approved" and r.get("kind") == "entry")
+    gone = {r.get("fingerprint") for r in rows if r.get("status") == "cancelled" and r.get("fingerprint")}
+    taken = sum(1 for r in rows if r.get("status") == "approved" and r.get("kind") == "entry"
+                and r.get("fingerprint") not in gone)    # an entry cancelled unfilled frees its slot
     cap = int((cfg or {}).get("max_trades_per_day") or 0)
     if cap and taken >= cap:
         return "the day's cap of %d trades is used" % cap

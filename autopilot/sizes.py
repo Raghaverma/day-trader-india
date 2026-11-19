@@ -67,6 +67,12 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
     c = scaled_cfg(cfg, budget)
     c.update(overrides or {})
     margin = float(margin or 1.0)
+    ttl = float(c.get("entry_ttl_minutes") or 0)
+
+    def waiting(t, at):
+        """An order that never filled holds its slot, its loss and its cash while it waits: until
+        entry_ttl_minutes after the signal, or all day without one (the paper broker cancels it at flat_by)."""
+        return t["fill"] is None and (not ttl or at < t["at_m"] + ttl)
     cap = int(c.get("max_trades_per_day") or 0)
     daily = float(c.get("max_daily_loss_inr") or 0)
     equity = float(budget)
@@ -87,6 +93,8 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
             at = _mins(s["at"])
             open_cost = sum(t["qty"] * t["fill"] for t in taken
                             if t["fill"] is not None and (t["exit_m"] is None or t["exit_m"] > at))
+            open_cost += sum(t["qty"] * t["entry"] for t in taken if waiting(t, at))
+            live = [t for t in taken if t["fill"] is not None or waiting(t, at)]
             realised = sum(t["net"] for t in taken if t["exit_m"] is not None and t["exit_m"] <= at)
             cash = (equity + realised) * margin - open_cost
             qty = nc.size_qty(s["entry"], s["stop"], s["symbol"], c, budget=c["budget"] * margin, cash=cash,
@@ -100,12 +108,12 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
             if max_charges_r is not None and charges_r is not None and charges_r > max_charges_r:
                 skip("cost filter")
                 continue
-            if cap and len(taken) >= cap:
+            if cap and len(live) >= cap:
                 skip("trade cap")
                 continue
             ml = float(nc.loss_at_stop(qty, s["entry"], s["stop"], s["symbol"], c)["total"])
             used = sum(max(t["max_loss"], -t["net"] if t["exit_m"] is not None and t["exit_m"] <= at else 0)
-                       for t in taken)
+                       for t in live)
             if daily and used + ml > daily + 0.01:
                 skip("daily loss limit")
                 continue
@@ -114,7 +122,7 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
                  "result": s.get("result"), "max_loss": round(ml, 2),
                  "charges_r": round(charges_r, 3) if charges_r is not None else None,
                  "order_value": round(qty * s["entry"], 2), "volume_share": None,
-                 "exit_m": _mins(s["exit_at"]) if s.get("exit_at") else None, "net": 0.0, "gross": 0.0,
+                 "exit_m": _mins(s["exit_at"]) if s.get("exit_at") else None, "at_m": at, "net": 0.0, "gross": 0.0,
                  "charges": 0.0, "r": None}
             if s.get("bar_volume"):
                 t["volume_share"] = round(qty / float(s["bar_volume"]), 4)
@@ -156,6 +164,7 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
         totals["over_10pct_of_bar"] = sum(1 for x in shares if x > 0.10)
     for t in trades:
         t.pop("exit_m", None)
+        t.pop("at_m", None)
     return {"budget": float(budget), "label": label(budget), "trades": trades, "skipped": skipped, "days": days,
             "totals": totals}
 

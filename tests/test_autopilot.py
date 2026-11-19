@@ -225,7 +225,7 @@ class Replay(HomeBase):
         self.assertEqual(c["outcome"], "vetoed")
         self.assertIn("results today", c["reason"])
         self.assertEqual(self.doc("autopilot", DAY, "vetoes.json")["vetoes"],
-                         [{"symbol": "RELIANCE", "reason": "results today"}])
+                         [{"symbol": "RELIANCE", "reason": "results today", "category": "OTHER"}])
         self.assertEqual(self.doc("state", "paper.json")["trades"], [])
         rep = self.doc("reports", DAY + ".json")
         row = rep["shadows"]["rows"][0]
@@ -358,7 +358,10 @@ class Pieces(unittest.TestCase):
     def test_clean_vetoes(self):
         got = run_day.clean_vetoes([{"symbol": "reliance", "reason": "r"}, {"symbol": "RELIANCE"}, "junk",
                                     {"symbol": "ZZZ"}, {"reason": "no symbol"}], ["RELIANCE", "TCS"])
-        self.assertEqual(got, [{"symbol": "RELIANCE", "reason": "r"}])
+        self.assertEqual(got, [{"symbol": "RELIANCE", "reason": "r", "category": "OTHER"}])
+        got = run_day.clean_vetoes([{"symbol": "TCS", "reason": "r", "category": "regulatory or ban"},
+                                    {"symbol": "RELIANCE", "reason": "r", "category": "made up"}], ["RELIANCE", "TCS"])
+        self.assertEqual([v["category"] for v in got], ["REGULATORY_OR_BAN", "OTHER"])
 
     def test_calibration(self):
         c = report.calibration([(0.2, 1), (0.2, 0), (0.6, 1), (None, 1), (0.3, None)])

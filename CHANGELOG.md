@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.11.0
+
+### Execution closer to a real broker
+
+- **Entries expire** (`"entry_ttl_minutes"` in config.json, off when unset). The paper broker cancels a LIMIT buy
+  that has not filled that many minutes after the order, with the reason in the log, so a breakout that ran away
+  (19 Nov: M&M) never fills on a pullback long after (19 Nov: INDIGO, a late fill that stopped out).
+- **Fills on a trade-through** (`"paper_fill": "through"`, default `"touch"`). A resting LIMIT buy fills only when
+  a bar trades at least one tick below it: a touch at the limit can leave a real order unfilled behind the queue.
+  A LIMIT that is marketable when it is placed still fills at once.
+- **A cancelled entry frees its slot.** nse-risk, the autopilot and each paper account no longer count an entry the
+  paper broker cancelled unfilled against the day's trade cap or daily loss (19 Nov: M&M held a slot all day).
+- **Waiting entries hold their cash.** nse-budget and nse-risk subtract today's paper LIMIT buys still waiting to
+  fill from the cash, so signals in the same minute are sized one after another on what is left (19 Nov: three
+  orders came to ₹11.08 lakh against ₹9 lakh of usable cash).
+- **The simulators agree.** `sizes.simulate` (account sizes, what-ifs, trade caps) holds a waiting order's slot,
+  loss and cash until it expires, and the report's replays use the paper broker's walk with the same config.
+- **Claude's vetoes by category.** The pre-market prompt asks for RESULTS, CORPORATE_ACTION, NEGATIVE_NEWS,
+  REGULATORY_OR_BAN or OTHER with each veto; the report shows it, and the scorecard keeps each category's replayed
+  net and average R over all days, so a category that vetoes winners shows up.
+- **News searches for confusable names.** BSE, ITC, TRENT, TITAN, BEL, HAL, LT and M&M get a spelled-out Google News
+  search (`news.QUERY_OVERRIDES`), so the exchange BSE or a footballer named Trent stop showing up as company news.
+- 11 new tests.
+
 ## 1.10.0
 
 ### Paper accounts at 5, 8 and 10 trades a day

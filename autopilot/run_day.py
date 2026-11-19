@@ -249,6 +249,10 @@ class Day(object):
         doc = ac.read_json(self.path("vetoes.json")) or {}
         return {v["symbol"]: v.get("reason") or "" for v in doc.get("vetoes") or [] if v.get("symbol")}
 
+    def veto_categories(self):
+        doc = ac.read_json(self.path("vetoes.json")) or {}
+        return {v["symbol"]: v.get("category") or "OTHER" for v in doc.get("vetoes") or [] if v.get("symbol")}
+
     # ------------------------------------------------------------ paper trades
 
     def live_trades(self):
@@ -498,6 +502,7 @@ class Day(object):
 
         vetoed = self.vetoes()
         if sym in vetoed:
+            c["veto_category"] = self.veto_categories().get(sym) or "OTHER"
             self.finish(c, "vetoed", "Claude's pre-market veto: %s" % (vetoed[sym] or "no reason given"))
             return
         mx, cr = self.charges_r_limit(), c["plan"]["charges_r"]
@@ -561,7 +566,9 @@ class Day(object):
         this only saves running the Time Machine on a trade that cannot be taken."""
         state = ac.read_json(self.home_path("state", "broker.json")) or {}
         rows = [r for r in state.get("orders") or [] if isinstance(r, dict) and r.get("date") == self.day]
-        taken = sum(1 for r in rows if r.get("status") == "approved" and r.get("kind") == "entry")
+        gone = {r.get("fingerprint") for r in rows if r.get("status") == "cancelled" and r.get("fingerprint")}
+        taken = sum(1 for r in rows if r.get("status") == "approved" and r.get("kind") == "entry"
+                    and r.get("fingerprint") not in gone)    # an entry cancelled unfilled frees its slot
         cap = int(self.cfg.get("max_trades_per_day") or 0)
         if cap and taken >= cap:
             return "the day's cap of %d trades is used" % cap
@@ -734,6 +741,9 @@ def rank_tag(path, sym, today):
     return "top half" if v >= 0.5 else "bottom half"
 
 
+VETO_CATEGORIES = ("RESULTS", "CORPORATE_ACTION", "NEGATIVE_NEWS", "REGULATORY_OR_BAN", "OTHER")
+
+
 def clean_vetoes(raw, universe):
     allowed = set(universe)
     out, seen = [], set()
@@ -743,7 +753,9 @@ def clean_vetoes(raw, universe):
         sym = nc.nse_symbol(v.get("symbol") or "")
         if sym and sym in allowed and sym not in seen:
             seen.add(sym)
-            out.append({"symbol": sym, "reason": str(v.get("reason") or "")[:300]})
+            cat = re.sub(r"[^A-Z_]", "", str(v.get("category") or "").upper().replace(" ", "_"))
+            out.append({"symbol": sym, "reason": str(v.get("reason") or "")[:300],
+                        "category": cat if cat in VETO_CATEGORIES else "OTHER"})
     return out
 
 

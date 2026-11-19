@@ -383,6 +383,11 @@ def shadows(st, day, cfg, bars=None):
             rows.append({"symbol": sym, "side": c.get("side") or "long", "why": c.get("outcome"),
                          "at": (c.get("trigger") or {}).get("at"), "charges_r": (c.get("plan") or {}).get("charges_r"),
                          "result": "could not replay: %s" % ac.tail(str(e), 120)})
+    cands = {(c.get("side") or "long", c.get("symbol")): c for c in (st.get("candidates") or {}).values()}
+    for r in rows:
+        if r.get("why") == "vetoed":
+            r["veto_category"] = (cands.get((r.get("side") or "long", r["symbol"])) or {}).get("veto_category") \
+                or "OTHER"
     by_why = {}
     for r in rows:
         w = by_why.setdefault(r.get("why") or "?", {"n": 0, "replayed": 0, "net": 0.0, "wins": 0, "targets": 0,
@@ -609,6 +614,7 @@ def score_row(rep):
             "whatif": whatif_row(rep.get("whatif")),
             "caps": caps_row(rep.get("caps")),
             "accounts": accounts_row(rep.get("accounts")),
+            "vetoes": veto_row(rep["shadows"]["rows"]),
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
 
 
@@ -623,6 +629,39 @@ def whatif_row(wi):
         out[r["key"]] = {"label": r["label"], "budget": wi.get("budget"), "net": t["net"], "trades": t["trades"],
                          "wins": t["wins"], "charges": t["charges"]}
     return out
+
+
+def veto_row(rows):
+    """Claude's vetoes, replayed, by category: what sitting out cost or saved."""
+    out = {}
+    for s in rows:
+        if s.get("why") != "vetoed":
+            continue
+        v = out.setdefault(s.get("veto_category") or "OTHER", {"n": 0, "replayed": 0, "net": 0.0, "r": 0.0,
+                                                               "wins": 0})
+        v["n"] += 1
+        if s.get("net") is not None:
+            v["replayed"] += 1
+            v["net"] = round(v["net"] + s["net"], 2)
+            v["wins"] += 1 if s["net"] > 0 else 0
+        if s.get("r") is not None:
+            v["r"] = round(v["r"] + s["r"], 3)
+    return out
+
+
+def veto_totals(days, order):
+    out = {}
+    for d in order:
+        for cat, v in (days[d].get("vetoes") or {}).items():
+            t = out.setdefault(cat, {"days": 0, "n": 0, "replayed": 0, "net": 0.0, "r": 0.0, "wins": 0})
+            t["days"] += 1
+            for k in ("n", "replayed", "wins"):
+                t[k] += v.get(k) or 0
+            t["net"] = round(t["net"] + (v.get("net") or 0), 2)
+            t["r"] = round(t["r"] + (v.get("r") or 0), 3)
+    for t in out.values():
+        t["avg_r"] = round(t["r"] / t["replayed"], 3) if t["replayed"] else None
+    return dict(sorted(out.items()))
 
 
 def accounts_row(acc):
@@ -804,7 +843,8 @@ def scorecard(home, day=None, rep=None):
               "edge": edge([dict(o, day=d) for d in order for o in days[d].get("signal_rs") or []]),
               "sizes": size_totals(days, order), "whatif": whatif_totals(days, order),
               "caps": whatif_totals(days, order, "caps", _cap_rank),
-              "accounts": whatif_totals(days, order, "accounts", _cap_rank)}
+              "accounts": whatif_totals(days, order, "accounts", _cap_rank),
+              "vetoes": veto_totals(days, order)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
@@ -903,8 +943,9 @@ def blocks(rep, card, analysis=None):
         items.append("%d stop(s) gapped through the SL limit" % fn["stop_gaps"])
     out.append(("ul", items))
     if rep.get("vetoes"):
-        out.append(("p", "Claude's pre-market vetoes: " + "; ".join("%s (%s)" % (v["symbol"], v["reason"])
-                                                                    for v in rep["vetoes"])))
+        out.append(("p", "Claude's pre-market vetoes: " + "; ".join(
+            "%s (%s%s)" % (v["symbol"], (v["category"] + ": ") if v.get("category") else "", v["reason"])
+            for v in rep["vetoes"])))
     wi = rep.get("whatif")
     if isinstance(wi, dict) and wi.get("error"):
         out.append(("h2", "Why so few trades"))
@@ -1062,6 +1103,12 @@ def blocks(rep, card, analysis=None):
                       ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
                       if (v.get("per_day") or {}).get("ci95") else "n/a"] for lab, v in t["sizes"].items()]))
 
+    if t.get("vetoes"):
+        out.append(("p", "Claude's vetoes by category, all days, replayed (positive net = the veto cost money; "
+                         "negative = it saved money):"))
+        out.append(("table", ["Category", "Days", "Vetoes", "Replayed", "Green", "Net if taken", "Average R"],
+                    [[cat, v["days"], v["n"], v["replayed"], v["wins"], signed_money(v["net"]), r_text(v["avg_r"])]
+                     for cat, v in t["vetoes"].items()]))
     if t.get("accounts"):
         out.append(("p", "The paper accounts, all days (each trades for real on paper at its own cap):"))
         out.append(("table", ["Account", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",

@@ -924,6 +924,28 @@ class RiskJsonStampsEveryResult(unittest.TestCase):
         self.assertEqual((res["pass_minutes"], res["pass_until_ist"]), (3.0, "2026-11-13 10:08"))
 
 
+class CancelledAndWaitingEntries(unittest.TestCase):
+    """An entry the paper broker cancelled unfilled holds no slot and no daily loss; a LIMIT buy still waiting
+    to fill holds its cash."""
+
+    def test_a_cancelled_entry_frees_its_slot_and_its_loss(self):
+        c = cfg(max_trades_per_day=1)
+        state = {"orders": [placed("TCS", kind="entry", fingerprint="abc")]}
+        self.assertIn("trades:", reasons(run_check([rel()], c, state=state)))
+        state["orders"].append(placed("TCS", status="cancelled", fingerprint="abc"))
+        res = run_check([rel()], c, state=state)
+        self.assertEqual(verdicts(res), ["PASS"])
+        self.assertEqual(res["today"]["entries_placed"], 0)
+        self.assertEqual(res["today"]["loss_at_risk"], 0)
+
+    def test_pending_entries(self):
+        paper = {"trades": [{"status": "open", "date": TODAY, "qty": 10, "limit": 100.0},
+                            {"status": "filled", "date": TODAY, "qty": 99, "limit": 1.0},
+                            {"status": "open", "date": "2026-11-12", "qty": 99, "limit": 1.0}]}
+        self.assertEqual(check.pending_entries(paper, TODAY), 1000.0)
+        self.assertEqual(check.pending_entries(None, TODAY), 0.0)
+
+
 class HomeCase(unittest.TestCase):
     """main() the way a real run goes: every default path inside the trader folder NSE_TRADER_HOME names."""
 

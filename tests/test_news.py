@@ -90,7 +90,10 @@ class Feeds(unittest.TestCase):
         self.assertIn("q=%22Reliance+Industries%22+when%3A3d", url)
         self.assertIn("hl=en-IN&gl=IN&ceid=IN:en", url)
         self.assertIn("when%3A1d", news.gnews_query("Tata Consultancy Services Limited", "TCS", 6))
-        self.assertIn("q=M%26M+NSE+share", news.gnews_query(None, "M&M", 24))
+        self.assertIn("q=J%26KBANK+NSE+share", news.gnews_query(None, "J&KBANK", 24))
+        # names a search confuses with something else are spelled out
+        self.assertIn("q=%28%22BSE+Ltd%22+OR+%22BSE+shares%22", news.gnews_query("BSE Limited", "BSE", 24))
+        self.assertIn("%22Mahindra+%26+Mahindra%22", news.gnews_query(None, "M&M", 24))
         self.assertEqual(news.clean_name("Amber Enterprises (I) Ltd"), "Amber Enterprises (I)")
         self.assertEqual(news.clean_name("TD Power Systems Ltd."), "TD Power Systems")
 
