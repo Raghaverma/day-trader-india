@@ -39,5 +39,9 @@
     5000000,
     10000000,
     50000000
-  ]
+  ],
+  "journal": {
+    "enabled": true,
+    "dir": "~/Desktop/NSE Trading P&L"
+  }
 }

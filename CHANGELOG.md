@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.7.0
+
+### The P&L journal: every trade, what it made or lost, and why
+
+- **`autopilot/journal.py`.** After the day's report, the email and the bar archive, the end of day rebuilds a
+  journal folder (`"journal": {"enabled": true, "dir": "~/Desktop/NSE Trading P&L"}` in autopilot.json):
+  - `Summary.md`: running totals, the reasons trades won or lost, the signals not taken, and each day
+  - `P&L ledger.csv`: one row per paper order across all days
+  - `Daily P&L.csv`: one row per day, with the running total
+  - `days/<date>.md`: each trade's story and the day's analysis
+  - `My notes.md`: never touched again
+- **The reason is computed, not guessed.** For each order it reads the 1-minute bars and puts it in one
+  category: target hit, gave back a winner (+1R or more before the stop), late fill on a pullback (the LIMIT
+  filled 15+ minutes after the order, after the breakout had run without it), failed breakout (never +0.5R),
+  squared off at 15:10, or never filled because the price ran away (with what it would have made). It also
+  records:
+  - the Nifty's move during the trade
+  - what the stock did after the stop
+  - how weak the breakout was
+  - the Time Machine's odds
+- **Day-level reasons.** When the trade cap was used up, and on which signals. What the signals the cap kept
+  out would have made. How LIMIT orders at the breakout price treated the runners and the failures.
+- **Rebuilt each time.** The journal is rebuilt from the trader folder's own records, so it can be deleted
+  and rebuilt with `run_day.py journal`. If macOS refuses the folder, it goes to `<trader folder>/journal`
+  and says so. A journal failure never fails the end of day.
+- **Tests.** 11 new.
+
 ## 1.6.0
 
 ### A progress email every half hour

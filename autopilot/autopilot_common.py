@@ -44,6 +44,8 @@ DEFAULTS = {
     "mail": {"enabled": False, "from": "", "to": [], "keychain_service": "nse-autopilot-gmail",
              "host": "smtp.gmail.com", "port": 465},
     "notify": True,
+    # the P&L journal (journal.py): every trade, what it made or lost, and why, rebuilt after each report
+    "journal": {"enabled": False, "dir": "~/Desktop/NSE Trading P&L"},
     # Measurements (autopilot.example.json turns them on; without the keys they are off):
     # skip a long signal whose round-trip charges at the stop exceed this share of its risk (R); every signal
     # skipped is replayed in the report, so the filter's cost or saving is measured. null = off.
