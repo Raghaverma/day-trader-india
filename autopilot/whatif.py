@@ -27,6 +27,7 @@ import sizes
 nc = ac.nc
 DEFAULT_MARGIN = 5.0
 STRESS = (5, 10, 20)
+DEFAULT_CAPS = (3, 5, 8, 10)
 
 
 def _cfg_text(cfg):
@@ -73,7 +74,7 @@ def _row(label, sim, key):
     worst = min(closed, key=lambda x: x["net"]) if closed else None
     big = max(sim["trades"], key=lambda x: x["order_value"]) if sim["trades"] else None
     return {"key": key, "label": label, "totals": t, "skipped": sim["skipped"], "peak_open": peak_open(sim["trades"]),
-            "trades": [{k: x.get(k) for k in ("symbol", "at", "exit_at", "qty", "order_value", "fill", "exit",
+            "trades": [{k: x.get(k) for k in ("day", "symbol", "at", "exit_at", "qty", "order_value", "fill", "exit",
                                               "result", "net",
                                               "charges", "max_loss", "r")} for x in sim["trades"]],
             "worst_trade": {"symbol": worst["symbol"], "net": worst["net"]} if worst else None,
@@ -102,6 +103,38 @@ def build(rep, cfg, margin=DEFAULT_MARGIN, max_charges_r=None):
                    "all_in_margin")]
     return {"limits": limits(rep, cfg), "ladder": ladder, "all_in": all_in, "margin": float(margin),
             "signals": len(sigs), "budget": budget}
+
+
+def cap_overrides(cfg, budget, cap):
+    """N trades a day: the cap, and a daily loss limit of N x the max loss a trade (at this budget), so the Nth
+    trade is never kept out by the loss rule's reservation. Every other rule as configured."""
+    per = float(sizes.scaled_cfg(cfg, budget).get("max_loss_per_trade_inr") or 0)
+    return {"max_trades_per_day": int(cap), "max_daily_loss_inr": round(per * int(cap), 2) if per else 0}
+
+
+def trade_caps(signals, cfg, caps=DEFAULT_CAPS, budget=None, max_charges_r=None):
+    """The same signals at each number of trades a day, at one budget (the config's unless given). The rows are
+    "cap3", "cap5", ... in the order asked; each carries its daily loss limit, totals, skips, trades and the most
+    money in stock at once."""
+    budget = float(budget or cfg.get("budget") or 0)
+    if budget <= 0:
+        raise ValueError("config.json has no budget")
+    out = []
+    for n in caps:
+        over = cap_overrides(cfg, budget, n)
+        sim = sizes.simulate(signals, cfg, budget, max_charges_r, overrides=over)
+        row = _row("%d trades a day" % int(n), sim, "cap%d" % int(n))
+        row.update(cap=int(n), daily_loss=over["max_daily_loss_inr"], budget=budget, days=sim["days"])
+        out.append(row)
+    return out
+
+
+def caps_for_report(rep, cfg, caps=DEFAULT_CAPS, budget=None, max_charges_r=None):
+    rows = trade_caps(sizes.from_report(rep), cfg, caps, budget, max_charges_r)
+    for r in rows:
+        r.pop("days", None)
+    return {"budget": rows[0]["budget"] if rows else float(budget or cfg.get("budget") or 0),
+            "live_cap": int(cfg.get("max_trades_per_day") or 0), "rows": rows}
 
 
 def limits(rep, cfg):

@@ -891,6 +891,22 @@ class Study(unittest.TestCase):
             self.assertEqual(study.main(["--calibrate"]), 0)
         self.assertIn("5-minute replay vs 1-minute replay on the 1 days", out.getvalue())
 
+    def test_trades_a_day_over_the_archive(self):
+        import study
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        fixture_archive(d)
+        shutil.copy(CFG_PATH, os.path.join(d, "config.json"))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"NSE_TRADER_HOME": d}), redirect_stdout(out):
+            self.assertEqual(study.main(["--caps", "3,10", "--budget", "1000000"]), 0)
+        self.assertIn("Trades a day at ₹10 lakh", out.getvalue())
+        self.assertIn("10 trades a day", out.getvalue())
+        md = text(os.path.join(d, "reports", "caps-study.md"))
+        self.assertIn("## 10 trades a day (daily loss limit ₹50,000)", md)
+        with open(os.path.join(d, "reports", "caps-study.csv"), encoding="utf-8") as fh:
+            self.assertEqual(fh.readline().strip().split(",")[:3], ["trades_a_day", "day", "symbol"])
+
 
 def five_minute_bars(rows, start="09:55"):
     """[(o, h, l, c)] one every 5 minutes from `start` on 13 Nov -> walk()'s bar tuples."""

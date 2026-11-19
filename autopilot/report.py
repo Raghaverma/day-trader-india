@@ -488,8 +488,22 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
     wi = settings.get("whatif") or {}
     if wi.get("enabled"):
         rep["whatif"] = what_if(rep, cfg, wi.get("margin"), (settings.get("cost_filter") or {}).get("max_charges_r"))
+    tc = settings.get("trade_caps") or {}
+    if tc.get("enabled"):
+        rep["caps"] = trade_caps(rep, cfg, tc.get("caps"), tc.get("budget"),
+                                 (settings.get("cost_filter") or {}).get("max_charges_r"))
     rep["stocks"] = stock_files(home, day, rep)
     return write_outputs(home, day, rep, None)
+
+
+def trade_caps(rep, cfg, caps=None, budget=None, max_charges_r=None):
+    """The day's signals at 3, 5, 8 and 10 trades a day (whatif.caps_for_report); a failure never stops the report."""
+    import whatif
+    try:
+        return whatif.caps_for_report(rep, cfg, [int(c) for c in (caps or whatif.DEFAULT_CAPS)], budget,
+                                      None if max_charges_r is None else float(max_charges_r))
+    except Exception as e:
+        return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
 
 
 def instruments(cfg, settings):
@@ -581,6 +595,7 @@ def score_row(rep):
                                    "wins": s["totals"]["wins"], "charges": s["totals"]["charges"]}
                       for s in rep.get("sizes") or [] if isinstance(rep.get("sizes"), list)},
             "whatif": whatif_row(rep.get("whatif")),
+            "caps": caps_row(rep.get("caps")),
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
 
 
@@ -597,14 +612,23 @@ def whatif_row(wi):
     return out
 
 
+def caps_row(tc):
+    if not isinstance(tc, dict) or tc.get("error"):
+        return {}
+    return {r["key"]: {"label": r["label"], "budget": r["budget"], "net": r["totals"]["net"],
+                       "trades": r["totals"]["trades"], "wins": r["totals"]["wins"], "charges": r["totals"]["charges"]}
+            for r in tc.get("rows") or []}
+
+
 WHATIF_ORDER = ("ladder0", "ladder1", "ladder2", "ladder3", "all_in_1x", "all_in_margin")
 
 
-def whatif_totals(days, order):
-    """All days for each what-if: net, trades, wins, charges, the worst and best day, the per-day mean in rupees."""
+def whatif_totals(days, order, field="whatif", rank=None):
+    """All days for each what-if (or each trade cap, field="caps"): net, trades, wins, charges, the worst and best
+    day, the per-day mean in rupees."""
     out = {}
     for d in order:
-        for key, v in (days[d].get("whatif") or {}).items():
+        for key, v in (days[d].get(field) or {}).items():
             s = out.setdefault(key, {"label": v.get("label"), "budget": v.get("budget"), "days": 0, "net": 0.0,
                                      "trades": 0, "wins": 0, "charges": 0.0, "daily": []})
             s["label"] = v.get("label") or s["label"]
@@ -621,7 +645,15 @@ def whatif_totals(days, order):
         s["worst_day"] = min(daily) if daily else None
         s["best_day"] = max(daily) if daily else None
         s["return_pct"] = round(100 * s["net"] / s["budget"], 3) if s.get("budget") else None
-    return {k: out[k] for k in sorted(out, key=lambda k: WHATIF_ORDER.index(k) if k in WHATIF_ORDER else 99)}
+    rank = rank or (lambda k: WHATIF_ORDER.index(k) if k in WHATIF_ORDER else 99)
+    return {k: out[k] for k in sorted(out, key=rank)}
+
+
+def _cap_rank(key):
+    try:
+        return int(str(key).replace("cap", ""))
+    except ValueError:
+        return 999
 
 
 # ---------------------------------------------------------------- is there an edge? (every number in R)
@@ -750,7 +782,8 @@ def scorecard(home, day=None, rep=None):
               "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
               "by_setup": setup, "shadows": sh,
               "edge": edge([dict(o, day=d) for d in order for o in days[d].get("signal_rs") or []]),
-              "sizes": size_totals(days, order), "whatif": whatif_totals(days, order)}
+              "sizes": size_totals(days, order), "whatif": whatif_totals(days, order),
+              "caps": whatif_totals(days, order, "caps", _cap_rank)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
@@ -850,6 +883,12 @@ def blocks(rep, card, analysis=None):
         out.append(("p", "Could not work it out today: %s" % wi["error"]))
     elif wi:
         out.extend(why_blocks(wi))
+    tc = rep.get("caps")
+    if isinstance(tc, dict) and tc.get("error"):
+        out.append(("h2", "Trades a day"))
+        out.append(("p", "Could not work them out today: %s" % tc["error"]))
+    elif tc and tc.get("rows"):
+        out.extend(cap_blocks(tc))
 
     out.append(("h2", "Did the Time Machine call it?"))
     tm = rep["time_machine"]
@@ -995,6 +1034,16 @@ def blocks(rep, card, analysis=None):
                       ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
                       if (v.get("per_day") or {}).get("ci95") else "n/a"] for lab, v in t["sizes"].items()]))
 
+    if t.get("caps"):
+        out.append(("p", "Trades a day, all days (same signals, each cap with its own daily loss limit):"))
+        out.append(("table", ["Trades a day", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",
+                              "Average day", "95% interval a day"],
+                    [[v["label"], v["days"], v["trades"], v["wins"], signed_money(v["net"]),
+                      ("%+.2f%%" % v["return_pct"]) if v.get("return_pct") is not None else "n/a",
+                      signed_money(v.get("worst_day")), signed_money(v.get("best_day")),
+                      signed_money((v.get("per_day") or {}).get("mean_r")),
+                      ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
+                      if (v.get("per_day") or {}).get("ci95") else "n/a"] for v in t["caps"].values()]))
     if t.get("whatif"):
         out.append(("p", "Why so few trades, and the whole principal, all days (same signals, each way's rules):"))
         out.append(("table", ["Way", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",
@@ -1088,6 +1137,36 @@ def why_blocks(wi):
                 [[r["label"], r["totals"]["trades"], r["totals"]["wins"], signed_money(r["totals"]["net"]),
                   "%+.2f%%" % r["totals"]["return_pct"], money(r["peak_open"]), _skips(r["skipped"])]
                  for r in wi["ladder"]]))
+    return out
+
+
+def cap_blocks(tc):
+    rows = tc["rows"]
+    caps = [r["cap"] for r in rows]
+    head = "%s trades a day at %s" % (", ".join(str(c) for c in caps[:-1]) + (" and %d" % caps[-1]
+                                                                             if len(caps) > 1 else str(caps[0])),
+                                      _lab(tc["budget"]))
+    out = [("h2", head)]
+    out.append(("p", "The day's signals run through the paper account's rules at each number of trades a day, at "
+                     "%s: the max loss a trade, the cost filter, Claude's veto, the cash (less the amount kept back, "
+                     "no margin) and a daily loss limit of that many times the max loss a trade, so the last trade "
+                     "is never kept out by the loss rule. Same fills and exits as the paper broker. The paper "
+                     "account itself trades %s a day." % (_lab(tc["budget"]), tc.get("live_cap") or "?")))
+    out.append(("table", ["Trades a day", "Daily loss limit", "Trades", "Won", "Net", "Charges", "Return", "Avg R",
+                          "Most in stock at once", "Kept out"],
+                [[r["cap"], money(r["daily_loss"]), r["totals"]["trades"], r["totals"]["wins"],
+                  signed_money(r["totals"]["net"]), money(r["totals"]["charges"]), "%+.2f%%" % r["totals"]["return_pct"],
+                  r_text(r["totals"]["avg_r"]), money(r["peak_open"]), _skips(r["skipped"])] for r in rows]))
+    trows = [[r["cap"], x["symbol"], x["at"], x["qty"], money(x["order_value"]), _px(x["fill"]), _px(x["exit"]),
+              EXIT_WORDS.get(x["result"], x["result"] or ""),
+              signed_money(x["net"]) if x["fill"] is not None else "never filled", r_text(x.get("r"))]
+             for r in rows for x in r["trades"]]
+    if trows:
+        out.append(("table", ["Trades a day", "Stock", "Signal", "Qty", "Order", "In", "Out", "Exit", "Net", "R"],
+                    trows))
+    out.append(("p", "When the money is already in open trades, a later signal is kept out (\"no size fits\"): "
+                     "at %s, sized to lose the max loss at the stop, only two or three orders fit at once, so a "
+                     "higher cap adds trades only when earlier ones have closed." % _lab(tc["budget"])))
     return out
 
 

@@ -68,6 +68,9 @@ DEFAULTS = {
     # the report's "why only N trades" (the limits lifted one at a time) and "the whole principal" (every trade
     # all in, with the money alone and with `margin`x intraday leverage). Measurement only: nothing is traded.
     "whatif": {"enabled": False, "margin": 5},
+    # the same signals at several trades a day (each with a daily loss limit of N x the max loss a trade), at one
+    # budget (null = config.json's). Measurement only: the paper account keeps config.json's cap.
+    "trade_caps": {"enabled": False, "caps": [3, 5, 8, 10], "budget": None},
     # keep the day's 1- and 5-minute bars (Yahoo drops them after 30 / 60 days) in archive/ in the trader folder
     "archive": {"enabled": False, "pause_s": 0.4},
     # test and replay only (NSE_TEST_MODE=1): extra arguments per step, "{sym}" is replaced by the symbol,

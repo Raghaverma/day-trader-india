@@ -77,12 +77,46 @@ class Limits(unittest.TestCase):
         self.assertEqual((L["capped"], L["capped_net"]), (5, 1234.5))
 
 
+class TradeCaps(unittest.TestCase):
+    cfg = nc.load_config(CFG_PATH)            # ₹1,00,000: ₹500 a trade, ₹1,500 a day, 3 trades
+
+    def sigs(self, n=10, exit_=1344.3, result="target"):
+        """n signals, each closed a minute after it fired, so the cash never binds."""
+        return [sig(symbol="S%02d" % i, at="%02d:%02d" % (10 + i // 6, (i % 6) * 10), exit=exit_, result=result,
+                    exit_at="%02d:%02d" % (10 + i // 6, (i % 6) * 10 + 1)) for i in range(n)]
+
+    def test_each_cap_gets_a_daily_limit_to_match(self):
+        self.assertEqual(whatif.cap_overrides(self.cfg, 100000, 8),
+                         {"max_trades_per_day": 8, "max_daily_loss_inr": 4000.0})
+        self.assertEqual(whatif.cap_overrides(self.cfg, 1000000, 10)["max_daily_loss_inr"], 50000.0)  # ₹5,000 a trade
+
+    def test_three_five_eight_and_ten(self):
+        rows = whatif.trade_caps(self.sigs(), self.cfg, (3, 5, 8, 10), budget=100000)
+        self.assertEqual([r["key"] for r in rows], ["cap3", "cap5", "cap8", "cap10"])
+        self.assertEqual([r["totals"]["trades"] for r in rows], [3, 5, 8, 10])
+        self.assertEqual([r["skipped"] for r in rows], [{"trade cap": 7}, {"trade cap": 5}, {"trade cap": 2}, {}])
+        one = rows[0]["totals"]["net"] / 3
+        self.assertAlmostEqual(rows[3]["totals"]["net"], 10 * one, delta=1)
+        self.assertEqual(rows[1]["daily_loss"], 2500.0)
+
+    def test_losers_hit_the_scaled_daily_limit_never_the_old_one(self):
+        rows = whatif.trade_caps(self.sigs(exit_=1328.8, result="stop"), self.cfg, (3, 10), budget=100000)
+        self.assertEqual([r["totals"]["trades"] for r in rows], [3, 10])          # ₹5,000 a day lets ten stops in
+        self.assertNotIn("daily loss limit", rows[1]["skipped"])
+
+    def test_a_larger_budget_scales_the_max_loss(self):
+        rows = whatif.trade_caps(self.sigs(3), self.cfg, (3,), budget=1000000)
+        self.assertEqual((rows[0]["budget"], rows[0]["daily_loss"]), (1000000.0, 15000.0))
+        self.assertGreater(rows[0]["trades"][0]["qty"], 37)
+
+
 class InTheDay(HomeBase):
     def setUp(self):
         super(InTheDay, self).setUp()
         self.settings["offline"]["dossier"] = ["--offline", os.path.join(FIX, "nse-dossier"), "--pause", "0"]
         self.settings["dossier"] = {"enabled": True, "results": False}
         self.settings["whatif"] = {"enabled": True, "margin": 5}
+        self.settings["trade_caps"] = {"enabled": True, "caps": [3, 5, 8, 10], "budget": 1000000}
         self.write_settings()
 
     def test_the_deep_scan_feeds_the_veto_and_the_report(self):
@@ -130,6 +164,24 @@ class InTheDay(HomeBase):
         self.assertEqual((card["ladder0"]["days"], card["ladder0"]["net"]), (1, live["pnl_net"]))
         self.assertIn("Why so few trades, and the whole principal, all days", md)
 
+    def test_three_five_eight_and_ten_trades_a_day_in_the_report(self):
+        self.replay()
+        rep = self.doc("reports", DAY + ".json")
+        tc = rep["caps"]
+        self.assertEqual((tc["budget"], tc["live_cap"]), (1000000.0, 3))
+        self.assertEqual([(r["cap"], r["daily_loss"]) for r in tc["rows"]],
+                         [(3, 15000.0), (5, 25000.0), (8, 40000.0), (10, 50000.0)])
+        ten = sizes.simulate(sizes.from_report(rep), ac.load_cfg(self.d), 1000000)
+        self.assertEqual(tc["rows"][0]["totals"]["net"], ten["totals"]["net"])   # 3 a day = the ₹10 lakh sizing
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("## 3, 5, 8 and 10 trades a day at ₹10 lakh", md)
+        self.assertIn("The paper account itself trades 3 a day.", md)
+        self.assertIn("| 10 | ₹50,000 | 1 |", md)
+        self.assertIn("Trades a day, all days", md)
+        card = self.doc("reports", "scorecard.json")["totals"]["caps"]
+        self.assertEqual(list(card), ["cap3", "cap5", "cap8", "cap10"])
+        self.assertEqual(card["cap10"]["days"], 1)
+
     def test_the_deep_scan_never_runs_into_the_session(self):
         d = self.day("%s 09:09" % DAY)
         out = d.dossier(["RELIANCE"])
@@ -160,10 +212,12 @@ class InTheDay(HomeBase):
     def test_off_by_default(self):
         self.settings.pop("dossier")
         self.settings.pop("whatif")
+        self.settings.pop("trade_caps")
         self.write_settings()
         self.replay()
         rep = self.doc("reports", DAY + ".json")
         self.assertNotIn("whatif", rep)
+        self.assertNotIn("caps", rep)
         self.assertIsNone(rep["stocks"])
         self.assertNotIn("dossier", self.state()["phases"]["premarket"])
         self.assertIn("instruments", rep)                                    # what it trades is always said

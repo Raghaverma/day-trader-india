@@ -290,6 +290,11 @@ def main(argv=None):
                     help="also run the autopilot's rules (cost filter, 3-trade cap, daily loss, cash) at these budgets, "
                          "comma separated rupees (default 1 lakh, 10 lakh, 50 lakh, 1 cr, 5 cr), and write every "
                          "trade to reports/sizes-study.csv and .md (sizes-study-5m.* with --bars 5m)")
+    ap.add_argument("--caps", nargs="?", const="default",
+                    help="also run the paper account's rules at these trades a day, comma separated (default "
+                         "3,5,8,10), each with a daily loss limit of that many times the max loss a trade, at "
+                         "--budget (default config.json's), and write every trade to reports/caps-study.csv and .md")
+    ap.add_argument("--budget", type=float, help="the budget for --caps, rupees (default config.json's)")
     a = ap.parse_args(argv)
     home = ac.trader_home()
     cfg = ac.load_cfg(home)
@@ -320,9 +325,16 @@ def main(argv=None):
         longs = [r for r in rows if r["side"] == "long"]
         by_size = [sizes.simulate(longs, cfg, b, float(mx)) for b in budgets]
         paths = write_sizes(home, by_size, days, a.bars)
+    by_cap = None
+    if a.caps:
+        import whatif
+        caps = whatif.DEFAULT_CAPS if a.caps == "default" else [int(x) for x in a.caps.split(",")]
+        longs = [r for r in rows if r["side"] == "long"]
+        by_cap = whatif.trade_caps(longs, cfg, caps, a.budget, float(mx))
+        cpaths = write_caps(home, by_cap, days, a.bars)
     if a.json:
         print(json.dumps({"days": days, "bars": a.bars, "max_charges_r": mx, "groups": res, "signals": rows,
-                          "sizes": by_size}, indent=2))
+                          "sizes": by_size, "caps": by_cap}, indent=2))
         return 0
     print("ORB study, paper rules, after estimated charges: %d days (%s to %s), %d signals replayed on %s bars. "
           "Cost filter split at %.2fR. Not advice." % (len(days), days[0], days[-1], len(rows),
@@ -347,7 +359,69 @@ def main(argv=None):
               "limit; no market impact):" % (mx, cfg.get("max_trades_per_day")))
         print(sizes_table(by_size))
         print("\nEvery trade: %s and %s" % (paths["csv"], paths["md"]))
+    if by_cap:
+        print("\nTrades a day at %s (long only; cost filter %.2fR; each cap with a daily loss limit of that many "
+              "times the max loss a trade; cash as configured; no market impact):" % (
+                  sizes.label(by_cap[0]["budget"]), mx))
+        print(caps_table(by_cap))
+        print("\nEvery trade: %s and %s" % (cpaths["csv"], cpaths["md"]))
     return 0
+
+
+def caps_table(by_cap):
+    lines = ["%-16s %11s %6s %5s %8s %13s %12s %8s %7s %12s %12s %12s %10s %s" % (
+        "trades a day", "daily limit", "trades", "won", "win rate", "net", "charges", "return", "avg R", "best day",
+        "worst day", "max dd", "green days", "average day")]
+    for s in by_cap:
+        t = s["totals"]
+        days = s.get("days") or {}
+        nets = [v["net"] for v in days.values()]
+        lines.append("%-16s %11s %6d %5d %8s %13s %12s %7.2f%% %+7.2f %12s %12s %12s %10s %s" % (
+            s["label"], report.money(s["daily_loss"]), t["trades"], t["wins"],
+            ("%.0f%%" % (100.0 * t["wins"] / t["trades"])) if t["trades"] else "-", report.signed_money(t["net"]),
+            report.money(t["charges"]), t["return_pct"], t["avg_r"] or 0, report.signed_money(t["best_day"]),
+            report.signed_money(t["worst_day"]), report.signed_money(t["max_drawdown"]),
+            "%d of %d" % (t["green_days"], len(nets)), report.signed_money(sum(nets) / len(nets) if nets else None)))
+    return "\n".join(lines)
+
+
+def write_caps(home, by_cap, days, bars="1m"):
+    """Every trade at every number of trades a day, as CSV and Markdown, in reports/."""
+    import csv
+    folder = ac.reports_dir(home)
+    os.makedirs(folder, exist_ok=True)
+    base = "caps-study" if bars == "1m" else "caps-study-" + bars
+    paths = {"csv": os.path.join(folder, base + ".csv"), "md": os.path.join(folder, base + ".md")}
+    cols = ["day", "symbol", "at", "qty", "order_value", "fill", "exit", "exit_at", "result", "charges", "net", "r",
+            "max_loss"]
+    with open(paths["csv"], "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["trades_a_day"] + cols)
+        for s in by_cap:
+            for t in s["trades"]:
+                w.writerow([s["cap"]] + [t.get(k) for k in cols])
+    md = ["# ORB paper trades at %s trades a day, %s" % (", ".join(str(s["cap"]) for s in by_cap),
+                                                         sizes.label(by_cap[0]["budget"]) if by_cap else ""), "",
+          "%d days, %s to %s, replayed from the bar archive on %s bars with the paper broker's rules. Long only, "
+          "with the cost filter, the cash (less the amount kept back, no margin) and a daily loss limit of that many "
+          "times the max loss a trade. Claude's veto is not in the archive, so every signal counts. P&L after "
+          "estimated Zerodha charges; exact fills, no market impact. Paper; not advice."
+          % (len(days), days[0], days[-1], "1-minute" if bars == "1m" else "5-minute"), "", "```",
+          caps_table(by_cap), "```", ""]
+    for s in by_cap:
+        t = s["totals"]
+        md += ["## %s (daily loss limit %s)" % (s["label"], report.money(s["daily_loss"])), "",
+               "%d trades (%d won, %d lost, %d limit orders never filled), %s net after %s charges, %.2f%% of the "
+               "budget. Kept out: %s." % (t["trades"], t["wins"], t["losses"], t["unfilled"],
+                                         report.signed_money(t["net"]), report.money(t["charges"]), t["return_pct"],
+                                         ", ".join("%s %d" % kv for kv in sorted(s["skipped"].items())) or "none"), "",
+               "| Day | Trades | Net | Equity after |", "|---|---|---|---|"]
+        for d, v in sorted((s.get("days") or {}).items()):
+            md.append("| %s | %d | %s | %s |" % (d, v["trades"], report.signed_money(v["net"]), report.money(v["equity"])))
+        md.append("")
+    with open(paths["md"], "w", encoding="utf-8") as fh:
+        fh.write("\n".join(md))
+    return paths
 
 
 def sizes_table(by_size):

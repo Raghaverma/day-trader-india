@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.0
+
+### 3, 5, 8 and 10 trades a day
+
+- **`whatif.trade_caps`.** The same signals at several numbers of trades a day, at one budget, each with a daily
+  loss limit of that many times the max loss a trade (at ₹10 lakh: ₹15,000, ₹25,000, ₹40,000 and ₹50,000), so the
+  last trade is never kept out by the loss rule's reservation. Everything else is the paper account's: the max
+  loss a trade, the cost filter, Claude's veto and the cash with no margin.
+- **In the report** (`"trade_caps": {"enabled": true, "caps": [3, 5, 8, 10], "budget": null}`): a section with each
+  cap's trades, net, return, average R, the most money in stock at once and what was kept out, every trade each
+  took, and an all-days table in the scorecard. Measurement only: the paper account keeps config.json's cap.
+- **`study.py --caps [3,5,8,10] [--budget RUPEES]`** replays the bar archive at each cap and writes every trade to
+  `reports/caps-study.csv` and `.md` (`caps-study-5m.*` with `--bars 5m`).
+- 6 new tests.
+
 ## 1.8.0
 
 ### The deep scan, why only three trades, and the whole principal

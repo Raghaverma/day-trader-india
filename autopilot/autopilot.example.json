@@ -52,5 +52,15 @@
   "whatif": {
     "enabled": true,
     "margin": 5
+  },
+  "trade_caps": {
+    "enabled": true,
+    "caps": [
+      3,
+      5,
+      8,
+      10
+    ],
+    "budget": null
   }
 }
