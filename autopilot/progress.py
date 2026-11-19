@@ -238,7 +238,13 @@ def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None)
     cands = sorted(st["candidates"].values(), key=lambda c: (c.get("first_seen") or "", c.get("symbol") or ""))
     jobs = jobs if jobs is not None else {"tick": launchd_job("com.nse-autopilot"),
                                           "awake": launchd_job("com.keep-awake")}
+    import accounts
+    try:
+        accs = accounts.all_summaries(home, day, settings, cfg) if accounts.caps_of(settings) else []
+    except Exception:
+        accs = []
     return {
+        "accounts": accs,
         "day": day, "now": ist.strftime("%H:%M"), "now_m": ist.hour * 60 + ist.minute,
         "weekday": ist.strftime("%A %d %b %Y"), "status": status, "guard": ac.guard(cfg), "phases": ph,
         "ticks": st["ticks"], "candidates": cands, "trades": trades, "made": made, "lost": lost,
@@ -438,6 +444,15 @@ def money_lines(s, cfg):
     return out
 
 
+def account_lines(s):
+    out = []
+    for a in s.get("accounts") or []:
+        used = a["orders"]
+        out.append("%-34s %d of %d trades used, %d open, %d closed (%d won, %d lost), net %s" % (
+            a["label"] + ":", used, a["cap"], a["still_open"], a["closed"], a["wins"], a["losses"], signed(a["net"])))
+    return out
+
+
 def subject(kind, s):
     tag = "[PAPER] NSE autopilot"
     if kind == "closed":
@@ -479,6 +494,8 @@ def body(kind, s, settings, cfg, pm):
                                 eod.get("mail") or "not sent"), ""]
     lines += ["WHAT IT IS DOING NOW", doing_now(s, settings, cfg)] + s["_health"] + [""]
     lines += ["MONEY TODAY (paper)"] + money_lines(s, cfg) + [""]
+    if s.get("accounts"):
+        lines += ["PAPER ACCOUNTS (realised today, after charges)"] + account_lines(s) + [""]
     lines += ["TRADES"] + trade_lines(s, cfg) + [""]
     lines += ["SIGNALS"] + signal_lines(s) + [""]
     lines += ["PRE-MARKET"] + premarket_lines(s) + [""]

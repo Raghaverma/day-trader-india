@@ -62,5 +62,13 @@
       10
     ],
     "budget": null
+  },
+  "accounts": {
+    "enabled": true,
+    "caps": [
+      5,
+      8,
+      10
+    ]
   }
 }

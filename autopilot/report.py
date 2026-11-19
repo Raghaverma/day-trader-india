@@ -493,7 +493,19 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
         rep["caps"] = trade_caps(rep, cfg, tc.get("caps"), tc.get("budget"),
                                  (settings.get("cost_filter") or {}).get("max_charges_r"))
     rep["stocks"] = stock_files(home, day, rep)
+    rep["accounts"] = paper_accounts(home, day, settings, cfg)
     return write_outputs(home, day, rep, None)
+
+
+def paper_accounts(home, day, settings, cfg):
+    """The main paper account and the others (accounts.py) side by side; None when there are no others."""
+    import accounts
+    if not accounts.caps_of(settings):
+        return None
+    try:
+        return accounts.all_summaries(home, day, settings, cfg)
+    except Exception as e:
+        return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
 
 
 def trade_caps(rep, cfg, caps=None, budget=None, max_charges_r=None):
@@ -596,6 +608,7 @@ def score_row(rep):
                       for s in rep.get("sizes") or [] if isinstance(rep.get("sizes"), list)},
             "whatif": whatif_row(rep.get("whatif")),
             "caps": caps_row(rep.get("caps")),
+            "accounts": accounts_row(rep.get("accounts")),
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
 
 
@@ -610,6 +623,13 @@ def whatif_row(wi):
         out[r["key"]] = {"label": r["label"], "budget": wi.get("budget"), "net": t["net"], "trades": t["trades"],
                          "wins": t["wins"], "charges": t["charges"]}
     return out
+
+
+def accounts_row(acc):
+    if not isinstance(acc, list):
+        return {}
+    return {a["name"]: {"label": a["label"], "budget": a["budget"], "net": a["net"], "trades": a["closed"],
+                        "wins": a["wins"], "charges": a["charges"]} for a in acc}
 
 
 def caps_row(tc):
@@ -783,7 +803,8 @@ def scorecard(home, day=None, rep=None):
               "by_setup": setup, "shadows": sh,
               "edge": edge([dict(o, day=d) for d in order for o in days[d].get("signal_rs") or []]),
               "sizes": size_totals(days, order), "whatif": whatif_totals(days, order),
-              "caps": whatif_totals(days, order, "caps", _cap_rank)}
+              "caps": whatif_totals(days, order, "caps", _cap_rank),
+              "accounts": whatif_totals(days, order, "accounts", _cap_rank)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
@@ -861,6 +882,13 @@ def blocks(rep, card, analysis=None):
             signed_money(d["net"]), r_text(d["total_r"]), r_text(d["avg_r"]))))
     else:
         out.append(("p", "No paper trades today."))
+
+    acc = rep.get("accounts")
+    if isinstance(acc, dict) and acc.get("error"):
+        out.append(("h2", "The paper accounts"))
+        out.append(("p", "Could not read them today: %s" % acc["error"]))
+    elif acc:
+        out.extend(account_blocks(acc))
 
     out.append(("h2", "Every signal, start to finish"))
     items = ["Universe: %s stock(s). ORB scans: %d (%d failed). Signals (ORB hits): %d." % (
@@ -1034,6 +1062,16 @@ def blocks(rep, card, analysis=None):
                       ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
                       if (v.get("per_day") or {}).get("ci95") else "n/a"] for lab, v in t["sizes"].items()]))
 
+    if t.get("accounts"):
+        out.append(("p", "The paper accounts, all days (each trades for real on paper at its own cap):"))
+        out.append(("table", ["Account", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",
+                              "Average day", "95% interval a day"],
+                    [[v["label"], v["days"], v["trades"], v["wins"], signed_money(v["net"]),
+                      ("%+.2f%%" % v["return_pct"]) if v.get("return_pct") is not None else "n/a",
+                      signed_money(v.get("worst_day")), signed_money(v.get("best_day")),
+                      signed_money((v.get("per_day") or {}).get("mean_r")),
+                      ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
+                      if (v.get("per_day") or {}).get("ci95") else "n/a"] for v in t["accounts"].values()]))
     if t.get("caps"):
         out.append(("p", "Trades a day, all days (same signals, each cap with its own daily loss limit):"))
         out.append(("table", ["Trades a day", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",
@@ -1137,6 +1175,30 @@ def why_blocks(wi):
                 [[r["label"], r["totals"]["trades"], r["totals"]["wins"], signed_money(r["totals"]["net"]),
                   "%+.2f%%" % r["totals"]["return_pct"], money(r["peak_open"]), _skips(r["skipped"])]
                  for r in wi["ladder"]]))
+    return out
+
+
+def account_blocks(acc):
+    caps = [a["cap"] for a in acc]
+    out = [("h2", "The paper accounts: %s trades a day" % (", ".join(str(c) for c in caps[:-1]) +
+                                                          (" and %d" % caps[-1] if len(caps) > 1 else str(caps[0]))))]
+    out.append(("p", "Each account is a paper account of its own (%s each) that traded today's signals for real on "
+                     "paper: its own sizing on its own cash, nse-risk on its own cap and daily loss limit (that many "
+                     "times the max loss a trade), the paper broker's fills, stops and targets. They see the same "
+                     "signals after Claude's veto and the cost filter." % _lab(acc[0]["budget"] or 0)))
+    out.append(("table", ["Account", "Daily loss limit", "Orders", "Filled", "Never filled", "Won", "Lost", "Net",
+                          "Charges", "Return", "Cash now"],
+                [[a["label"], money(_f(a.get("daily_loss"))), a["orders"], a["filled"], a["never_filled"], a["wins"],
+                  a["losses"], signed_money(a["net"]), money(a["charges"]),
+                  ("%+.2f%%" % a["return_pct"]) if a.get("return_pct") is not None else "n/a",
+                  money(_f(a.get("cash")))] for a in acc]))
+    rows = [[a["cap"], t["symbol"], (t.get("ordered_at") or "")[11:16], t["qty"], _px(t.get("fill")),
+             _px(t.get("exit")), EXIT_WORDS.get(t.get("exit_reason"), t.get("exit_reason") or t.get("status") or ""),
+             signed_money(t["net"]) if t.get("net") is not None else "never filled"
+             if t.get("status") == "cancelled" else t.get("status") or ""]
+            for a in acc for t in a["trades"]]
+    if rows:
+        out.append(("table", ["Trades a day", "Stock", "Ordered", "Qty", "In", "Out", "Exit", "Net"], rows))
     return out
 
 

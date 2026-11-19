@@ -34,9 +34,11 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import accounts  # noqa: E402
 import autopilot_common as ac  # noqa: E402
 import claude_run  # noqa: E402
 import mail  # noqa: E402
@@ -128,6 +130,7 @@ class Day(object):
             self.premarket()
         if self.at_least(PAPER_FROM) and not ph.get("eod"):
             self.paper_check()
+            self.paper_check_accounts()
         bar = self.orb_due()
         if bar:
             self.orb(bar)
@@ -142,6 +145,8 @@ class Day(object):
         ph = self.st["phases"]
         ph["premarket"] = {"started": self.stamp()}
         self.save()
+        if accounts.caps_of(self.settings):
+            ph["premarket"]["accounts"] = [a["name"] for a in self.accounts(refresh=True)]
         if not nc.test_mode():
             self.runner.run("holidays", "alerts", ["holidays", "--refresh", "--if-stale"], parse=False, now=False)
         syms, names = self.universe()
@@ -254,6 +259,74 @@ class Day(object):
         if not force and not self.live_trades():
             return None
         return self.runner.run("paper_check", "ticket", ["paper-check"], parse=False)
+
+    # ------------------------------------------------------------ the other paper accounts (accounts.py)
+
+    def accounts(self, refresh=False):
+        """[{name, cap, home, cfg, runner}] for each extra paper account; the folders are created or refreshed from
+        the main config at the pre-market (or on first use). A cap equal to the main account's is the main account."""
+        if getattr(self, "_accounts", None) is not None and not refresh:
+            return self._accounts
+        main_cap = int(self.cfg.get("max_trades_per_day") or 0)
+        out = []
+        for cap in accounts.caps_of(self.settings):
+            if cap == main_cap:
+                continue
+            path = accounts.home_of(self.home, cap)
+            if refresh or not os.path.isfile(os.path.join(path, "config.json")):
+                accounts.ensure(self.home, self.cfg, cap)
+            cfg = accounts.load_cfg(path) or {}
+            if ac.guard(cfg):
+                self.runner.note("accounts", account=accounts.name_of(cap), error=ac.guard(cfg))
+                continue
+            out.append({"name": accounts.name_of(cap), "cap": cap, "home": path, "cfg": cfg,
+                        "runner": ac.Runner(path, self.day, self.settings, getattr(self.runner, "now_text", None))})
+        self._accounts = out
+        return out
+
+    def paper_check_accounts(self, force=False):
+        for a in self.accounts():
+            if force or accounts.live_trades(a["home"]):
+                a["runner"].run("paper_check", "ticket", ["paper-check"], parse=False)
+
+    def trade_accounts(self, c, sym, plan_path):
+        """The planned signal through each extra account: its own size, quote, risk check, approval and paper
+        fill. One account failing never touches the main account or the others."""
+        out = c.setdefault("accounts", {})
+        for a in self.accounts():
+            if (out.get(a["name"]) or {}).get("outcome"):
+                continue
+            try:
+                out[a["name"]] = self.account_trade(a, sym, plan_path)
+            except Exception as e:                   # an account's error is its own
+                out[a["name"]] = {"outcome": "error", "reason": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
+        self.save()
+
+    def account_trade(self, a, sym, plan_path):
+        why = accounts.cap_reason(a["home"], a["cfg"], self.day)
+        if why:
+            return {"outcome": "shadow", "reason": why}
+        home, run = a["home"], a["runner"].run
+        plan = os.path.join(home, "plan.json")
+        shutil.copyfile(plan_path, plan)
+        r = run("size", "size", ["--plan", plan, "--write", "--json"], sym)
+        sizing = (r.data or {}).get("sizing") or {}
+        if not r.ok:
+            return {"outcome": "size_refused",
+                    "reason": "; ".join((r.data or {}).get("notes") or []) or ac.tail(r.err or r.out, 300)}
+        run("quote", "alerts", ["quote", sym, "--write", os.path.join(home, "prices.json"), "--json"], sym)
+        r = run("risk", "risk", ["--json"], sym)
+        res = ((r.data or {}).get("results") or [{}])[0]
+        if res.get("verdict") != "PASS":
+            return {"outcome": "risk_block", "qty": sizing.get("qty"),
+                    "reason": "; ".join(res.get("reasons") or []) or ac.tail(r.err or "no verdict", 300)}
+        r = run("approve", "ticket", ["autopilot-approve", "--index", "1"], sym, parse=False)
+        if not r.ok:
+            return {"outcome": "approve_refused", "reason": ac.tail(r.err or r.out, 300)}
+        r = run("paper_fill", "ticket", ["paper-fill", "--index", "1"], sym, parse=False)
+        if not r.ok:
+            return {"outcome": "fill_refused", "reason": ac.tail(r.err or r.out, 300)}
+        return {"outcome": "traded", "qty": sizing.get("qty"), "bound_by": sizing.get("bound_by")}
 
     # ------------------------------------------------------------ opening-range breakouts
 
@@ -434,6 +507,8 @@ class Day(object):
                 self.finish(c, "cost_filter", "round-trip charges at the stop are %.2fR of the risk, over the "
                                               "%.2fR limit (cost_filter.max_charges_r)" % (cr, mx))
                 return
+        if self.accounts():
+            self.trade_accounts(c, sym, plan_path)
         cap = self.cap_reason()
         if cap:
             self.finish(c, "shadow", cap)
@@ -518,6 +593,7 @@ class Day(object):
 
     def _eod(self, ph):
         self.paper_check(force=True)
+        self.paper_check_accounts(force=True)
         r = self.runner.run("journal", "ticket", ["journal", "--days", "7", "--json"])
         if r.data is not None:
             ac.write_json(self.path("journal.json"), r.data)
@@ -807,6 +883,11 @@ def cmd_status(a):
             print("  paper %s %s %s qty %s fill %s exit %s %s net %s" % (
                 t.get("id"), t.get("status"), t.get("symbol"), t.get("qty"), t.get("fill_price"),
                 t.get("exit_price"), t.get("exit_reason") or "", t.get("pnl_net")))
+    settings = ac.load_settings(home)
+    if accounts.caps_of(settings):
+        for s in accounts.all_summaries(home, day, settings, cfg):
+            print("  account %-30s orders %d, open %d, closed %d (%d won), net %s, cash %s" % (
+                s["label"], s["orders"], s["still_open"], s["closed"], s["wins"], s["net"], s.get("cash")))
     return 0
 
 

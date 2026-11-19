@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.10.0
+
+### Paper accounts at 5, 8 and 10 trades a day
+
+- **`autopilot/accounts.py`.** With `"accounts": {"enabled": true, "caps": [5, 8, 10]}` each cap gets a paper account
+  of its own in `<trader folder>/accounts/cap<N>/`, a trader folder like the main one: the main config.json with
+  that many trades a day and a daily loss limit of that many times the max loss a trade (rewritten from the main
+  config each pre-market), its own `portfolio.json` cash starting at the budget, its own broker, paper and risk
+  state, and a link to the main cache. A cap equal to the main account's is the main account.
+- **They trade for real, on paper.** Every long signal the main account plans, after Claude's veto and the cost
+  filter, goes to each account: nse-budget on its cash, a fresh quote, nse-risk on its rules, autopilot-approve
+  and the paper broker. Each account's open trades get the same paper-check every minute and at the close. An
+  account whose config is not paper with `"autopilot": true` is left out; one account failing never touches the
+  others or the main one.
+- **Side by side.** The 15:35 report has a section with every account's orders, fills, wins, losses, net, charges,
+  return and cash, and every trade each took; the scorecard keeps every account over all days; the half-hourly
+  progress email and `run_day.py status` list each account's trades used, open and closed, and net.
+- 6 new tests.
+
 ## 1.9.0
 
 ### 3, 5, 8 and 10 trades a day
