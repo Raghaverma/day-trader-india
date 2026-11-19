@@ -12,6 +12,10 @@ breakout trade in them unusually risky. Veto a stock only for a concrete reason 
 - a material corporate event announced overnight: a merger or acquisition, an open offer, a block
   deal on the stock, a rating action, a large pledge, a fraud or regulatory order, a management exit
 - a large overnight gap already visible in "moves" together with one of the reasons above
+- the same reasons in "stock_flags", the deep scan of each stock's NSE records this morning: a board
+  meeting or results today, an ex-date today, the F&O ban list, results filed in the last two days, a
+  bulk or block deal, insider or promoter selling, a large pledge (a flag alone, like "near its 52-week
+  high", a big move or heavy volume, is not a reason)
 
 Do NOT veto for ordinary headlines, analyst price targets, sector or market commentary, or because a
 stock "looks" weak or strong. Most days should have zero to three vetoes. If the news feeds failed

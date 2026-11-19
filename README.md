@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.7.0" src="https://img.shields.io/badge/version-1.7.0-blue?style=flat-square">
+  <img alt="version 1.7.0" src="https://img.shields.io/badge/version-1.8.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
@@ -117,10 +117,10 @@ cd tests && python3 -m unittest discover -v
 
 | IST | what runs |
 | --- | --- |
-| 08:40 | the Nifty 50, the daily scan, the news; then headless Claude (your logged-in account, no tools) names the stocks to sit out today, such as results days or halts |
+| 08:40 | the Nifty 50, the daily scan, the news, then the deep scan: a file per stock (results, board meetings and ex-dates, filings, headlines, shareholding, pledges, insider trades, bulk deals, the F&O ban), done by 09:10 at the latest; then headless Claude (your logged-in account, no tools) reads it all and names the stocks to sit out today, such as results days or halts |
 | 09:35-14:30 | every 5 minutes, an opening-range scan; each new signal goes through entry, exit, the Time Machine, budget, a fresh quote and risk, then the paper broker. After the day's trade cap or loss limit, signals are planned but not traded |
 | 09:16-15:10 | every minute, `paper-check` runs the stops, targets and the 15:10 flat-by on 1-minute bars |
-| 15:35 | the report (Markdown, HTML, JSON and a running scorecard), Claude's plain-words analysis, then a Gmail email |
+| 15:35 | the report (Markdown, HTML, JSON and a running scorecard), Claude's plain-words analysis, then a Gmail email with the traded stocks' files attached. The report says what it trades, why it took only N trades, and what the whole principal would have done |
 | after 15:35 | the P&L journal, rebuilt in `~/Desktop/NSE Trading P&L`: every paper order with what it made or lost and **why** (gave back a winner, failed breakout, late fill on a pullback, never filled, target hit...), worked out from the 1-minute prices by fixed rules; a ledger CSV, a daily CSV with the running total, a summary and one page per day |
 | 08:42, then :00 and :30 to 15:30 | a progress email: what the autopilot is doing now, every paper trade, money made and lost (realised and open), the signals and why each was or wasn't traded, the pre-market veto, and any stuck tick or failed step. On a closed day, one email saying why it isn't running. At 16:00, only if the 15:35 email didn't go out, the day's numbers anyway |
 
@@ -172,15 +172,23 @@ The gate covers MCP order tools only, so a Bash or curl call to the Kite API isn
 - **The data is free and unofficial.** Yahoo's chart endpoint and NSE's website APIs can lag, change shape or rate-limit you, and Yahoo leaves the last few minutes of NSE sessions empty. Check anything that matters against your broker.
 - **Taxes and deals.** Intraday equity profits are speculative business income in India; nothing here is tax advice. Bulk and block deals are public disclosures published after the session, not inside information.
 
+### What it trades, why only three trades, and the whole principal (1.8.0)
+
+- **What it trades.** Shares only, in NSE's cash market (EQ series), intraday (MIS, flat by 15:10), long only, paid in full from cash. No futures or options: `"allow_fno": false` in config.json, and `nse-risk` blocks any F&O order. The scanner's "fno" universe is only a list of liquid stocks. Every report says this in one line, from the config.
+- **Why only three trades** (`"whatif": {"enabled": true}`). Three rules each stop the day at about three entries: the trade cap (`max_trades_per_day`; a placed entry counts even if its LIMIT never fills), the daily loss limit (each entry reserves its whole max loss for the day, even after it closes, so ₹15,000 / ₹5,000 = 3), and the cash (the budget less the 10% kept back, no margin; orders sized to lose ₹5,000 at a tight stop are ₹1-4 lakh each). The report lifts them one at a time on the day's own signals and shows the trades, the net and the most money the day would have needed in stock at once.
+- **The whole principal.** The same signals with no risk sizing: every trade takes all the free money (nothing kept back, no cap, no daily limit), once with the money alone and once with 5x intraday margin (`"margin": 5`), with the loss at the stop and what a 10% or 20% fall in the largest position would cost. At 5x a 20% fall loses all of it. Measurement only: nothing about what is traded changes. The scorecard keeps both over all days.
+- **The deep scan** (`"dossier": {"enabled": true}`). `nse-news/dossier.py` builds a file per stock in the universe before the open, in `autopilot/<date>/stocks/`. Its flags go into Claude's pre-market veto and the report; the traded and vetoed stocks' files are attached to the email. It stops starting new stocks at `budget_s` (900) or 09:10, whichever is sooner, so it never runs into the session.
+
 ## Files
 
 ```
 nse-<skill>/   SKILL.md + one script each (scan.py, news.py, entry.py, exit.py, timemachine.py,
                size.py, check.py, ticket.py, alerts.py, results.py, deals.py) + nse_common.py,
                the shared NSE clock, tick, charges, loss and sizing rules
+               nse-news also has dossier.py, the stock file (everything public on one stock)
 hooks/         the plugin's hooks: gate.py, record_prompt.py, session_status.py
 autopilot/     the paper autopilot: run_day.py (launchd tick), report.py, claude_run.py, mail.py,
-               shorts.py, sizes.py, market.py, study.py, prompts/, install.sh, ...
+               shorts.py, sizes.py, whatif.py, market.py, study.py, prompts/, install.sh, ...
 tests/         unittest suite + offline fixtures
 CHANGELOG.md   what changed in each version        PORTING.md   how the port was done
 ```

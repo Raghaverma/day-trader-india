@@ -49,6 +49,7 @@ nc = ac.nc
 ORB_FIRST_BAR = "09:35"          # the first bar after the 15-minute range (09:30) closes at 09:35
 PAPER_FROM = "09:16"
 SESSION = ("09:15", "15:30")
+DOSSIER_STOP = "09:10"          # the deep scan never starts a stock after this
 ENTRY_RETRIES = 3                # an ORB hit nse-entry does not (yet) call triggered is checked on 3 bars
 EOD_ATTEMPTS = 3                 # an end of day that keeps failing gives up after 3 tries (and says so)
 SAFE_REASON_CHARS = 400
@@ -160,6 +161,9 @@ class Day(object):
             if news is not None:
                 ac.write_json(self.path("news.json"), news)
             ph["premarket"]["news"] = {"code": r.code, "items": len((news or {}).get("items") or [])}
+        if (self.settings.get("dossier") or {}).get("enabled") and syms:
+            ph["premarket"]["dossier"] = self.dossier(syms)
+            self.save()
         claude = self.settings.get("claude") or {}
         if not claude.get("enabled"):
             ph["premarket"]["veto"] = "off"
@@ -167,7 +171,8 @@ class Day(object):
             ph["premarket"]["veto"] = "skipped: the pre-market started after %s" % self.settings["veto_by"]
             self.runner.note("veto", skipped=ph["premarket"]["veto"])
         else:
-            brief = premarket_brief(self.day, syms, names, news, ac.read_json(self.path("daily.json")))
+            brief = premarket_brief(self.day, syms, names, news, ac.read_json(self.path("daily.json")),
+                                    ac.read_json(self.path("stocks", "index.json")))
             ac.write_json(self.path("premarket-brief.json"), brief)
             out = self.claude("premarket", brief, self.settings, self.path("claude-premarket.json"))
             vetoes = clean_vetoes((out or {}).get("vetoes"), syms) if out and out.get("ok") else []
@@ -179,6 +184,30 @@ class Day(object):
             self.runner.note("veto", vetoes=vetoes, ok=bool(out and out.get("ok")), error=(out or {}).get("error"))
         ph["premarket"]["done"] = self.stamp()
         self.save()
+
+    def dossier(self, syms):
+        """The deep scan: a file per stock (nse-news/dossier.py) in <day>/stocks/. It must never run into the
+        session (a tick holds the lock while it runs, and the ORB scans and paper stops wait), so it stops starting
+        new stocks at budget_s or DOSSIER_STOP (09:10), whichever is sooner, and is skipped with under 2 minutes."""
+        dz = self.settings.get("dossier") or {}
+        left = (minutes(DOSSIER_STOP) - minutes(hm(self.ist))) * 60
+        budget = min(float(dz.get("budget_s") or 900), left)
+        if budget < 120:
+            self.runner.note("dossier", skipped="too close to the open")
+            return {"skipped": "too close to the open (it stops at %s)" % DOSSIER_STOP}
+        args = ["--tickers"] + syms + ["--out", self.path("stocks"), "--budget-s", "%d" % budget]
+        if os.path.isfile(self.path("universe.txt")):
+            args += ["--names", self.path("universe.txt")]
+        if dz.get("results") is False:
+            args.append("--no-results")
+        r = self.runner.run("dossier", "dossier", args, parse=False, timeout=int(budget) + 240)
+        idx = ac.read_json(self.path("stocks", "index.json")) or {}
+        stocks = idx.get("stocks") or {}
+        return {"code": r.code, "stocks": len(stocks), "of": len(syms),
+                "flagged": sum(1 for v in stocks.values() if [f for f in v.get("flags") or []
+                                                               if not f.startswith("Could not read")]),
+                "failed": sorted(k for k, v in stocks.items() if v.get("failed")),
+                "shared_errors": idx.get("shared_errors") or {}, "seconds": r.seconds}
 
     def universe(self):
         """(symbols, {symbol: name}) for the news and the veto."""
@@ -575,8 +604,10 @@ def tm_summary(doc):
             "verdict": verdict, "category": verdict.split(":")[0].strip() if verdict else None}
 
 
-def premarket_brief(day, syms, names, news, daily):
-    """What Claude reads before the open: compact, so the prompt stays small."""
+def premarket_brief(day, syms, names, news, daily, stocks=None):
+    """What Claude reads before the open: compact, so the prompt stays small. `stocks` is the deep scan's
+    index.json: each stock's flags (results or a board meeting close, an ex-date, the F&O ban, insider selling,
+    a pledge, a bulk deal, a big move), only for the stocks that have one."""
     items = []
     for i in (news or {}).get("items") or []:
         items.append({"ticker": i.get("ticker"), "time_ist": i.get("time_ist"), "kind": i.get("kind"),
@@ -589,7 +620,11 @@ def premarket_brief(day, syms, names, news, daily):
             "news_items": items[:400], "results_calendar": ((news or {}).get("calendar") or [])[:100],
             "moves": ((news or {}).get("moves") or [])[:100],
             "daily_setups": [{"symbol": h.get("symbol"), "setups": h.get("setups")}
-                             for h in (daily or {}).get("hits") or []]}
+                             for h in (daily or {}).get("hits") or []],
+            "stock_flags": {s: [f for f in (v.get("flags") or []) if not f.startswith("Could not read")]
+                            for s, v in sorted(((stocks or {}).get("stocks") or {}).items())
+                            if [f for f in (v.get("flags") or []) if not f.startswith("Could not read")]},
+            "deep_scan": "ok" if (stocks or {}).get("stocks") else "not run or failed"}
 
 
 def plain_reason(text):

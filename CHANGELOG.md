@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.8.0
+
+### The deep scan, why only three trades, and the whole principal
+
+- **`nse-news/dossier.py`: everything public on one stock.** Price and trend from a year of Yahoo daily bars, the
+  series and circuit band, NSE board meetings and corporate actions, the latest quarters from `nse-analyst`, 30
+  days of NSE filings, a week of headlines that name the stock, the shareholding pattern, pledges, insider (SEBI
+  PIT) trades over 90 days, bulk and block deals and the F&O ban list. It starts with plain-words flags (a board
+  meeting or ex-date close, the F&O ban, fresh results, a big move or volume, a 52-week extreme, insider or
+  promoter selling, a pledge, a bulk deal, important filings). A failed source is named, never shown as "none".
+  `--out DIR` writes `<SYM>.md`, `<SYM>.json` and `index.json`, each as soon as it is built.
+- **The deep scan before the open** (`"dossier"` in autopilot.json). After the news, the pre-market builds a file
+  for every stock in the universe (about 6 minutes for the Nifty 50). It stops starting new stocks at
+  `budget_s` or 09:10, whichever is sooner, and is skipped with under 2 minutes left, so a tick never runs into
+  the session. Claude's veto gets each stock's flags (`stock_flags`), and the prompt says which flags are
+  reasons. The report has a "Stock files" section, the Health list has the scan, and the traded and vetoed
+  stocks' files are attached to the email as `<date>.stocks.md`.
+- **`autopilot/whatif.py`: why only N trades.** The report names the three limits that each stop the day at
+  about three entries (the trade cap, the daily loss limit's reservation of each entry's whole max loss, and the
+  cash), with the day's numbers, then lifts them one at a time on the day's own signals: trades, net, return and
+  the most money in stock at once.
+- **The whole principal.** The same signals with every trade taking all the free money, with the money alone
+  and with 5x intraday margin (`"whatif": {"margin": 5}`): the net, the worst trade, the largest position, its
+  loss at the stop and what a 10% or 20% fall in it would cost. The scorecard keeps every way over all days.
+- **What it trades.** Every report says it in one line, from the config: shares in NSE's cash market, intraday,
+  long only, no futures or options, no margin.
+- `sizes.simulate` takes `margin` and `overrides` (unchanged when left out). 26 new tests.
+
 ## 1.7.0
 
 ### The P&L journal: every trade, what it made or lost, and why

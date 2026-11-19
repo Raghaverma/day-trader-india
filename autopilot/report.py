@@ -52,7 +52,7 @@ SHORT_NOTE = ("Shorts are replayed, never traded. A replay cannot show a short's
 EXIT_WORDS = {"target": "target", "stop": "stop", "flat_by": "flat by 15:10", "sold": "sold", "partial": "partial",
               "cancelled": "LIMIT never filled"}
 # a step's exit code that is a decision, not a failure (no hits, nothing new, not triggered, a refusal)
-DECISION_CODES = {"scan_orb": {0, 1}, "scan_daily": {0, 1}, "news": {0, 1}, "entry": {0, 1}, "exit": {0, 1},
+DECISION_CODES = {"dossier": {0, 1}, "scan_orb": {0, 1}, "scan_daily": {0, 1}, "news": {0, 1}, "entry": {0, 1}, "exit": {0, 1},
                   "size": {0, 1}, "risk": {0, 1}, "quote": {0}, "timemachine": {0}, "approve": {0, 1},
                   "paper_fill": {0, 1}, "paper_check": {0}, "journal": {0}, "status": {0}, "universe": {0},
                   "holidays": {0}}
@@ -434,7 +434,8 @@ def health(st, log):
             "session_minutes_seen": len(seen), "session_minutes": 375, "gaps": gaps,
             "first_tick": seen[0] if seen else None, "last_tick": seen[-1] if seen else None,
             "premarket": "ran" if pre.get("done") else ("started, not finished" if pre else "did not run"),
-            "news": pre.get("news"), "veto": pre.get("veto"), "closed": ph.get("closed")}
+            "news": pre.get("news"), "veto": pre.get("veto"), "dossier": pre.get("dossier"),
+            "closed": ph.get("closed")}
 
 
 def _count(items):
@@ -483,7 +484,56 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
     budgets = settings.get("sizes") or []
     if budgets:
         rep["sizes"] = account_sizes(rep, cfg, budgets, (settings.get("cost_filter") or {}).get("max_charges_r"))
+    rep["instruments"] = instruments(cfg, settings)
+    wi = settings.get("whatif") or {}
+    if wi.get("enabled"):
+        rep["whatif"] = what_if(rep, cfg, wi.get("margin"), (settings.get("cost_filter") or {}).get("max_charges_r"))
+    rep["stocks"] = stock_files(home, day, rep)
     return write_outputs(home, day, rep, None)
+
+
+def instruments(cfg, settings):
+    try:
+        import whatif
+        return whatif.instruments(cfg, settings)
+    except Exception as e:
+        return "could not describe: %s" % ac.tail(str(e), 120)
+
+
+def what_if(rep, cfg, margin=None, max_charges_r=None):
+    """Why only N trades, and the whole principal (whatif.build); one failure never stops the report."""
+    import whatif
+    try:
+        return whatif.build(rep, cfg, float(margin or whatif.DEFAULT_MARGIN),
+                            None if max_charges_r is None else float(max_charges_r))
+    except Exception as e:
+        return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
+
+
+STOCK_FLAG_ROWS = 25
+
+
+def stock_files(home, day, rep):
+    """The morning's stock files (nse-news/dossier.py, run by the pre-market): where they are, the traded and
+    vetoed stocks' flags and results, and every stock with a flag. None when the deep scan did not run."""
+    folder = os.path.join(ac.day_dir(home, day), "stocks")
+    idx = ac.read_json(os.path.join(folder, "index.json"))
+    if not isinstance(idx, dict) or not isinstance(idx.get("stocks"), dict):
+        return None
+    stocks = idx["stocks"]
+    traded = [t["symbol"] for t in rep.get("trades") or []]
+    vetoed = [v.get("symbol") for v in rep.get("vetoes") or [] if v.get("symbol")]
+    pick = []
+    for sym in traded + [v for v in vetoed if v not in traded]:
+        row = stocks.get(sym)
+        if row is not None:
+            pick.append(dict(row, symbol=sym, why="traded" if sym in traded else "vetoed"))
+    flagged = [dict(symbol=sym, flags=[f for f in row.get("flags") or [] if not f.startswith("Could not read")])
+               for sym, row in sorted(stocks.items())]
+    flagged = [f for f in flagged if f["flags"]]
+    return {"dir": folder, "built_at": idx.get("built_at"), "count": len(stocks), "picked": pick,
+            "flagged": flagged, "shared_errors": idx.get("shared_errors") or {},
+            "failed": sorted(sym for sym, row in stocks.items() if row.get("failed"))}
 
 
 def account_sizes(rep, cfg, budgets, max_charges_r=None):
@@ -530,7 +580,48 @@ def score_row(rep):
             "sizes": {s["label"]: {"budget": s["budget"], "net": s["totals"]["net"], "trades": s["totals"]["trades"],
                                    "wins": s["totals"]["wins"], "charges": s["totals"]["charges"]}
                       for s in rep.get("sizes") or [] if isinstance(rep.get("sizes"), list)},
+            "whatif": whatif_row(rep.get("whatif")),
             "failures": len(rep["health"]["failures"]), "gaps": len(rep["health"]["gaps"])}
+
+
+def whatif_row(wi):
+    if not isinstance(wi, dict) or wi.get("error"):
+        return {}
+    out = {}
+    for r in (wi.get("ladder") or []) + (wi.get("all_in") or []):
+        if r["key"] == "rules":
+            continue
+        t = r["totals"]
+        out[r["key"]] = {"label": r["label"], "budget": wi.get("budget"), "net": t["net"], "trades": t["trades"],
+                         "wins": t["wins"], "charges": t["charges"]}
+    return out
+
+
+WHATIF_ORDER = ("ladder0", "ladder1", "ladder2", "ladder3", "all_in_1x", "all_in_margin")
+
+
+def whatif_totals(days, order):
+    """All days for each what-if: net, trades, wins, charges, the worst and best day, the per-day mean in rupees."""
+    out = {}
+    for d in order:
+        for key, v in (days[d].get("whatif") or {}).items():
+            s = out.setdefault(key, {"label": v.get("label"), "budget": v.get("budget"), "days": 0, "net": 0.0,
+                                     "trades": 0, "wins": 0, "charges": 0.0, "daily": []})
+            s["label"] = v.get("label") or s["label"]
+            s["days"] += 1
+            s["net"] = round(s["net"] + (v.get("net") or 0), 2)
+            s["charges"] = round(s["charges"] + (v.get("charges") or 0), 2)
+            s["trades"] += v.get("trades") or 0
+            s["wins"] += v.get("wins") or 0
+            s["daily"].append(v.get("net") or 0)
+    for s in out.values():
+        daily = s.pop("daily")
+        st = edge_stats(daily, unit="days")
+        s["per_day"] = {k: st.get(k) for k in ("mean_r", "ci95", "verdict")}
+        s["worst_day"] = min(daily) if daily else None
+        s["best_day"] = max(daily) if daily else None
+        s["return_pct"] = round(100 * s["net"] / s["budget"], 3) if s.get("budget") else None
+    return {k: out[k] for k in sorted(out, key=lambda k: WHATIF_ORDER.index(k) if k in WHATIF_ORDER else 99)}
 
 
 # ---------------------------------------------------------------- is there an edge? (every number in R)
@@ -659,7 +750,7 @@ def scorecard(home, day=None, rep=None):
               "time_machine": calibration([(t.get("p"), t.get("hit")) for t in tms]), "by_category": by_cat,
               "by_setup": setup, "shadows": sh,
               "edge": edge([dict(o, day=d) for d in order for o in days[d].get("signal_rs") or []]),
-              "sizes": size_totals(days, order)}
+              "sizes": size_totals(days, order), "whatif": whatif_totals(days, order)}
     out = {"updated_at": nc.utc_iso(), "days": days, "equity": equity, "totals": totals}
     if rep is not None:
         ac.write_json(path, out)
@@ -723,6 +814,8 @@ def blocks(rep, card, analysis=None):
                                             r.get("no_entries_before"), r.get("no_entries_after"), r.get("flat_by"),
                                             rep.get("universe") if not isinstance(rep.get("universe"), list)
                                             else ", ".join(rep["universe"]))))
+    if rep.get("instruments"):
+        out.append(("p", "What it trades: " + rep["instruments"]))
     out.append(("h2", "Trades"))
     if rep["trades"]:
         out.append(("table", ["Stock", "Qty", "In", "Out", "Exit", "Net", "R", "Held", "TM P(target)", "TM said"],
@@ -751,6 +844,12 @@ def blocks(rep, card, analysis=None):
     if rep.get("vetoes"):
         out.append(("p", "Claude's pre-market vetoes: " + "; ".join("%s (%s)" % (v["symbol"], v["reason"])
                                                                     for v in rep["vetoes"])))
+    wi = rep.get("whatif")
+    if isinstance(wi, dict) and wi.get("error"):
+        out.append(("h2", "Why so few trades"))
+        out.append(("p", "Could not work it out today: %s" % wi["error"]))
+    elif wi:
+        out.extend(why_blocks(wi))
 
     out.append(("h2", "Did the Time Machine call it?"))
     tm = rep["time_machine"]
@@ -830,6 +929,11 @@ def blocks(rep, card, analysis=None):
         if rows:
             out.append(("table", ["Budget", "Stock", "Signal", "Qty", "Order", "In", "Out", "Exit", "Net", "R"], rows))
 
+    if wi and not wi.get("error"):
+        out.extend(all_in_blocks(wi))
+    if rep.get("stocks"):
+        out.extend(stock_blocks(rep["stocks"]))
+
     out.append(("h2", "Execution"))
     out.append(("ul", ["Average entry slippage vs the plan: %s" % _px(ex["avg_entry_slippage"], signed=True),
                        "Average exit vs the target (target exits): %s" % _px(ex["avg_exit_vs_target"], signed=True),
@@ -847,6 +951,13 @@ def blocks(rep, card, analysis=None):
               ("; gaps: " + ", ".join(h["gaps"])) if h["gaps"] else ""),
           "Step failures: %s." % (", ".join("%s x%d" % kv for kv in sorted(h["failures_by_step"].items()))
                                    or "none")]
+    dz = h.get("dossier")
+    if dz:
+        hl.insert(1, "Deep scan: %s." % (dz["skipped"] if dz.get("skipped") else "%d of %d stock files in %ss, %d "
+                                         "with a flag%s" % (dz.get("stocks") or 0, dz.get("of") or 0,
+                                                            dz.get("seconds"), dz.get("flagged") or 0,
+                                                            ("; sources failed for " + ", ".join(dz["failed"][:8]))
+                                                            if dz.get("failed") else "")))
     for f in h["failures"][:8]:
         hl.append("%s %s%s: %s" % ((f.get("at") or "")[11:16], f["step"],
                                    (" " + f["symbol"]) if f.get("symbol") else "", f.get("error") or
@@ -884,6 +995,17 @@ def blocks(rep, card, analysis=None):
                       ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
                       if (v.get("per_day") or {}).get("ci95") else "n/a"] for lab, v in t["sizes"].items()]))
 
+    if t.get("whatif"):
+        out.append(("p", "Why so few trades, and the whole principal, all days (same signals, each way's rules):"))
+        out.append(("table", ["Way", "Days", "Trades", "Won", "Net", "Return", "Worst day", "Best day",
+                              "Average day", "95% interval a day"],
+                    [[v["label"], v["days"], v["trades"], v["wins"], signed_money(v["net"]),
+                      ("%+.2f%%" % v["return_pct"]) if v.get("return_pct") is not None else "n/a",
+                      signed_money(v.get("worst_day")), signed_money(v.get("best_day")),
+                      signed_money((v.get("per_day") or {}).get("mean_r")),
+                      ("%s to %s" % tuple(signed_money(x) for x in v["per_day"]["ci95"]))
+                      if (v.get("per_day") or {}).get("ci95") else "n/a"] for v in t["whatif"].values()]))
+
     ed = t.get("edge") or {}
     if any(g.get("n") for g in (ed.get("groups") or {}).values()):
         out.append(("h2", "Is there an edge? (all days, in R)"))
@@ -917,6 +1039,141 @@ def blocks(rep, card, analysis=None):
     elif analysis is False:
         out.append(("h2", "Claude's analysis"))
         out.append(("p", "Claude's analysis is unavailable today; the numbers above are complete without it."))
+    return out
+
+
+def _skips(skipped):
+    return ", ".join("%s %d" % (k, n) for k, n in sorted(skipped.items(), key=lambda kv: -kv[1])) or "nothing"
+
+
+def _share(x, of):
+    return ("%.1f%%" % (100.0 * x / of)) if x is not None and of else "n/a"
+
+
+def why_blocks(wi):
+    L = wi["limits"]
+    n, filled = L["entries"], L["entries"] - len(L["unfilled"])
+    out = [("h2", "Why only %d trade%s%s" % (n, "" if n == 1 else "s",
+                                             (" (%d filled)" % filled) if filled != n else ""))]
+    items = []
+    if L["cap"]:
+        items.append("Trade cap: at most %d entries a day (max_trades_per_day in config.json). A placed entry counts "
+                     "even if its LIMIT never fills%s." % (L["cap"], ("; today %s used a slot without filling"
+                                                                     % ", ".join(L["unfilled"])) if L["unfilled"]
+                                                          else ""))
+    if L["daily"]:
+        items.append("Daily loss limit: %s. Each entry keeps its whole max loss (%s) reserved for the rest of the "
+                     "day, even after it closes, so %s / %s = %s entries at most." % (
+                         money(L["daily"]), money(L["per_trade"]), money(L["daily"]), money(L["per_trade"]),
+                         L["entries_by_loss_limit"] if L["entries_by_loss_limit"] is not None else "n/a"))
+    cash = "Cash: %s less the %g%% kept back = %s, and no margin." % (money(L["budget"]), L["buffer_pct"],
+                                                                    money(L["usable_cash"]))
+    if L["avg_order"]:
+        cash += " Sized to lose about %s at the stop, today's orders averaged %s, so about %d fit at once" % (
+            money(L["per_trade"]), money(L["avg_order"]), L["orders_that_fit"] or 0)
+        if L["orders_total"] > L["usable_cash"]:
+            cash += " (today's %d entry orders added up to %s: sized in the same minute, each against all the " \
+                    "cash)" % (L["entries"], money(L["orders_total"]))
+        cash += "."
+    items.append(cash)
+    out.append(("p", "Three rules each stop the day at about three entries:"))
+    out.append(("ul", items))
+    if L["capped"]:
+        out.append(("p", "Signals these limits kept out today: %d. Replayed, they would have made %s net (see "
+                         "\"Signals not taken, replayed\")." % (L["capped"], signed_money(L["capped_net"]))))
+    out.append(("p", "The same signals with the limits lifted one at a time. Same fills and exits as the paper "
+                     "broker; each signal sized by today's rules from the cash left free, in the order they fired. "
+                     "\"Most in stock at once\" is the money the way needed at its busiest minute."))
+    out.append(("table", ["Rules", "Trades", "Won", "Net", "Return", "Most in stock at once", "Kept out"],
+                [[r["label"], r["totals"]["trades"], r["totals"]["wins"], signed_money(r["totals"]["net"]),
+                  "%+.2f%%" % r["totals"]["return_pct"], money(r["peak_open"]), _skips(r["skipped"])]
+                 for r in wi["ladder"]]))
+    return out
+
+
+def all_in_blocks(wi):
+    b, m = wi["budget"], wi["margin"]
+    out = [("h2", "If every trade used the whole %s" % _lab(b))]
+    out.append(("p", "The same signals with no risk sizing: each takes all the money that is free (nothing kept "
+                     "back, no trade cap, no daily loss limit), and waits while at least half of it is in another "
+                     "trade. Once with the money alone, once with %gx intraday margin." % m))
+    rows = []
+    for r in wi["all_in"]:
+        t, big = r["totals"], r["largest"] or {}
+        st = big.get("stress") or {}
+        rows.append([r["label"], t["trades"], t["wins"], signed_money(t["net"]), "%+.2f%%" % t["return_pct"],
+                     signed_money((r["worst_trade"] or {}).get("net")), money(big.get("order_value")),
+                     "%s (%s)" % (money(big.get("max_loss")), _share(big.get("max_loss"), b)),
+                     "-%s (%s)" % (money(st.get("10")), _share(st.get("10"), b)) if st else "n/a",
+                     "-%s (%s)" % (money(st.get("20")), _share(st.get("20"), b)) if st else "n/a"])
+    out.append(("table", ["Way", "Trades", "Won", "Net", "Return", "Worst trade", "Largest position",
+                          "Its loss at the stop", "If it fell 10%", "If it fell 20%"], rows))
+    rules, one, lev = (wi["all_in"] + [None, None, None])[:3]
+    notes = []
+    if rules and one and lev:
+        notes.append("Under today's rules a stop costs at most %s (%s of the money). All in, today's largest stop "
+                     "would have cost %s (%s); with %gx margin %s (%s)." % (
+                         money(wi["limits"]["per_trade"]), _share(wi["limits"]["per_trade"], b),
+                         money((one["largest"] or {}).get("max_loss")), _share((one["largest"] or {}).get("max_loss"), b),
+                         m, money((lev["largest"] or {}).get("max_loss")),
+                         _share((lev["largest"] or {}).get("max_loss"), b)))
+        waited = sum(n for k, n in one["skipped"].items() if k.startswith("no size"))
+        if waited:
+            notes.append("All in, %d signal%s had to wait or were missed because the money was already in a trade."
+                         % (waited, "" if waited == 1 else "s"))
+    notes.append("A stop is not a floor: a stock that gaps, is halted or locks at its lower circuit can fall 10-20%% "
+                 "before it can be sold. At %gx margin a %d%% fall in one position loses the whole %s, and more."
+                 % (m, int(round(100 / m)), _lab(b)))
+    notes.append("Assumptions: %gx is the intraday (MIS) leverage Zerodha usually gives on large stocks (a 20%% "
+                 "margin); it differs by stock and the broker squares MIS positions off near 15:20. Fills are the "
+                 "paper broker's with no market impact, so the largest orders are the least believable." % m)
+    out.append(("ul", notes))
+    trows = [[r["label"], x["symbol"], x["at"], x["qty"], money(x["order_value"]), _px(x["fill"]), _px(x["exit"]),
+              EXIT_WORDS.get(x["result"], x["result"] or ""),
+              signed_money(x["net"]) if x["fill"] is not None else "never filled"]
+             for r in wi["all_in"][1:] for x in r["trades"]]
+    if trows:
+        out.append(("table", ["Way", "Stock", "Signal", "Qty", "Position", "In", "Out", "Exit", "Net"], trows))
+    return out
+
+
+def _built(stamp):
+    try:
+        return nc.ist_text(nc.parse_now(stamp))
+    except (TypeError, ValueError):
+        return "this morning"
+
+
+def _lab(budget):
+    import sizes
+    return sizes.label(budget)
+
+
+def stock_blocks(sf):
+    out = [("h2", "Stock files (the deep scan before the open)")]
+    out.append(("p", "Built %s for %d stocks: price and trend, the latest results, board meetings and ex-dates, 30 "
+                     "days of NSE filings, a week of headlines, shareholding, pledges, insider trades, bulk and block "
+                     "deals and the F&O ban list. Each stock's file: %s/<SYMBOL>.md (the traded stocks' files are "
+                     "attached to this email)." % (
+                         _built(sf.get("built_at")), sf["count"], sf["dir"])))
+    for p in sf["picked"]:
+        bits = ["%s (%s%s):" % (p["symbol"], p["why"], (", " + p["name"]) if p.get("name") else "")]
+        bits.append(("; ".join(p.get("flags") or []) or "no flags") + ".")
+        if p.get("results"):
+            bits.append("Results: " + p["results"])
+        out.append(("p", " ".join(bits)))
+    if sf["flagged"]:
+        out.append(("p", "Every stock in the universe with a flag this morning:"))
+        out.append(("table", ["Stock", "Flags"], [[f["symbol"], "; ".join(f["flags"])]
+                                                 for f in sf["flagged"][:STOCK_FLAG_ROWS]]))
+        if len(sf["flagged"]) > STOCK_FLAG_ROWS:
+            out.append(("p", "... and %d more in the folder's index.json." % (len(sf["flagged"]) - STOCK_FLAG_ROWS)))
+    bad = ["%s: %s" % (k, v) for k, v in sorted(sf["shared_errors"].items())]
+    if sf["failed"]:
+        bad.append("some sources failed for %d stock%s (%s)" % (len(sf["failed"]), "" if len(sf["failed"]) == 1
+                                                                else "s", ", ".join(sf["failed"][:10])))
+    if bad:
+        out.append(("p", "Could not read: " + "; ".join(bad) + "."))
     return out
 
 
@@ -1091,7 +1348,25 @@ def paths_for(home, day):
     r = ac.reports_dir(home)
     return {"json": os.path.join(r, day + ".json"), "md": os.path.join(r, day + ".md"),
             "html": os.path.join(r, day + ".html"), "analysis": os.path.join(r, day + ".analysis.md"),
-            "scorecard": os.path.join(r, "scorecard.json")}
+            "stocks": os.path.join(r, day + ".stocks.md"), "scorecard": os.path.join(r, "scorecard.json")}
+
+
+def write_stock_files(path, rep):
+    """The traded and vetoed stocks' full files, one after another, for the email. False when there are none."""
+    sf = rep.get("stocks") or {}
+    parts = []
+    for p in sf.get("picked") or []:
+        f = os.path.join(sf["dir"], "%s.md" % p["symbol"].replace("&", "_"))
+        try:
+            with open(f, encoding="utf-8") as fh:
+                parts.append(fh.read().strip())
+        except OSError:
+            continue
+    if not parts:
+        return False
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# Stock files: %s\n\n" % rep["date"] + "\n\n---\n\n".join(parts) + "\n")
+    return True
 
 
 def write_outputs(home, day, rep, analysis):
@@ -1111,6 +1386,8 @@ def write_outputs(home, day, rep, analysis):
         fh.write(to_html(bl, "NSE autopilot %s" % day))
     if not analysis:
         paths.pop("analysis")
+    if not write_stock_files(paths["stocks"], rep):
+        paths.pop("stocks")
     return {"report": rep, "paths": paths, "scorecard": card}
 
 

@@ -55,11 +55,18 @@ def _mins(hhmm):
     return t.hour * 60 + t.minute
 
 
-def simulate(signals, cfg, budget, max_charges_r=None):
+def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=None):
     """signals: [{"day", "symbol", "at", "entry", "stop", "fill", "exit", "exit_at", "result", "eligible",
     "why"}] (long only), in any order. Returns {"budget", "trades": [...], "skipped": {reason: n}, "days": {...},
-    "totals": {...}} for this budget, carrying the account's realised P&L from day to day."""
+    "totals": {...}} for this budget, carrying the account's realised P&L from day to day.
+
+    whatif.py's scenarios: `overrides` replaces config keys after the scaling (0 turns a limit off), and
+    `margin` lets the account hold that many times its money in stock (5 = Zerodha's usual intraday MIS
+    leverage on large stocks): the cash, the account base and the position cap are all multiplied by it.
+    The return is still measured on the money itself (`budget`)."""
     c = scaled_cfg(cfg, budget)
+    c.update(overrides or {})
+    margin = float(margin or 1.0)
     cap = int(c.get("max_trades_per_day") or 0)
     daily = float(c.get("max_daily_loss_inr") or 0)
     equity = float(budget)
@@ -81,8 +88,9 @@ def simulate(signals, cfg, budget, max_charges_r=None):
             open_cost = sum(t["qty"] * t["fill"] for t in taken
                             if t["fill"] is not None and (t["exit_m"] is None or t["exit_m"] > at))
             realised = sum(t["net"] for t in taken if t["exit_m"] is not None and t["exit_m"] <= at)
-            cash = equity + realised - open_cost
-            qty = nc.size_qty(s["entry"], s["stop"], s["symbol"], c, cash=cash, portfolio_total=equity + realised)
+            cash = (equity + realised) * margin - open_cost
+            qty = nc.size_qty(s["entry"], s["stop"], s["symbol"], c, budget=c["budget"] * margin, cash=cash,
+                              portfolio_total=(equity + realised) * margin)
             if qty < 1 or qty * s["entry"] < float(c.get("min_order_inr") or 0):
                 skip("no size fits (cash or caps)")
                 continue
@@ -103,7 +111,8 @@ def simulate(signals, cfg, budget, max_charges_r=None):
                 continue
             t = {"day": day, "symbol": s["symbol"], "at": s["at"], "qty": int(qty), "entry": s["entry"],
                  "stop": s["stop"], "fill": s.get("fill"), "exit": s.get("exit"), "exit_at": s.get("exit_at"),
-                 "result": s.get("result"), "max_loss": round(ml, 2), "charges_r": round(charges_r, 3),
+                 "result": s.get("result"), "max_loss": round(ml, 2),
+                 "charges_r": round(charges_r, 3) if charges_r is not None else None,
                  "order_value": round(qty * s["entry"], 2), "volume_share": None,
                  "exit_m": _mins(s["exit_at"]) if s.get("exit_at") else None, "net": 0.0, "gross": 0.0,
                  "charges": 0.0, "r": None}

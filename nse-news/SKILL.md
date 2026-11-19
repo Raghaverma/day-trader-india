@@ -6,9 +6,10 @@ description: >-
   ratings, pledges), Google News headlines by company name, results dates from
   NSE's calendar, and each stock's move from its previous close in ₹. Shows
   only what is new, newest first, in IST, tagged, and says plainly when a
-  source failed. Use when the user says "any news on RELIANCE", "why is TCS
-  moving", "morning briefing", "pre-open news", "check the NSE filings", "did
-  anything break", "when does Infosys report", or after /nse-scanner.
+  source failed. dossier.py builds a full stock file. Use when the user says
+  "any news on RELIANCE", "why is TCS moving", "morning briefing", "check the
+  NSE filings", "when does Infosys report", "tell me everything about INFY",
+  "deep scan", or after /nse-scanner.
 argument-hint: "[NSE symbols]"
 ---
 
@@ -29,6 +30,39 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers RELIANCE TCS --hours 24
 python3 "${CLAUDE_SKILL_DIR}/news.py" --no-google --json           # NSE filings only
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers INFY --all --hours 168
 ```
+
+## Everything on one stock: dossier.py
+
+When the user wants all of it ("tell me everything about INFY", "deep scan
+RELIANCE", "is there anything I should know before I buy TCS"), build the
+stock file instead of the news check:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/dossier.py" INFY                       # the whole file, as text
+python3 "${CLAUDE_SKILL_DIR}/dossier.py" INFY TCS --out trader/stocks  # INFY.md, INFY.json, index.json
+python3 "${CLAUDE_SKILL_DIR}/dossier.py" INFY --no-results          # skip the quarterly numbers
+```
+
+It reads, for each stock: a year of Yahoo daily prices (moves over a day, a
+week, a month, three months and a year; the 52-week range; the 20, 50 and
+200-day averages; the average daily range; volume against its 20-day
+average), the series and circuit band from NSE's `sec_list.csv`, NSE's board
+meetings and corporate actions (dividends, splits, bonus issues, ex-dates),
+the latest quarters from `nse-analyst` (`results.py`), 30 days of NSE
+filings, a week of Google News headlines that name the stock, NSE's
+shareholding pattern (promoter and public, four quarters), pledge data,
+insider (SEBI PIT) trades over 90 days, bulk and block deals (NSE's latest
+files plus `nse-deals`' history) and NSE's F&O ban list. It starts with
+**flags**: a board meeting or ex-date within 14 days, the F&O ban, results
+filed in the last two days, a 3% move or twice the usual volume, within 2% of
+the 52-week high or low, insiders buying or selling over ₹1 crore on the
+market, promoters pledging 5% or more, promoter holding moving a point in a
+quarter, a recent bulk or block deal, important filings in the last 3 days.
+A source that failed is named in the flags ("Could not read: ...") and in
+its section, never shown as "none". NSE's live quote page refuses scripts,
+so prices come from Yahoo. Read the flags out first, then the sections the
+user asked about; the paper autopilot builds these files for its whole
+universe before the open (`"dossier"` in autopilot.json).
 
 ## What it reads and writes
 

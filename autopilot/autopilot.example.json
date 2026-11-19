@@ -43,5 +43,14 @@
   "journal": {
     "enabled": true,
     "dir": "~/Desktop/NSE Trading P&L"
+  },
+  "dossier": {
+    "enabled": true,
+    "budget_s": 900,
+    "results": true
+  },
+  "whatif": {
+    "enabled": true,
+    "margin": 5
   }
 }

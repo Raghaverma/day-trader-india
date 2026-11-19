@@ -62,7 +62,7 @@ def build_message(settings, rep, paths, analysis=None):
     page = _read(paths.get("html"))
     if page:
         msg.add_alternative(page, subtype="html")
-    for key in ("md", "analysis", "json"):
+    for key in ("md", "analysis", "stocks", "json"):
         p = paths.get(key)
         if p and os.path.isfile(p):
             ctype = mimetypes.guess_type(p)[0] or "text/plain"

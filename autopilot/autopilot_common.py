@@ -20,6 +20,7 @@ import nse_common as nc  # noqa: E402
 SCRIPTS = {
     "scan": "nse-scanner/scan.py",
     "news": "nse-news/news.py",
+    "dossier": "nse-news/dossier.py",
     "entry": "nse-entry/entry.py",
     "exit": "nse-exit/exit.py",
     "timemachine": "nse-timemachine/timemachine.py",
@@ -59,6 +60,14 @@ DEFAULTS = {
     "rank_file": None,
     # the report re-sizes each day's signals for these budgets (rupees), each with its own scaled rules. [] = off.
     "sizes": [],
+    # the deep scan before the open (nse-news/dossier.py): a file per stock in the universe (price and trend,
+    # results, board meetings and ex-dates, NSE filings, headlines, shareholding, pledges, insider trades, bulk and
+    # block deals, the F&O ban list). Its flags go to Claude's veto and the report. It stops starting new stocks at
+    # budget_s or 09:10, whichever is sooner, so it never runs into the session; results: false skips the XBRL.
+    "dossier": {"enabled": False, "budget_s": 900, "results": True},
+    # the report's "why only N trades" (the limits lifted one at a time) and "the whole principal" (every trade
+    # all in, with the money alone and with `margin`x intraday leverage). Measurement only: nothing is traded.
+    "whatif": {"enabled": False, "margin": 5},
     # keep the day's 1- and 5-minute bars (Yahoo drops them after 30 / 60 days) in archive/ in the trader folder
     "archive": {"enabled": False, "pause_s": 0.4},
     # test and replay only (NSE_TEST_MODE=1): extra arguments per step, "{sym}" is replaced by the symbol,
