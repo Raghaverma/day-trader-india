@@ -9,13 +9,15 @@
 #   3. creates the trader folder with a PAPER config (README defaults) and switches "autopilot" on in it
 #   4. writes autopilot.json (asks for the Gmail sender and recipients) and stores the Gmail app password
 #      in the login keychain (macOS asks for it; it is never echoed or written to a file)
-#   5. installs ~/Library/LaunchAgents/com.nse-autopilot.plist (every 60 s) and loads it
+#   5. installs ~/Library/LaunchAgents/com.nse-autopilot.plist (the day, every 60 s) and
+#      com.nse-autopilot-progress.plist (the half-hourly progress email, every 60 s) and loads them
 #   6. runs the selftest INSIDE launchd (Claude login, Gmail login + one test email) and prints the result
 #
 # Undo with autopilot/uninstall.sh. Paper only: the autopilot refuses any config that is not "broker": "paper".
 set -euo pipefail
 
 LABEL="com.nse-autopilot"
+PROGRESS_LABEL="com.nse-autopilot-progress"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TRADER_HOME="$HOME/Trading/nse-autopilot"
 while [ $# -gt 0 ]; do
@@ -121,31 +123,37 @@ if [ -n "$CLAUDE" ]; then
   "$PY" "$REPO/autopilot/claude_run.py" selftest || echo "(log in with \`claude\` in Terminal, then run this installer again)"
 fi
 
-say "5/6 launchd job $LABEL (every 60 s)"
-"$PY" - "$PLIST" "$LABEL" "$REPO" "$TRADER_HOME" "$PY" "$LAUNCH_PATH" "$HOME/Library/Logs/nse-autopilot" <<'EOF'
+say "5/6 launchd jobs $LABEL and $PROGRESS_LABEL (every 60 s)"
+write_plist() {   # label, run.sh command, log prefix
+  "$PY" - "$HOME/Library/LaunchAgents/$1.plist" "$1" "$REPO" "$TRADER_HOME" "$PY" "$LAUNCH_PATH" \
+    "$HOME/Library/Logs/nse-autopilot" "$2" "$3" <<'EOF'
 import os, plistlib, sys
-plist, label, repo, home, py, path, logs = sys.argv[1:8]
+plist, label, repo, home, py, path, logs, cmd, prefix = sys.argv[1:10]
 os.makedirs(os.path.dirname(plist), exist_ok=True)
 os.makedirs(logs, exist_ok=True)
 doc = {
     "Label": label,
-    "ProgramArguments": ["/bin/sh", os.path.join(repo, "autopilot", "run.sh"), "tick"],
+    "ProgramArguments": ["/bin/sh", os.path.join(repo, "autopilot", "run.sh"), cmd],
     "EnvironmentVariables": {"NSE_TRADER_HOME": home, "NSE_AUTOPILOT_PYTHON": py, "PATH": path},
     "StartInterval": 60,
     "RunAtLoad": True,
     "ProcessType": "Standard",
     "WorkingDirectory": home,
-    "StandardOutPath": os.path.join(logs, "launchd.out.log"),
-    "StandardErrorPath": os.path.join(logs, "launchd.err.log"),
+    "StandardOutPath": os.path.join(logs, prefix + ".out.log"),
+    "StandardErrorPath": os.path.join(logs, prefix + ".err.log"),
 }
 with open(plist, "wb") as fh:
     plistlib.dump(doc, fh)
 print("wrote %s" % plist)
 EOF
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
-launchctl enable "gui/$(id -u)/$LABEL"
-echo "loaded: $(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -m1 'state =' | xargs)"
+  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$1.plist"
+  launchctl enable "gui/$(id -u)/$1"
+  echo "loaded $1: $(launchctl print "gui/$(id -u)/$1" 2>/dev/null | grep -m1 'state =' | xargs)"
+}
+write_plist "$LABEL" tick launchd
+# the half-hourly progress email (progress.py): its own job, so it still reports when a tick is stuck
+write_plist "$PROGRESS_LABEL" progress progress
 
 say "6/6 Selftest inside launchd (this also sends one test email if mail is on)"
 rm -f "$SUPPORT/selftest.result"
@@ -167,6 +175,7 @@ Installed. On every NSE trading day the autopilot now runs on its own (paper onl
   08:40 IST  scan, news, Claude's pre-market veto
   09:35-14:30 opening-range breakouts, sized, risk-checked and paper-filled
   15:35 IST  report in $TRADER_HOME/reports/ and by email
+  08:42, then every 30 minutes to 15:30: a progress email (what it is doing, trades, money made and lost)
 
 Keep this Mac awake and logged in (System Settings):
   - Energy: "Prevent automatic sleeping when the display is off" ON, "Start up automatically after a power failure" ON

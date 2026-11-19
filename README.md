@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.5.0" src="https://img.shields.io/badge/version-1.5.0-blue?style=flat-square">
+  <img alt="version 1.6.0" src="https://img.shields.io/badge/version-1.6.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
@@ -121,6 +121,7 @@ cd tests && python3 -m unittest discover -v
 | 09:35-14:30 | every 5 minutes, an opening-range scan; each new signal goes through entry, exit, the Time Machine, budget, a fresh quote and risk, then the paper broker. After the day's trade cap or loss limit, signals are planned but not traded |
 | 09:16-15:10 | every minute, `paper-check` runs the stops, targets and the 15:10 flat-by on 1-minute bars |
 | 15:35 | the report (Markdown, HTML, JSON and a running scorecard), Claude's plain-words analysis, then a Gmail email |
+| 08:42, then :00 and :30 to 15:30 | a progress email: what the autopilot is doing now, every paper trade, money made and lost (realised and open), the signals and why each was or wasn't traded, the pre-market veto, and any stuck tick or failed step. On a closed day, one email saying why it isn't running. At 16:00, only if the 15:35 email didn't go out, the day's numbers anyway |
 
 ```bash
 git clone <this repo> ~/Trading/day-trader-india    # not ~/Desktop or ~/Documents: launchd can't read those
@@ -128,7 +129,7 @@ claude                                               # log in once
 ~/Trading/day-trader-india/autopilot/install.sh      # paper config, Gmail app password (to Keychain), launchd job, selftest
 ```
 
-`install.sh` writes a paper config with the defaults above (₹1,00,000, ₹500 a trade, ₹1,500 a day, 3 trades) in `~/Trading/nse-autopilot` and sets `"autopilot": true` in it. It installs a LaunchAgent that ticks every minute, then runs a selftest inside launchd: Claude answers, Gmail logs in and one test email goes out. Keep the Mac awake and logged in: Energy → prevent automatic sleeping and start up after a power failure; Users & Groups → automatic login. `run_day.py status` shows the day; logs are in `~/Library/Logs/nse-autopilot/`; `uninstall.sh` removes the job and keeps your reports.
+`install.sh` writes a paper config with the defaults above (₹1,00,000, ₹500 a trade, ₹1,500 a day, 3 trades) in `~/Trading/nse-autopilot` and sets `"autopilot": true` in it. It installs a LaunchAgent that ticks every minute and a second one for the progress email (`progress.py`; its own job, so it still reports when a tick is stuck; `"progress_mail": {"enabled": false}` in autopilot.json turns it off, `"to"` sends it elsewhere, `run_day.py progress --show` previews it), then runs a selftest inside launchd: Claude answers, Gmail logs in and one test email goes out. Keep the Mac awake and logged in: Energy → prevent automatic sleeping and start up after a power failure; Users & Groups → automatic login. `run_day.py status` shows the day; logs are in `~/Library/Logs/nse-autopilot/`; `uninstall.sh` removes the job and keeps your reports.
 
 - **Paper only, by code, twice.** The runner refuses any config that isn't `"broker": "paper"` with `"autopilot": true`. The approval it uses, `ticket.py autopilot-approve`, checks both again and refuses in manual and kite mode with no override. It's recorded as `approved_by: "autopilot"`, never as your yes. Nothing in `autopilot/` edits the config.
 - **Every number is Python's.** Claude gets the report as data and writes only words. If Claude or Gmail fails, the report is still written, and the failure is in it.

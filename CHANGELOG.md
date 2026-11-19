@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0
+
+### A progress email every half hour
+
+- **`autopilot/progress.py`.** A second LaunchAgent, `com.nse-autopilot-progress`, checks every minute and
+  emails the same recipients:
+  - at 08:42: it's a trading day and the autopilot will run (or it's off, and why), and the first tick ran
+  - at :00 and :30 from 09:00 to 15:30: what it's doing now, every paper trade, money made and lost (after
+    charges, realised and open at Yahoo's last price), the trade cap and loss limit used, each signal and why
+    it was or wasn't traded, the pre-market veto, and any failed step
+  - on a closed day: one email saying why it isn't running
+  - at 16:00: only if the 15:35 report's email didn't go out, the day's numbers anyway
+- **A stuck tick shows.** The job only reads the day's files and never takes the tick's lock. A tick that
+  hasn't run for 5 minutes, or a launchd job that isn't loaded or a keep-awake that isn't running, is flagged
+  with `!!` in the subject.
+- **Each slot goes out once.** Slots are recorded in `autopilot/<date>/progress.json`. A failed send is retried
+  on the next two ticks, and a slot more than 20 minutes late (the Mac slept) is skipped.
+- **Settings.** `"progress_mail": {"enabled", "every_min", "to", "grace_min", "wrapup_at"}` in autopilot.json,
+  all optional. `run_day.py progress --show` prints the email without sending it; `--send-now` sends one.
+- `install.sh` installs both jobs and `uninstall.sh` removes both.
+- **Tests.** 13 new.
+
 ## 1.5.0
 
 ### Slippage, days as the sample, and a 5-minute replay

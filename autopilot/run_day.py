@@ -5,6 +5,7 @@ keyboard, on PAPER only, and writes the end-of-day report. Standard library only
     python3 run_day.py tick        # what launchd runs every minute; does whatever the clock says is due
     python3 run_day.py status      # today's state, in plain words
     python3 run_day.py selftest    # python, config, Claude (headless) and Gmail, from where it is run
+    python3 run_day.py progress    # the half-hourly progress email, when one is due (progress.py)
     python3 run_day.py eod --date 2026-11-13     # rebuild and resend a day's report
     NSE_TEST_MODE=1 python3 run_day.py replay --date 2026-11-13 --times 08:45,10:05,15:35
 
@@ -759,6 +760,13 @@ def cmd_status(a):
     return 0
 
 
+def cmd_progress(a):
+    import progress
+    home = ac.trader_home()
+    return progress.run(home, ac.load_settings(home), ac.load_cfg(home), ac.parse_clock(a.now), show=a.show,
+                        force=a.send_now)
+
+
 def cmd_selftest(a):
     home = ac.trader_home()
     ok = True
@@ -809,6 +817,10 @@ def main(argv=None):
     p.add_argument("--now", help="test only")
     p = sub.add_parser("selftest", help="check python, the config, headless Claude and Gmail")
     p.add_argument("--send-mail", action="store_true", help="also send a test email")
+    p = sub.add_parser("progress", help="the half-hourly progress email (launchd runs this every minute)")
+    p.add_argument("--show", action="store_true", help="print the mail that would go out now; send nothing")
+    p.add_argument("--send-now", action="store_true", help="send an update now, due or not")
+    p.add_argument("--now", help="test only")
     p = sub.add_parser("archive", help="save the last 5 sessions' 1- and 5-minute bars into archive/ now")
     p.add_argument("--backfill", action="store_true",
                    help="everything Yahoo still has: 60 days of 5-minute bars, 28 days of 1-minute bars")
@@ -818,7 +830,7 @@ def main(argv=None):
         return 1
     try:
         return {"tick": cmd_tick, "eod": cmd_eod, "replay": cmd_replay, "status": cmd_status,
-                "selftest": cmd_selftest, "archive": cmd_archive}[a.cmd](a)
+                "selftest": cmd_selftest, "archive": cmd_archive, "progress": cmd_progress}[a.cmd](a)
     except (ac.AutopilotError, ValueError, OSError) as e:
         print("run_day.py: %s" % e, file=sys.stderr)
         return 2
