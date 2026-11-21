@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.15.0
+
+### The main account can carry the opening-volume filter, and the journal covers every account
+
+- **A filter follows its number of trades a day.** `accounts.filters` is keyed by cap (`"cap5"`), and when the main
+  account's own `max_trades_per_day` is that cap, the filter is the main account's. `run_day` applies it after the
+  signal has gone to the other paper accounts, so they still see every signal; a signal it keeps out is finished as
+  `filtered` and replayed with the rest. It is read even with the extra accounts switched off.
+- **Report.** The rules line names the filter; the main account's filter table adds what each kept-out signal made
+  in its replay ("If taken") and the total; the edge table gets its own row for filtered signals; the sizes and
+  "whole principal" replays leave filtered signals out (they follow today's rules) while the trade-cap replay keeps
+  them (it has no filter). "Three rules each stop the day at about three entries" now reads "Three rules limit the
+  day's entries", since the cap is no longer 3. The progress email names the new outcome.
+- **The P&L journal covers every paper account.** Each day's page has the accounts side by side, then each
+  account's trades with the story and the reason, what its trade cap kept out and what its filter kept out, each
+  replayed. A trade another account made the same way (same order, fill and exit) is told once and referred to
+  after that. The summary puts the accounts side by side, all days and day by day (bold: the main account that
+  day); a row follows one set of rules wherever it ran, so "5 a day + volume filter" continues from its own account
+  folder to the main account. The ledger and the daily CSV get `account` and `main` columns; the daily CSV has one
+  row per account per day with that account's running total.
+- **An unfilled order cancelled after `entry_ttl_minutes`** is now written up as freeing its slot (true since
+  1.12.0), not as blocking a later signal all day; its "never came back" low is taken over the order's own minutes.
+- 7 new tests.
+
 ## 1.14.0
 
 ### The opening-volume filter, tried on the 5-a-day paper account

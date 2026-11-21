@@ -10,12 +10,16 @@ forecast was recorded but never used to filter), nse-budget (size to the max los
 BLOCK) and a paper broker driven by Yahoo 1-minute bars. After the day's trade cap or loss limit, signals
 were planned but not traded ("shadows"), then replayed on the day's bars by the same rules.
 
-Three measurements may be switched on (the data shows which):
+Four measurements may be switched on (the data shows which):
 - A cost filter skips a long signal whose round-trip charges at the stop exceed a share of its risk
   ("cost_filter" in the outcomes, "charges_r" on each signal). Skipped signals are replayed, so the data
   says what the filter saved or cost.
 - Short breakdowns (side "short", outcome "short_shadow") are planned and replayed but NEVER traded. A
   replay cannot show a short's own risks (an upper-circuit lock, NSE's auction for an uncovered short).
+- An opening-volume filter on the main account ("filtered" in the outcomes, "open_rvol" on each signal, the
+  rule in "rules.filter"): a signal whose opening volume (09:20-09:30) is under the multiple of its 20-day median
+  is not traded by the main account. It still goes to the other paper accounts ("accounts"), and it is replayed,
+  so the data says what the filter saved or cost.
 - Tags on each signal (nifty_trend, vix_band, nifty_today, rank) only record what was true when it fired;
   nothing was skipped on them.
 "all_days.totals.edge" has the average R per group with a 95% interval and a verdict; quote the verdict

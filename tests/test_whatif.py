@@ -175,12 +175,22 @@ class InTheDay(HomeBase):
         self.assertEqual(tc["rows"][0]["totals"]["net"], ten["totals"]["net"])   # 3 a day = the ₹10 lakh sizing
         md = text(os.path.join(self.d, "reports", DAY + ".md"))
         self.assertIn("## 3, 5, 8 and 10 trades a day at ₹10 lakh", md)
-        self.assertIn("The paper account itself trades 3 a day.", md)
+        self.assertIn("The main paper account itself trades 3 a day.", md)
         self.assertIn("| 10 | ₹50,000 | 1 |", md)
         self.assertIn("Trades a day, all days", md)
         card = self.doc("reports", "scorecard.json")["totals"]["caps"]
         self.assertEqual(list(card), ["cap3", "cap5", "cap8", "cap10"])
         self.assertEqual(card["cap10"]["days"], 1)
+
+    def test_the_main_accounts_filter_stays_out_of_the_sizes_but_not_the_trade_caps(self):
+        rep = {"date": DAY, "trades": [], "plans": {"ABC": {"entry": 100.0, "stop": 99.0, "at": "09:35"}},
+               "candidates": [{"symbol": "ABC", "outcome": "filtered", "side": "long"}],
+               "shadows": {"rows": [{"symbol": "ABC", "side": "long", "fill": 100.0, "exit": 102.0, "exit_at": "10:00",
+                                     "result": "target"}]}}
+        a = sizes.from_report(rep)
+        self.assertEqual((a[0]["eligible"], a[0]["why"]), (False, "the opening-volume filter"))
+        b = sizes.from_report(rep, keep_filtered=True)           # the trade-cap replay has no filter
+        self.assertEqual((b[0]["eligible"], b[0]["why"]), (True, None))
 
     def test_the_deep_scan_never_runs_into_the_session(self):
         d = self.day("%s 09:09" % DAY)

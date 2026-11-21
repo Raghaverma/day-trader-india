@@ -35,7 +35,12 @@ class Config(unittest.TestCase):
                                             5), {"min_open_rvol": 2.0})
         for bad in ({"min_open_rvol": 0}, {"min_open_rvol": "x"}, {}, "1.5"):
             self.assertIsNone(accounts.filter_of({"accounts": {"enabled": True, "filters": {"cap5": bad}}}, 5))
-        self.assertIsNone(accounts.filter_of(dict(on, accounts=dict(on["accounts"], enabled=False)), 5))
+        # read with the extra accounts off too: the main account's own cap can carry the filter
+        self.assertEqual(accounts.filter_of(dict(on, accounts=dict(on["accounts"], enabled=False)), 5),
+                         {"min_open_rvol": 1.5})
+        self.assertIsNone(accounts.filter_of({}, 5))
+        self.assertEqual(accounts.label_of(5, {"min_open_rvol": 1.5}, True),
+                         "5 trades a day, opening volume 1.5x or more only (main account)")
         f = {"min_open_rvol": 1.5}
         self.assertIsNone(accounts.filter_reason(f, 1.5))
         self.assertIsNone(accounts.filter_reason(f, 3.44))
@@ -158,6 +163,64 @@ class InTheDay(HomeBase):
                          [("RELIANCE", 37, "target", 328.4)])
         md = text(os.path.join(self.d, "reports", DAY + ".md"))
         self.assertIn("| RELIANCE | 2.40x | let through | traded |", md)
+
+    def main_has_the_filter(self):
+        """The main account trades 5 a day with the filter; the extra account is 3 a day, every signal."""
+        self.settings["accounts"] = {"enabled": True, "caps": [3, 5], "filters": {"cap5": {"min_open_rvol": 1.5}}}
+        self.write_settings()
+        self.set_cfg(max_trades_per_day=5, max_daily_loss_inr=2500)
+
+    def test_the_main_accounts_own_filter_keeps_it_out_but_not_the_other_accounts(self):
+        self.main_has_the_filter()
+        with mock.patch.object(run_day.Day, "open_rvol", return_value=1.11):
+            self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual(c["outcome"], "filtered")
+        self.assertEqual(c["reason"], "opening volume 1.11x its 20-day median, under the filter's 1.5x")
+        self.assertEqual(c["accounts"], {"cap3": c["accounts"]["cap3"]})          # cap5 is the main account itself
+        self.assertEqual(c["accounts"]["cap3"]["outcome"], "traded")              # it still saw the signal
+        self.assertFalse(os.path.exists(os.path.join(self.d, "accounts", "cap5")))
+        self.assertEqual((ac.read_json(os.path.join(self.d, "state", "paper.json")) or {}).get("trades") or [], [])
+        mine = self.doc("accounts", "cap3", "state", "paper.json")["trades"]
+        self.assertEqual([(t["symbol"], t["exit_reason"], t["pnl_net"]) for t in mine], [("RELIANCE", "target", 328.4)])
+        rep = self.doc("reports", DAY + ".json")
+        self.assertEqual(rep["rules"]["filter"], {"min_open_rvol": 1.5})
+        self.assertEqual([(a["name"], a["main"], a["label"]) for a in rep["accounts"]],
+                         [("cap3", False, "3 trades a day"),
+                          ("cap5", True, "5 trades a day, opening volume 1.5x or more only (main account)")])
+        main = rep["accounts"][1]
+        self.assertEqual([(s["symbol"], s["outcome"], s["replay_result"], s["replay_net"]) for s in main["signals"]],
+                         [("RELIANCE", "filtered", "target", rep["shadows"]["rows"][0]["net"])])
+        self.assertEqual(rep["shadows"]["rows"][0]["why"], "filtered")
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("Only stocks whose opening volume (09:20-09:30) is at least 1.5x its 20-day median.", md)
+        self.assertIn("The main account (5 a day) has a filter", md)
+        self.assertIn("| Stock | Opening volume | Filter | What happened | If taken (replayed) |", md)
+        self.assertIn("| RELIANCE | 1.11x | kept out |  | target, +₹", md)
+        self.assertIn("The 1 kept out that could be replayed would have made +₹", md)
+        self.assertIn("1 kept out by the main account's opening-volume filter", md)
+        self.assertIn("Long, kept out by the opening-volume filter (replayed)", md)
+
+    def test_the_main_accounts_filter_lets_enough_volume_through(self):
+        self.main_has_the_filter()
+        with mock.patch.object(run_day.Day, "open_rvol", return_value=2.4):
+            self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual((c["outcome"], c["accounts"]["cap3"]["outcome"]), ("traded", "traded"))
+        md = text(os.path.join(self.d, "reports", DAY + ".md"))
+        self.assertIn("| RELIANCE | 2.40x | let through | traded |  |", md)
+
+    def test_the_main_accounts_filter_holds_with_the_other_accounts_off(self):
+        self.main_has_the_filter()
+        self.settings["accounts"]["enabled"] = False
+        self.write_settings()
+        with mock.patch.object(run_day.Day, "open_rvol", return_value=1.11):
+            self.replay()
+        c = self.state()["candidates"]["RELIANCE"]
+        self.assertEqual(c["outcome"], "filtered")
+        self.assertNotIn("accounts", c)
+        rep = self.doc("reports", DAY + ".json")
+        self.assertEqual([(a["name"], a["main"]) for a in rep["accounts"]], [("cap5", True)])
 
     def test_a_filter_leaves_out_a_signal_whose_opening_volume_is_not_known(self):
         self.with_filter()

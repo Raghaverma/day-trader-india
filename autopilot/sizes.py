@@ -169,9 +169,13 @@ def simulate(signals, cfg, budget, max_charges_r=None, margin=1.0, overrides=Non
             "totals": totals}
 
 
-def from_report(rep):
+def from_report(rep, keep_filtered=False):
     """Today's long signals with a plan, as simulate() reads them: the paper trades with their real fills, the
-    rest from their replays. Vetoed and risk-blocked signals stay out at every size."""
+    rest from their replays. Vetoed and risk-blocked signals stay out at every size, and so do the ones the main
+    account's own filter kept out, unless keep_filtered (the trade-cap replay, which has no filter)."""
+    kept_out = {"vetoed": "Claude's veto", "risk_block": "nse-risk block"}
+    if not keep_filtered:
+        kept_out["filtered"] = "the opening-volume filter"
     out = []
     trades = {t["symbol"]: t for t in rep.get("trades") or []}
     cands = {c["symbol"]: c for c in rep.get("candidates") or [] if (c.get("side") or "long") == "long"}
@@ -181,8 +185,7 @@ def from_report(rep):
         if not p or not p.get("entry") or not p.get("stop"):
             continue
         sig = {"day": rep["date"], "symbol": sym, "at": p.get("at") or c.get("scan_at"), "entry": p["entry"],
-               "stop": p["stop"], "eligible": c.get("outcome") not in ("vetoed", "risk_block"),
-               "why": {"vetoed": "Claude's veto", "risk_block": "nse-risk block"}.get(c.get("outcome"))}
+               "stop": p["stop"], "eligible": c.get("outcome") not in kept_out, "why": kept_out.get(c.get("outcome"))}
         t = trades.get(sym)
         if t and c.get("outcome") == "traded":
             exit_at = (t.get("exit_time") or "")[11:16] or None

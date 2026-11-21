@@ -44,6 +44,7 @@ OUTCOMES = collections.OrderedDict([
     ("shadow", "planned, not traded: the day's trade cap or loss limit (the report replays it)"),
     ("vetoed", "vetoed by Claude's pre-market check"),
     ("cost_filter", "skipped: charges too big against the risk"),
+    ("filtered", "kept out by the opening-volume filter (the report replays it)"),
     ("risk_block", "blocked by the risk checks"),
     ("entry_expired", "breakout faded before nse-entry confirmed it"),
     ("entry_waiting", "breakout not confirmed by nse-entry"),

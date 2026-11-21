@@ -1,6 +1,6 @@
 """More paper accounts: the same signals, traded for real on paper at other numbers of trades a day.
 
-The main trader folder is the main paper account (its config.json's cap, 3 by default). With
+The main trader folder is the main paper account (its config.json's cap). With
 "accounts": {"enabled": true, "caps": [5, 8, 10]} in autopilot.json, each cap gets a paper account of its own in
 <trader folder>/accounts/cap<N>/, a trader folder like the main one:
 
@@ -16,6 +16,9 @@ An account can also have a filter of its own, a rule the others do not have, so 
 while the rest keep trading as before. "filters": {"cap5": {"min_open_rvol": 1.5}} has the 5-a-day account take only
 signals whose opening volume (09:20-09:30) is at least 1.5x its 20-day median (research.py's one lead; a signal whose
 opening volume is not known is left out too, as research.py does). A filtered signal never reaches nse-budget.
+A filter belongs to the number of trades a day, wherever that runs: when the main account's own cap is 5, "cap5"'s
+filter is the main account's (run_day applies it after the signal has gone to the other accounts, so they still see
+every signal), and it holds even with the extra accounts switched off.
 
 Every long signal the main account plans (after Claude's veto and the cost filter) goes to each account in turn:
 nse-budget sizes it on the account's cash, a fresh quote, nse-risk checks it on the account's rules (its cap, its
@@ -53,9 +56,10 @@ def caps_of(settings):
 
 
 def filter_of(settings, cap):
-    """This account's own filter ({"min_open_rvol": 1.5}), or None. Keyed "cap5" (or "5") under accounts.filters."""
-    a = settings_of(settings) or {}
-    fs = a.get("filters") or {}
+    """This account's own filter ({"min_open_rvol": 1.5}), or None. Keyed "cap5" (or "5") under accounts.filters;
+    read even when the extra accounts are off, since the main account's cap can carry one too."""
+    a = (settings or {}).get("accounts") or {}
+    fs = a.get("filters") or {} if isinstance(a, dict) else {}
     f = fs.get(name_of(cap)) or fs.get(str(int(cap))) or {}
     out = {}
     try:
@@ -183,19 +187,28 @@ def day_summary(path, day, budget=None):
     return out
 
 
+def label_of(cap, f=None, main=False):
+    """"5 trades a day, opening volume 1.5x or more only (main account)"."""
+    return "%d trades a day" % int(cap) + (", %s only" % filter_words(f) if f else "") + \
+        (" (main account)" if main else "")
+
+
+def main_summary(home, day, settings, main_cfg):
+    cap = int(main_cfg.get("max_trades_per_day") or 0)
+    f = filter_of(settings, cap) if cap else None
+    return dict(day_summary(home, day, main_cfg.get("budget")), name=name_of(cap), label=label_of(cap, f, True),
+                cap=cap, main=True, daily_loss=main_cfg.get("max_daily_loss_inr"), filter=f)
+
+
 def all_summaries(home, day, settings, main_cfg):
     """[{name, label, cap, main, ...day_summary}] for the main account and every extra one, by cap."""
-    rows = [dict(day_summary(home, day, main_cfg.get("budget")), name=name_of(main_cfg.get("max_trades_per_day") or 0),
-                 label="%d trades a day (main account)" % int(main_cfg.get("max_trades_per_day") or 0),
-                 cap=int(main_cfg.get("max_trades_per_day") or 0), main=True,
-                 daily_loss=main_cfg.get("max_daily_loss_inr"))]
+    rows = [main_summary(home, day, settings, main_cfg)]
     for cap in caps_of(settings):
         path = home_of(home, cap)
-        if not os.path.isdir(path):
+        if cap == rows[0]["cap"] or not os.path.isdir(path):     # the main account's own cap is the main account
             continue
         s = day_summary(path, day)
         f = filter_of(settings, cap)
-        label = "%d trades a day" % cap + (", %s only" % filter_words(f) if f else "")
-        rows.append(dict(s, name=name_of(cap), label=label, cap=cap, main=False, filter=f))
+        rows.append(dict(s, name=name_of(cap), label=label_of(cap, f), cap=cap, main=False, filter=f))
     rows.sort(key=lambda r: (r["cap"], not r["main"]))
     return rows

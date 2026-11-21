@@ -44,6 +44,7 @@ WHY = {
     "fill_refused": "paper-fill refused",
     "error": "the runner hit an error",
     "cost_filter": "skipped by the cost filter: charges too large a share of the risk",
+    "filtered": "kept out by the main account's opening-volume filter",
     "short_shadow": "short (breakdown), shadow only: never traded",
     "short_refused": "short (breakdown): no plan fits",
 }
@@ -508,6 +509,10 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
                           for c in sorted((st.get("candidates") or {}).values(),
                                           key=lambda c: c.get("first_seen") or "")],
            "plans": plans}
+    import accounts
+    main_filter = accounts.filter_of(settings, cfg.get("max_trades_per_day") or 0)
+    if main_filter:
+        rep["rules"]["filter"] = main_filter
     budgets = settings.get("sizes") or []
     if budgets:
         rep["sizes"] = account_sizes(rep, cfg, budgets, (settings.get("cost_filter") or {}).get("max_charges_r"))
@@ -520,22 +525,39 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
         rep["caps"] = trade_caps(rep, cfg, tc.get("caps"), tc.get("budget"),
                                  (settings.get("cost_filter") or {}).get("max_charges_r"))
     rep["stocks"] = stock_files(home, day, rep)
-    rep["accounts"] = paper_accounts(home, day, settings, cfg, rep.get("candidates"))
+    rep["accounts"] = paper_accounts(home, day, settings, cfg, rep.get("candidates"), (sh or {}).get("rows"))
     return write_outputs(home, day, rep, None)
 
 
-def paper_accounts(home, day, settings, cfg, candidates=None):
-    """The main paper account and the others (accounts.py) side by side; None when there are no others. An account
-    with a filter of its own gets "signals": what the filter let through and kept out, with each opening volume."""
+# a main-account signal that got as far as its filter: planned, not vetoed, within the cost filter
+MAIN_FILTER_REACHED = ("traded", "filtered", "shadow", "size_refused", "risk_block", "approve_refused", "fill_refused")
+
+
+def paper_accounts(home, day, settings, cfg, candidates=None, shadow_rows=None):
+    """The main paper account and the others (accounts.py) side by side; None when there are no others and the main
+    account has no filter. An account with a filter of its own gets "signals": what the filter let through and kept
+    out, with each opening volume (and, for the main account, what a kept-out signal made in its replay)."""
     import accounts
-    if not accounts.caps_of(settings):
+    if not accounts.caps_of(settings) and not accounts.filter_of(settings, cfg.get("max_trades_per_day") or 0):
         return None
     try:
         rows = accounts.all_summaries(home, day, settings, cfg)
     except Exception as e:
         return {"error": "%s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
+    replays = {r.get("symbol"): r for r in shadow_rows or [] if r.get("why") == "filtered" and r.get("side") != "short"}
     for a in rows:
-        if a.get("filter"):
+        if a.get("filter") and a.get("main"):
+            a["signals"] = []
+            for c in candidates or []:
+                if (c.get("side") or "long") != "long" or c.get("outcome") not in MAIN_FILTER_REACHED:
+                    continue
+                s = {"symbol": c.get("symbol"), "open_rvol": c.get("open_rvol"), "outcome": c.get("outcome"),
+                     "reason": c.get("reason")}
+                r = replays.get(c.get("symbol"))
+                if c.get("outcome") == "filtered" and r:
+                    s.update(replay_result=r.get("result"), replay_net=r.get("net"), replay_r=r.get("r"))
+                a["signals"].append(s)
+        elif a.get("filter"):
             a["signals"] = [{"symbol": c.get("symbol"), "open_rvol": c.get("open_rvol"),
                              "outcome": c["accounts"][a["name"]].get("outcome"),
                              "reason": c["accounts"][a["name"]].get("reason")}
@@ -787,8 +809,9 @@ def edge_stats(rs, seed=20261113, boot=BOOT, unit="trades"):
 EDGE_GROUPS = (
     ("Long, traded (paper)", lambda o: o["side"] == "long" and o["why"] == "traded"),
     ("Long, skipped by the cost filter (replayed)", lambda o: o["side"] == "long" and o["why"] == "cost_filter"),
+    ("Long, kept out by the opening-volume filter (replayed)", lambda o: o["side"] == "long" and o["why"] == "filtered"),
     ("Long, other signals not taken (replayed)",
-     lambda o: o["side"] == "long" and o["why"] not in ("traded", "cost_filter")),
+     lambda o: o["side"] == "long" and o["why"] not in ("traded", "cost_filter", "filtered")),
     ("Long, every signal (traded or replayed)", lambda o: o["side"] == "long"),
     ("Short, every breakdown (shadow)", lambda o: o["side"] == "short"),
     ("Short, charges within the cost filter (shadow)", lambda o: o["side"] == "short" and o.get("cost_ok") is True),
@@ -937,7 +960,9 @@ def blocks(rep, card, analysis=None):
                                             money(_f(r.get("max_daily_loss_inr"))), r.get("max_trades_per_day"),
                                             r.get("no_entries_before"), r.get("no_entries_after"), r.get("flat_by"),
                                             rep.get("universe") if not isinstance(rep.get("universe"), list)
-                                            else ", ".join(rep["universe"]))))
+                                            else ", ".join(rep["universe"])) +
+                     (" Only stocks whose opening volume (09:20-09:30) is at least %gx its 20-day median." %
+                      r["filter"]["min_open_rvol"] if (r.get("filter") or {}).get("min_open_rvol") else "")))
     if rep.get("instruments"):
         out.append(("p", "What it trades: " + rep["instruments"]))
     out.append(("h2", "Trades"))
@@ -1240,7 +1265,7 @@ def why_blocks(wi):
                     "cash)" % (L["entries"], money(L["orders_total"]))
         cash += "."
     items.append(cash)
-    out.append(("p", "Three rules each stop the day at about three entries:"))
+    out.append(("p", "Three rules limit the day's entries:"))
     out.append(("ul", items))
     if L["capped"]:
         out.append(("p", "Signals these limits kept out today: %d. Replayed, they would have made %s net (see "
@@ -1287,27 +1312,57 @@ def _rvol_text(x):
 
 
 def filter_blocks(a):
-    """An account's own filter: what it is, and which of the day's signals it let through or kept out."""
+    """An account's own filter: what it is, and which of the day's signals it let through or kept out. The main
+    account's kept-out signals are replayed (the report's shadows), so the filter's cost or saving shows."""
     f = a["filter"]
-    out = [("p", "The %d-a-day account has a filter the others do not: it takes a signal only when the stock's "
-                 "opening volume (09:20-09:30) is at least %gx its median over the last 20 days. research.py found "
-                 "that the one rule that picked better trades in both archives; this account tries it for real. "
-                 "Compare it with the %d-trades-a-day row of the trade-cap replay further down, which has no filter."
-                 % (a["cap"], f["min_open_rvol"], a["cap"]))]
+    if a.get("main"):
+        out = [("p", "The main account (%d a day) has a filter: it takes a signal only when the stock's opening volume "
+                     "(09:20-09:30) is at least %gx its median over the last 20 days. research.py found that the one "
+                     "rule that picked better trades in both archives. The other accounts take every signal. Each "
+                     "signal it kept out is replayed with the same rules (\"If taken\"), so what the filter saved or "
+                     "cost is measured. Compare it with the %d-trades-a-day row of the trade-cap replay further down, "
+                     "which has no filter." % (a["cap"], f["min_open_rvol"], a["cap"]))]
+    else:
+        out = [("p", "The %d-a-day account has a filter the others do not: it takes a signal only when the stock's "
+                     "opening volume (09:20-09:30) is at least %gx its median over the last 20 days. research.py "
+                     "found that the one rule that picked better trades in both archives; this account tries it for "
+                     "real. Compare it with the %d-trades-a-day row of the trade-cap replay further down, which has "
+                     "no filter." % (a["cap"], f["min_open_rvol"], a["cap"]))]
     sig = a.get("signals") or []
     kept = [s for s in sig if s.get("outcome") == "filtered"]
     passed = [s for s in sig if s.get("outcome") != "filtered"]
     if not sig:
         out.append(("p", "No signals reached it today."))
         return out
-    out.append(("table", ["Stock", "Opening volume", "Filter", "What happened"],
-                [[s["symbol"], _rvol_text(s.get("open_rvol")),
-                  "kept out" if s.get("outcome") == "filtered" else "let through",
-                  "" if s.get("outcome") == "filtered" else ACCOUNT_OUTCOMES.get(s.get("outcome"), s.get("outcome") or "")
-                  + (": %s" % s["reason"] if s.get("reason") and s.get("outcome") != "traded" else "")]
-                 for s in sig]))
-    out.append(("p", "Let through %d of %d signals, kept out %d." % (len(passed), len(sig), len(kept))))
+
+    def happened(s):
+        if s.get("outcome") == "filtered":
+            return ""
+        o = s.get("outcome")
+        return ACCOUNT_OUTCOMES.get(o, o or "") + (": %s" % s["reason"] if s.get("reason") and o != "traded" else "")
+
+    head = ["Stock", "Opening volume", "Filter", "What happened"]
+    rows = [[s["symbol"], _rvol_text(s.get("open_rvol")), "kept out" if s.get("outcome") == "filtered" else
+             "let through", happened(s)] for s in sig]
+    if a.get("main"):
+        head.append("If taken (replayed)")
+        for row, s in zip(rows, sig):
+            row.append(_replay_text(s) if s.get("outcome") == "filtered" else "")
+    out.append(("table", head, rows))
+    line = "Let through %d of %d signals, kept out %d." % (len(passed), len(sig), len(kept))
+    nets = [s["replay_net"] for s in kept if s.get("replay_net") is not None]
+    if a.get("main") and nets:
+        line += " The %d kept out that could be replayed would have made %s net (%d of %d green)." % (
+            len(nets), signed_money(sum(nets)), sum(1 for x in nets if x > 0), len(nets))
+    out.append(("p", line))
     return out
+
+
+def _replay_text(s):
+    if s.get("replay_net") is None:
+        return "not replayed" + (" (%s)" % s["replay_result"] if s.get("replay_result") else "")
+    return "%s, %s" % (EXIT_WORDS.get(s.get("replay_result"), s.get("replay_result") or "?"),
+                       signed_money(s["replay_net"]))
 
 
 ACCOUNT_OUTCOMES = {"traded": "traded", "shadow": "not taken", "size_refused": "no size fits",
@@ -1325,8 +1380,8 @@ def cap_blocks(tc):
     out.append(("p", "The day's signals run through the paper account's rules at each number of trades a day, at "
                      "%s: the max loss a trade, the cost filter, Claude's veto, the cash (less the amount kept back, "
                      "no margin) and a daily loss limit of that many times the max loss a trade, so the last trade "
-                     "is never kept out by the loss rule. Same fills and exits as the paper broker. The paper "
-                     "account itself trades %s a day." % (_lab(tc["budget"]), tc.get("live_cap") or "?")))
+                     "is never kept out by the loss rule. No opening-volume filter: every signal counts. Same fills "
+                     "and exits as the paper broker. The main paper account itself trades %s a day." % (_lab(tc["budget"]), tc.get("live_cap") or "?")))
     out.append(("table", ["Trades a day", "Daily loss limit", "Trades", "Won", "Net", "Charges", "Return", "Avg R",
                           "Most in stock at once", "Kept out"],
                 [[r["cap"], money(r["daily_loss"]), r["totals"]["trades"], r["totals"]["wins"],

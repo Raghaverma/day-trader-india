@@ -491,7 +491,7 @@ class Day(object):
             tags = self.tags_for(sym, h.get("at"))
             if tags is not None:
                 c["tags"] = tags
-            if self.settings.get("tags") or any(a.get("filter") for a in self.accounts()):
+            if self.settings.get("tags") or self.main_filter() or any(a.get("filter") for a in self.accounts()):
                 c["open_rvol"] = self.open_rvol(sym)
             self.st["candidates"][sym] = c
         c["tries"] = c.get("tries", 0) + 1
@@ -547,6 +547,12 @@ class Day(object):
                 return
         if self.accounts():
             self.trade_accounts(c, sym, plan_path)
+        f = self.main_filter()           # the main account's own filter: after the other accounts have the signal
+        if f:
+            why = accounts.filter_reason(f, self.signal_rvol(c, sym))
+            if why:
+                self.finish(c, "filtered", why)
+                return
         cap = self.cap_reason()
         if cap:
             self.finish(c, "shadow", cap)
@@ -586,6 +592,11 @@ class Day(object):
             return
         c["fill"] = ac.tail(r.out, 300)
         self.finish(c, "traded")
+
+    def main_filter(self):
+        """The main account's own filter (accounts.filters under its cap's name, "cap5" for 5 a day), or None."""
+        cap = int(self.cfg.get("max_trades_per_day") or 0)
+        return accounts.filter_of(self.settings, cap) if cap else None
 
     def daily_setups(self, sym):
         doc = ac.read_json(self.path("daily.json")) or {}

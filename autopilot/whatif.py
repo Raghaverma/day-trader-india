@@ -130,7 +130,7 @@ def trade_caps(signals, cfg, caps=DEFAULT_CAPS, budget=None, max_charges_r=None)
 
 
 def caps_for_report(rep, cfg, caps=DEFAULT_CAPS, budget=None, max_charges_r=None):
-    rows = trade_caps(sizes.from_report(rep), cfg, caps, budget, max_charges_r)
+    rows = trade_caps(sizes.from_report(rep, keep_filtered=True), cfg, caps, budget, max_charges_r)
     for r in rows:
         r.pop("days", None)
     return {"budget": rows[0]["budget"] if rows else float(budget or cfg.get("budget") or 0),
