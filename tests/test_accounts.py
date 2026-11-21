@@ -51,6 +51,18 @@ class Config(unittest.TestCase):
         self.assertEqual(accounts.filter_words(f), "opening volume 1.5x or more")
 
 
+class SizeRefusal(unittest.TestCase):
+    def test_nse_budgets_own_words_not_its_json(self):
+        why = "one share of HDFCBANK costs ₹830.15, more than your cash limit. No order."
+        r = mock.Mock(data={"sizing": {"refusal": why}, "notes": []}, out="", err="")
+        self.assertEqual(run_day.size_refusal(r), why)
+        r = mock.Mock(data=None, out='{"sizing": {"refusal": "one share costs \\u20b9830.15. No order."}, "notes": []}',
+                      err="")
+        self.assertEqual(run_day.size_refusal(r), "one share costs ₹830.15. No order.")
+        r = mock.Mock(data={"notes": ["cash is short"]}, out="", err="")
+        self.assertEqual(run_day.size_refusal(r), "cash is short")
+
+
 class InTheDay(HomeBase):
     def setUp(self):
         super(InTheDay, self).setUp()

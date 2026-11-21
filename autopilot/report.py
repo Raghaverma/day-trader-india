@@ -513,6 +513,11 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
     main_filter = accounts.filter_of(settings, cfg.get("max_trades_per_day") or 0)
     if main_filter:
         rep["rules"]["filter"] = main_filter
+    for k in ("entry_ttl_minutes", "cash_buffer_pct", "max_position_pct", "max_order_inr"):   # the journal's rules
+        if cfg.get(k) is not None:
+            rep["rules"][k] = cfg[k]
+    if (settings.get("cost_filter") or {}).get("max_charges_r") is not None:
+        rep["rules"]["cost_filter_max_r"] = settings["cost_filter"]["max_charges_r"]
     budgets = settings.get("sizes") or []
     if budgets:
         rep["sizes"] = account_sizes(rep, cfg, budgets, (settings.get("cost_filter") or {}).get("max_charges_r"))

@@ -142,7 +142,14 @@ class Files(HomeBase):
         with open(os.path.join(self.out, "days", DAY + ".md"), encoding="utf-8") as fh:
             page = fh.read()
         self.assertIn("RELIANCE", page)
-        self.assertIn("**Why:**", page)
+        self.assertIn("## The strategy", page)
+        self.assertIn("**Why it was bought: the autopilot's steps**", page)
+        self.assertIn("**10:05, the signal:** a 5-minute bar closed at ₹1,334, above the opening-range high", page)
+        self.assertIn("On the daily chart it was also a 20-day breakout.", page)
+        self.assertIn("**The size (nse-budget):** 37 shares, ₹49,358, set by the max loss a trade", page)
+        self.assertIn("**The risk check (nse-risk):** PASS.", page)
+        self.assertIn("**Why it made or lost money:**", page)
+        self.assertNotIn("the cost filter (round-trip", page)          # no cost filter in this config
 
     def test_every_paper_account_gets_its_trades_and_reasons(self):
         self.archive_reliance()
@@ -158,9 +165,12 @@ class Files(HomeBase):
         self.assertIn("## 5 trades a day, opening volume 1.5x or more only (main account): +₹328.40 net", page)
         self.assertIn("## 3 trades a day: +₹328.40 net", page)
         self.assertIn("#### 1. RELIANCE: WIN, +₹328.40", page)
-        self.assertEqual(page.count("**Why:**"), 1)                  # the 3-a-day account's trade is told once
-        self.assertIn("Same order, fill and exit as in the 5 a day + volume filter account above, with 37 shares",
-                      page)
+        self.assertEqual(page.count("**Why it made or lost money:**"), 1)    # the 3-a-day account's: told once
+        self.assertIn("Same signal, order, fill and exit as in the 5 a day + volume filter account above, with 37 "
+                      "shares", page)
+        self.assertIn("opening volume 2.40x its 20-day median, at least the 1.5x this account needs", page)
+        self.assertIn("| 5 trades a day, opening volume 1.5x or more only (main account) | 5 | ₹1,500 | opening "
+                      "volume 1.5x or more |", page)
         self.assertIn("### What the opening-volume filter kept out", page)
         self.assertIn("It kept out none of today's signals.", page)
         with open(os.path.join(self.out, "P&L ledger.csv"), encoding="utf-8") as fh:
@@ -191,6 +201,43 @@ class Files(HomeBase):
         self.assertIn("| RELIANCE | 10:05 | 1.11x | target |", page)
         with open(os.path.join(self.out, "Summary.md"), encoding="utf-8") as fh:
             self.assertIn("| Kept out by the opening-volume filter | +", fh.read())
+
+    def test_pdfs_at_the_top_of_the_folder_printed_only_when_a_page_changed(self):
+        self.archive_reliance()
+        self.settings["journal"]["pdf"] = True
+        self.write_settings()
+        printed = []
+
+        def fake_render(home, html_path, pdf_path):
+            self.assertTrue(html_path.endswith(".html"))                 # WebKit opens only an .html name
+            with open(html_path, encoding="utf-8") as fh:
+                page = fh.read()
+            self.assertIn("<!doctype html>", page)
+            printed.append(os.path.basename(pdf_path))
+            with open(pdf_path, "wb") as fh:
+                fh.write(b"%PDF-1.4 test")
+        with mock.patch("pdf.render", side_effect=fake_render):
+            self.replay()
+            self.assertEqual(sorted(printed), [DAY + ".pdf", "Summary.pdf"])
+            for name in (DAY + ".pdf", "Summary.pdf"):
+                self.assertTrue(os.path.isfile(os.path.join(self.out, name)), name)
+            with open(os.path.join(self.out, ".pdf", "Summary.html"), encoding="utf-8") as fh:
+                self.assertIn('href="%s.pdf"' % DAY, fh.read())              # the summary links to the PDFs
+            del printed[:]
+            with mock.patch.object(journal.nc, "utc_now", return_value=journal.nc.utc_now()):
+                journal.write_all(self.d, ac.load_settings(self.d), ac.load_cfg(self.d))
+            self.assertNotIn(DAY + ".pdf", printed)                         # the day page did not change
+
+    def test_a_pdf_failure_is_reported_and_stops_the_rest(self):
+        self.replay()
+        self.settings["journal"]["pdf"] = True
+        self.write_settings()
+        import pdf
+        with mock.patch("pdf.render", side_effect=pdf.PdfError("no session")) as r:
+            folder, n, note = journal.write_all(self.d, ac.load_settings(self.d), ac.load_cfg(self.d))
+        self.assertEqual(r.call_count, 1)
+        self.assertIn("PDF: %s.pdf: no session" % DAY, note)
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "days", DAY + ".md")))   # the text pages are there
 
     def test_my_notes_is_never_overwritten(self):
         self.replay()

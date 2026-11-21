@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version 1.15.0" src="https://img.shields.io/badge/version-1.15.0-blue?style=flat-square">
+  <img alt="version 1.16.0" src="https://img.shields.io/badge/version-1.16.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
@@ -121,7 +121,7 @@ cd tests && python3 -m unittest discover -v
 | 09:35-14:30 | every 5 minutes, an opening-range scan; each new signal goes through entry, exit, the Time Machine, budget, a fresh quote and risk, then the paper broker. After the day's trade cap or loss limit, signals are planned but not traded |
 | 09:16-15:10 | every minute, `paper-check` runs the stops, targets and the 15:10 flat-by on 1-minute bars |
 | 15:35 | the report (Markdown, HTML, JSON and a running scorecard), Claude's plain-words analysis, then a Gmail email with the traded stocks' files attached. The report says what it trades, why it took only N trades, and what the whole principal would have done |
-| after 15:35 | the P&L journal, rebuilt in `~/Desktop/NSE Trading P&L`: every paper order of every paper account with what it made or lost and **why** (gave back a winner, failed breakout, late fill on a pullback, never filled, target hit...), worked out from the 1-minute prices by fixed rules; a ledger CSV, a daily CSV with each account's running total, a summary with the accounts side by side and one page per day (each account's trades, what its trade cap and its own filter kept out, replayed) |
+| after 15:35 | the P&L journal, rebuilt in `~/Desktop/NSE Trading P&L`: every paper order of every paper account with what it made or lost and **why** (gave back a winner, failed breakout, late fill on a pullback, never filled, target hit...), worked out from the 1-minute prices by fixed rules; a ledger CSV, a daily CSV with each account's running total, a summary with the accounts side by side and one page per day: the strategy and its rules that day, Claude's news check before the open, and each account's trades with **why each was bought** (the autopilot's own steps: the signal, the plan, the checks, the Time Machine's odds, the size, the risk check, the order), what happened and why it made or lost money, plus what its trade cap and its own filter kept out, replayed. With `"journal": {"pdf": true}` each day and the summary are also printed to `<date>.pdf` and `Summary.pdf` at the top of the folder (macOS WebKit through `autopilot/html2pdf.swift`, built once with the Xcode command-line tools; needs the logged-in session launchd runs in) |
 | 08:42, then :00 and :30 to 15:30 | a progress email: what the autopilot is doing now, every paper trade, money made and lost (realised and open), the signals and why each was or wasn't traded, the pre-market veto, and any stuck tick or failed step. On a closed day, one email saying why it isn't running. At 16:00, only if the 15:35 email didn't go out, the day's numbers anyway |
 
 ```bash

@@ -66,6 +66,20 @@ def minutes(text):
     return t.hour * 60 + t.minute
 
 
+def size_refusal(r):
+    """Why nse-budget sized nothing, in its own words (sizing.refusal), not the tail of its JSON."""
+    d = r.data or {}
+    why = (d.get("sizing") or {}).get("refusal") or "; ".join(d.get("notes") or [])
+    if not why:
+        m = re.search(r'"refusal":\s*"((?:[^"\\]|\\.)*)"', r.out or "")
+        if m:
+            try:
+                why = json.loads('"%s"' % m.group(1))
+            except ValueError:
+                why = m.group(1)
+    return why or ac.tail(r.err or r.out, 300)
+
+
 class Day(object):
     """One trading day of the autopilot. `now` is naive UTC; `runner` runs the skill scripts; `claude` and
     `send_mail` are swapped out in tests."""
@@ -322,8 +336,7 @@ class Day(object):
         r = run("size", "size", ["--plan", plan, "--write", "--json"], sym)
         sizing = (r.data or {}).get("sizing") or {}
         if not r.ok:
-            return {"outcome": "size_refused",
-                    "reason": "; ".join((r.data or {}).get("notes") or []) or ac.tail(r.err or r.out, 300)}
+            return {"outcome": "size_refused", "reason": size_refusal(r)}
         run("quote", "alerts", ["quote", sym, "--write", os.path.join(home, "prices.json"), "--json"], sym)
         r = run("risk", "risk", ["--json"], sym)
         res = ((r.data or {}).get("results") or [{}])[0]
@@ -567,7 +580,7 @@ class Day(object):
         r = run("size", "size", ["--plan", plan_path, "--write", "--json"], sym)
         sizing = (r.data or {}).get("sizing") or {}
         if not r.ok:
-            self.finish(c, "size_refused", "; ".join((r.data or {}).get("notes") or []) or r.err or r.out)
+            self.finish(c, "size_refused", size_refusal(r))
             return
         c["order"] = {"qty": sizing.get("qty"), "entry": sizing.get("entry"), "stop_limit": sizing.get("stop_limit"),
                       "bound_by": sizing.get("bound_by"), "cost": sizing.get("cost")}

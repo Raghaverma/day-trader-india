@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.16.0
+
+### The journal as PDFs, with the strategy and why each trade was made
+
+- **PDFs at the top of the journal folder.** With `"journal": {"pdf": true}`, each day's page and the summary are
+  printed to `<date>.pdf` and `Summary.pdf` next to the CSVs (the Markdown stays in `days/`). `autopilot/pdf.py`
+  turns the journal's Markdown into one styled HTML page (gains in green, losses in red) and prints it to A4 with
+  macOS's own WebKit through `autopilot/html2pdf.swift`, compiled once into `<trader folder>/tools/html2pdf` (Xcode
+  command-line tools). A page is printed again only when it changed; the first failure stops the rest and is
+  reported in the journal's line, never failing the day. Nothing to install from outside macOS.
+- **The strategy, every day.** Each day's page starts with the setup and its rules that day: the opening-range
+  breakout, the signal, the plan (stop at the range's middle, 2R target, flat by 15:10, the LIMIT's expiry), the
+  checks in order (Claude's veto, the cost filter, an account's own filter, the trade cap, the daily loss limit),
+  the sizing limits, nse-risk and the Time Machine; and each account's cap, loss limit and filter.
+- **Before the open.** The market's mood and Claude's pre-market news check: what it vetoed and its own reasoning.
+- **Why each trade was made.** Every trade gets the autopilot's own steps, from what it recorded at the time: the
+  stock file's flags and the veto, the signal (the bar, the range, how far over, the volume, a daily-chart setup),
+  nse-exit's plan with its charges and break-even, the checks it passed (cost, opening volume, the slot), the Time
+  Machine's odds and past sessions, nse-budget's size and the limit that set it, nse-risk's verdict and the order.
+  Then "What happened" and "Why it made or lost money", as before.
+- **The report rules** now also record the entry expiry, the cash buffer, the position and order caps and the cost
+  filter, so later days' strategy text is exact.
+- **Fix:** a signal nse-budget could not size is recorded with its own sentence ("one share of HDFCBANK costs
+  ₹830.15, more than your cash limit...") instead of the tail of its JSON.
+- 8 new tests.
+
 ## 1.15.0
 
 ### The main account can carry the opening-volume filter, and the journal covers every account

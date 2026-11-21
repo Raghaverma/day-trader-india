@@ -12,8 +12,10 @@ The folder (autopilot.json "journal": {"enabled": true, "dir": "~/Desktop/NSE Tr
                        the main account did not take
     P&L ledger.csv     one row per paper order, every account, all days: the numbers and the reason
     Daily P&L.csv      one row per account per day, with each account's running total
-    days/<date>.md     the day in full: every account's trades, each one's story and reason, the market, the
-                       signals not taken (the trade cap, an account's own filter), Claude's analysis
+    days/<date>.md     the day in full: the strategy and its rules, Claude's news check before the open, every
+                       account's trades (why each was bought, step by step; what happened; why it made or lost
+                       money), the signals not taken (the trade cap, an account's own filter), Claude's analysis
+    <date>.pdf         the same page as a PDF, and Summary.pdf ("journal": {"pdf": true}; pdf.py, macOS WebKit)
     My notes.md        yours: created once, never touched again
 
 Everything is rebuilt from the trader folder's own records (reports/<date>.json, state/paper.json and each paper
@@ -205,10 +207,11 @@ def explain(t, cand, bars, nifty, cfg, cancel_note=None):
         return row
 
     delay = (mins(row["fill_at"]) - mins(row["ordered_at"])) if row["fill_at"] and row["ordered_at"] else 0
-    story.append("Order: LIMIT buy %s at %s at %s; stop %s (risk %s a share), target %s (2R)." % (
-        qty, px(t.get("limit")), row["ordered_at"], px(stop), px(risk), px(target)))
-    story.append("Filled at %s at %s%s." % (px(t.get("fill_price")), row["fill_at"],
-                                            " (%d min after the order)" % delay if delay >= 2 else ""))
+    story.append("Order: LIMIT buy %s at %s at %s; stop %s, target %s (2R)." % (
+        qty, px(t.get("limit")), row["ordered_at"], px(stop), px(target)))
+    story.append("Filled at %s at %s%s%s." % (px(t.get("fill_price")), row["fill_at"],
+                                              " (%d min after the order)" % delay if delay >= 2 else "",
+                                              "; %s a share above the stop from this fill" % px(risk) if risk else ""))
     end = row["exit_at"] or "15:30"
     held = window(bars, row["fill_at"], end)
     if not held:
@@ -303,6 +306,221 @@ def explain(t, cand, bars, nifty, cfg, cancel_note=None):
     return row
 
 
+# ---------------------------------------------------------------- why it was bought: the autopilot's own steps
+
+BOUND = {"max loss": "the max loss a trade", "cash": "the cash still free (the trades already open hold the rest, and "
+         "%s is kept back)", "position cap": "the cap on one stock (%s%% of the money)",
+         "max order": "the largest order allowed (%s)"}
+
+
+def context_of(rep, cfg, settings):
+    """What every trade's decision trail needs from the day: the market before the open, Claude's vetoes, the stock
+    files' flags and the rules (the day's report first, today's config for anything it did not record)."""
+    rules = dict(rep.get("rules") or {})
+    for k in ("cash_buffer_pct", "max_position_pct", "max_order_inr", "budget", "max_loss_per_trade_inr"):
+        if rules.get(k) is None:
+            rules[k] = cfg.get(k)
+    if rules.get("cost_filter_max_r") is None:
+        rules["cost_filter_max_r"] = ((settings or {}).get("cost_filter") or {}).get("max_charges_r")
+    stocks = rep.get("stocks") or {}
+    flags = {f.get("symbol"): f.get("flags") or [] for f in stocks.get("flagged") or [] if isinstance(f, dict)}
+    return {"regime": rep.get("regime") or {}, "rules": rules, "flags": flags,
+            "vetoes": {v.get("symbol"): v.get("reason") for v in rep.get("vetoes") or [] if isinstance(v, dict)},
+            "veto_ran": bool(rep.get("veto_summary") or rep.get("vetoes")), "stocks_ran": bool(stocks.get("count"))}
+
+
+def _pct(x):
+    return "%.1f%%" % (100 * x) if x is not None else "n/a"
+
+
+def decisions(t, cand, B, ctx, slot):
+    """The autopilot's steps for one order, in the order it took them, from what it recorded at the time."""
+    sym = t.get("symbol")
+    trig = cand.get("trigger") or {}
+    plan = cand.get("plan") or {}
+    tags = cand.get("tags") or {}
+    reg, rules = ctx["regime"], ctx["rules"]
+    out = []
+    pre = []
+    if reg.get("nifty_trend"):
+        pre.append("the Nifty's trend was %s and India VIX %s (%s)" % (reg["nifty_trend"], reg.get("vix") or "n/a",
+                                                                      reg.get("vix_band") or "n/a"))
+    if ctx["veto_ran"]:
+        pre.append("Claude read the news and NSE filings and did not veto %s" % sym)
+    if ctx["stocks_ran"]:
+        fl = ctx["flags"].get(sym)
+        pre.append("its stock file flagged %s" % ("; ".join(fl) if fl else "nothing"))
+    if pre:
+        out.append("**Before the open:** %s." % "; ".join(pre))
+    at = trig.get("at") or cand.get("scan_at")
+    sig = "**%s, the signal:** a 5-minute bar closed at %s, above the opening-range high %s (the 09:15-09:30 range " \
+          "was %s to %s)" % (at or "?", px(trig.get("price") or cand.get("scan_price")), px(cand.get("or_high")),
+                             px(cand.get("or_low")), px(cand.get("or_high")))
+    bits = []
+    if cand.get("pct_over") is not None:
+        bits.append("%.2f%% over" % cand["pct_over"])
+    if trig.get("volume_x") is not None:
+        bits.append("on %.2fx its normal volume" % trig["volume_x"])
+    sig += (", " + ", ".join(bits) if bits else "") + "."
+    if tags.get("nifty_today"):
+        sig += " The Nifty was %s on the day by then." % tags["nifty_today"]
+    if cand.get("daily_setups"):
+        sig += " On the daily chart it was also a %s." % " and a ".join(
+            SETUP_WORDS.get(x, str(x).replace("_", " ")) for x in cand["daily_setups"])
+    if cand.get("first_seen") and at and cand["first_seen"] > at:
+        sig += " nse-entry confirmed it and the autopilot picked it up at %s." % cand["first_seen"]
+    out.append(sig)
+    if plan.get("entry"):
+        p = "**The plan (nse-exit):** buy at %s; stop %s, the middle of the opening range, so %s a share at risk" % (
+            px(plan["entry"]), px(plan.get("stop")), px(plan.get("risk_per_share")))
+        if plan.get("worst_exit"):
+            p += " (%s if the stop fills at its worst, %s)" % (px(plan.get("risk_per_share_worst")),
+                                                                px(plan["worst_exit"]))
+        p += "; target %s, twice the risk (2R); sell whatever is left at %s." % (px(plan.get("target")),
+                                                                               plan.get("flat_by") or "15:10")
+        if plan.get("charges_r") is not None:
+            p += " Round-trip charges at the stop come to %.2fR" % plan["charges_r"]
+            if plan.get("reward_risk_after_charges") is not None:
+                p += "; after charges the target pays %.2f times the risk" % plan["reward_risk_after_charges"]
+            if plan.get("break_even"):
+                p += "; break-even %s" % px(plan["break_even"])
+            p += "."
+        out.append(p)
+    checks = []
+    if ctx["veto_ran"]:
+        checks.append("no veto")
+    mx = rules.get("cost_filter_max_r")
+    if plan.get("charges_r") is not None and mx is not None:
+        checks.append("the cost filter passed (charges %.2fR, at most %.2fR allowed)" % (plan["charges_r"], float(mx)))
+    rvol, f = cand.get("open_rvol"), B.get("filter")
+    if f and f.get("min_open_rvol"):
+        checks.append("opening volume %s its 20-day median, at least the %gx this account needs" % (
+            "%.2fx" % rvol if rvol is not None else "?", f["min_open_rvol"]))
+    elif rvol is not None:
+        checks.append("opening volume %.2fx its 20-day median (no volume filter on this account)" % rvol)
+    if B.get("cap"):
+        checks.append("a trade slot was free (%s of %d today)" % (_ordinal(slot), B["cap"]))
+    if checks:
+        out.append("**The checks:** %s." % "; ".join(checks))
+    tm = cand.get("tm") or {}
+    if tm.get("p_target") is not None:
+        m = "**The Time Machine (shown, never used to choose):** in 10,000 replays of the rest of the day, %s reached " \
+            "the target first, %s the stop first and %s neither by 15:10" % (
+                _pct(tm["p_target"]), _pct(tm.get("p_stop")), _pct(tm.get("p_neither")))
+        h = tm.get("history") or {}
+        if h.get("triggered"):
+            m += "; on the %d past days this setup fired on %s, %d hit the target, %d the stop and %d neither" % (
+                h["triggered"], sym, h.get("target") or 0, h.get("stop") or 0, h.get("close") or 0)
+        m += ". Its verdict: %s." % (tm.get("category") or "none")
+        out.append(m)
+    if B["main"]:
+        order = cand.get("order") or {}
+        qty, bound = order.get("qty"), order.get("bound_by")
+    else:
+        acc = (cand.get("accounts") or {}).get(B["name"]) or {}
+        qty, bound = acc.get("qty"), acc.get("bound_by")
+    qty = qty or t.get("qty")
+    if qty:
+        entry = t.get("limit") or plan.get("entry")
+        z = "**The size (nse-budget):** %s share%s%s" % (qty, "" if qty == 1 else "s",
+                                                        ", %s" % money(qty * entry) if entry else "")
+        if bound:
+            z += ", set by %s" % bound_words(bound, rules)
+        if bound == "max loss" and t.get("max_loss"):
+            z += ": a stop at its worst fill would lose about %s with charges, within %s" % (
+                money(t["max_loss"], 2), money(rules.get("max_loss_per_trade_inr")))
+        out.append(z + ".")
+    risk = (cand.get("risk") or {}) if B["main"] else {}
+    r = "**The risk check (nse-risk):** PASS%s" % ("" if B["main"] else " on this account's own limits")
+    if risk.get("warnings"):
+        r += "; it warned: %s" % "; ".join(str(w) for w in risk["warnings"])
+    out.append(r + ".")
+    out.append("**The order:** a paper LIMIT buy of %s at %s, sent at %s." % (
+        qty, px(t.get("limit")), hhmm(t.get("ordered_at")) or "?"))
+    return out
+
+
+SETUP_WORDS = {"breakout_20d": "20-day breakout", "bull_flag": "bull flag", "oversold_bounce": "oversold bounce",
+               "oversold": "oversold bounce"}
+
+
+def bound_words(bound, rules):
+    w = BOUND.get(bound, bound)
+    if bound == "cash":
+        budget, pct = rules.get("budget"), rules.get("cash_buffer_pct")
+        return w % (money(float(budget) * float(pct) / 100) if budget and pct is not None else "a buffer")
+    if bound == "position cap":
+        return w % (rules.get("max_position_pct") or "?")
+    if bound == "max order":
+        return w % money(rules.get("max_order_inr"))
+    return w
+
+
+def _ordinal(n):
+    return "%d%s" % (n, {1: "st", 2: "nd", 3: "rd"}.get(n if n < 20 else n % 10, "th"))
+
+
+def strategy_markdown(D, ctx):
+    """The rules the accounts traded by that day, in plain words."""
+    rules = ctx["rules"]
+    accs = D["accounts"]
+    filt = next((B["filter"] for B in accs if B.get("filter")), None)
+    budget = rules.get("budget")
+    L = ["## The strategy", "",
+         "Every account trades one setup, the same way: the **15-minute opening-range breakout (ORB)**, long only "
+         "(buy, then sell), in the Nifty 50 shares on NSE's cash market, intraday (MIS), with paper money.", "",
+         "1. **Before the open (from 08:40):** a file is built on every stock (price, results, NSE filings, deals, "
+         "pledges, the F&O ban list) and Claude reads the news and filings. It can veto a stock for the day when fresh, "
+         "concrete news could move it hard either way.",
+         "2. **The opening range:** the high and the low of the first 15 minutes, 09:15 to 09:30.",
+         "3. **The signal:** every 5 minutes, a scan looks for a 5-minute bar that closes above a stock's opening-range "
+         "high; nse-entry confirms it. New trades only from %s to %s." % (rules.get("no_entries_before") or "09:30",
+                                                                         rules.get("no_entries_after") or "14:30"),
+         "4. **The plan:** a LIMIT buy at the breakout price; the stop at the middle of the opening range; the target "
+         "at twice the risk (2R). Anything still open at %s is sold.%s" % (
+             rules.get("flat_by") or "15:10",
+             (" A LIMIT buy that has not filled within %d minutes is cancelled, and its slot freed." %
+              int(rules["entry_ttl_minutes"])) if rules.get("entry_ttl_minutes") else ""),
+         "5. **The checks, in this order:** Claude's veto%s%s; the trade cap, first come first served (nothing ranks "
+         "the signals); the daily loss limit." % (
+             ("; the cost filter (round-trip charges at the stop at most %gR of the risk, or the trade is not worth "
+              "taking)" % float(rules["cost_filter_max_r"])) if rules.get("cost_filter_max_r") is not None else "",
+             ("; an account's own filter (the opening-volume filter: the stock's volume from 09:20 to 09:30 at least "
+              "%gx its 20-day median)" % filt["min_open_rvol"]) if filt else ""),
+         "6. **The size:** the most shares that keep the loss at the stop, at its worst fill and with charges, within "
+         "%s; paid from cash only (%s kept back, no margin), at most %s%% of the money in one stock and %s an order."
+         % (money(rules.get("max_loss_per_trade_inr")),
+            money(float(budget) * float(rules["cash_buffer_pct"]) / 100) if budget and rules.get("cash_buffer_pct")
+            is not None else "a buffer", rules.get("max_position_pct") or "?", money(rules.get("max_order_inr"))),
+         "7. **The risk check:** nse-risk checks every order against these rules before the paper broker takes it.",
+         "8. **The Time Machine:** before the order, 10,000 replays of the rest of the day give the odds of the target "
+         "or the stop first. They are recorded and shown, never used to choose.", "",
+         "| Account | Trades a day | Daily loss limit | Its own filter |", "|---|---|---|---|"]
+    for B in accs:
+        f = B.get("filter")
+        L.append("| %s | %d | %s | %s |" % (
+            B["label"], B["cap"], money(B.get("daily_loss")) if B.get("daily_loss") else "n/a",
+            "opening volume %gx or more" % f["min_open_rvol"] if f else "none"))
+    return L + [""]
+
+
+def premarket_markdown(D, ctx):
+    rep = D["report"]
+    reg = ctx["regime"]
+    L = ["## Before the open", ""]
+    if reg.get("nifty_trend"):
+        L += ["The market: the Nifty's trend was %s; India VIX %s (%s)." % (
+            reg["nifty_trend"], reg.get("vix") or "n/a", reg.get("vix_band") or "n/a"), ""]
+    if not ctx["veto_ran"]:
+        return L + ["Claude's news check did not run.", ""]
+    v = ctx["vetoes"]
+    L.append("Claude's news check vetoed %s." % (
+        "nothing" if not v else "; ".join("**%s** (%s)" % (s, r or "no reason given") for s, r in v.items())))
+    if rep.get("veto_summary"):
+        L += ["", "Its reasoning: %s" % str(rep["veto_summary"]).strip()]
+    return L + [""]
+
+
 # ---------------------------------------------------------------- one day
 
 def short_label(cap, f=None):
@@ -320,13 +538,14 @@ def day_accounts(home, day, rep, cfg):
         for a in rows:
             cap = int(a.get("cap") or 0)
             out.append({"name": a.get("name") or accounts.name_of(cap), "cap": cap, "main": bool(a.get("main")),
-                        "filter": a.get("filter"), "budget": a.get("budget"),
+                        "filter": a.get("filter"), "budget": a.get("budget"), "daily_loss": a.get("daily_loss"),
                         "home": home if a.get("main") else accounts.home_of(home, cap)})
     else:
         r = rep.get("rules") or {}
         cap = int(r.get("max_trades_per_day") or cfg.get("max_trades_per_day") or 0)
         out.append({"name": accounts.name_of(cap), "cap": cap, "main": True, "filter": r.get("filter"),
-                    "budget": r.get("budget") or cfg.get("budget"), "home": home})
+                    "budget": r.get("budget") or cfg.get("budget"), "daily_loss": r.get("max_daily_loss_inr"),
+                    "home": home})
     for a in out:
         a["label"] = accounts.label_of(a["cap"], a["filter"], a["main"])
         a["short"] = short_label(a["cap"], a["filter"])
@@ -356,18 +575,22 @@ def replays_of(rep):
     return out
 
 
-def build_account(A, day, rep, st, nifty, bars_for, cfg, replays):
+def build_account(A, day, rep, st, nifty, bars_for, cfg, replays, ctx=None):
     """One account's day: each trade explained, the totals, and the signals it did not take (the trade cap, its
     own filter), each with what it did when replayed."""
     paper = ac.read_json(os.path.join(A["home"], "state", "paper.json")) or {}
     notes = cancel_notes(A["home"], day)
     acfg = dict(cfg, max_trades_per_day=A["cap"])
     rows = []
-    for t in sorted((t for t in paper.get("trades") or [] if t.get("date") == day),
-                    key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")):
+    for slot, t in enumerate(sorted((t for t in paper.get("trades") or [] if t.get("date") == day),
+                                    key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")), 1):
         cand = st["candidates"].get(t["symbol"]) or {}
         r = explain(t, cand, bars_for(t["symbol"]), nifty, acfg, notes.get(t.get("fingerprint")))
         r.update(account=A["short"], main="yes" if A["main"] else "no")
+        if ctx is not None:
+            r["decisions"] = decisions(t, cand, A, ctx, slot)
+        acc = cand.get("order") if A["main"] else (cand.get("accounts") or {}).get(A["name"])
+        r["bound_by"] = (acc or {}).get("bound_by")
         rows.append(r)
     closed = [r for r in rows if r.get("result") in ("WIN", "LOSS", "FLAT")]
     B = dict(A, rows=rows, orders=len(rows), filled=sum(1 for r in rows if r.get("fill_price") is not None),
@@ -406,11 +629,12 @@ def build_account(A, day, rep, st, nifty, bars_for, cfg, replays):
     return B
 
 
-def build_day(home, day, cfg):
+def build_day(home, day, cfg, settings=None):
     """The day for the journal: every paper account's trades and reasons, the main account's at the top level."""
     rep = ac.read_json(os.path.join(ac.reports_dir(home), "%s.json" % day))
     if not rep:
         return None
+    ctx = context_of(rep, cfg, settings)
     st = ac.load_day(home, day)
     nifty = bars_of(home, day, market.NIFTY)
     memo = {}
@@ -420,10 +644,11 @@ def build_day(home, day, cfg):
             memo[sym] = bars_of(home, day, sym)
         return memo[sym]
     replays = replays_of(rep)
-    accs = [build_account(A, day, rep, st, nifty, bars_for, cfg, replays) for A in day_accounts(home, day, rep, cfg)]
+    accs = [build_account(A, day, rep, st, nifty, bars_for, cfg, replays, ctx)
+            for A in day_accounts(home, day, rep, cfg)]
     sh = (rep.get("shadows") or {}).get("by_why") or {}
     D = dict(accs[0])
-    D.update(date=day, report=rep, accounts=accs, main=accs[0],
+    D.update(date=day, report=rep, accounts=accs, main=accs[0], ctx=ctx,
              nifty_pct=r2(100 * (rep.get("benchmark") or {}).get("pct"))
              if (rep.get("benchmark") or {}).get("pct") is not None else None,
              signals=(rep.get("funnel") or {}).get("signals"),
@@ -485,6 +710,7 @@ def day_markdown(D):
                 signed(B["net"], 2), B["total_R"],
                 "%+.2f%%" % B["return_pct"] if B.get("return_pct") is not None else "n/a"))
         L.append("")
+    L += strategy_markdown(D, D["ctx"]) + premarket_markdown(D, D["ctx"])
     seen = {}
     for B in accs:
         L += account_markdown(B, D, seen, multi)
@@ -532,14 +758,23 @@ def account_markdown(B, D, seen, multi):
                r.get("exit_at"), r.get("ordered_at"))
         if key in seen:
             first, qty = seen[key]
-            L += ["Same order, fill and exit as in the %s account above, with %s shares here (%s there): net %s "
-                  "(%s). %s" % (first, r.get("qty"), qty, signed(r.get("net"), 2),
-                                "%+.2fR" % r["R"] if r.get("R") is not None else "n/a",
-                                "Why: %s." % r.get("why_category") if r.get("why_category") else ""), ""]
+            L += ["Same signal, order, fill and exit as in the %s account above, with %s shares here (%s there%s): "
+                  "net %s (%s). %s" % (first, r.get("qty"), qty,
+                                       "; here the size was set by %s" % bound_words(r["bound_by"], D["ctx"]["rules"])
+                                       if r.get("bound_by") else "", signed(r.get("net"), 2),
+                                       "%+.2fR" % r["R"] if r.get("R") is not None else "n/a",
+                                       "Why it made or lost money: %s." % r.get("why_category")
+                                       if r.get("why_category") else ""), ""]
             continue
         seen[key] = (B["short"], r.get("qty"))
-        L += ["- " + s for s in r.get("story") or []]
-        L += ["", "**Why:** %s" % r.get("why"), ""]
+        if r.get("decisions"):
+            L += ["**Why it was bought: the autopilot's steps**", ""]
+            L += ["%d. %s" % (j, s) for j, s in enumerate(r["decisions"], 1)]
+            L += ["", "**What happened**", ""]
+            L += ["- " + s for s in (r.get("story") or [])[1:]]
+        else:
+            L += ["- " + s for s in r.get("story") or []]
+        L += ["", "**Why it made or lost money:** %s" % r.get("why"), ""]
     L += ["%s Why the day went the way it did" % h, ""]
     L += day_reasons(B, D, market_line=not multi)
     caps = B["caps"]
@@ -705,14 +940,18 @@ README = """# NSE Trading P&L
 The paper autopilot's profit-and-loss journal: every trade it placed, what it made or lost, and why.
 Paper trading only: no broker, no real money.
 
-- **Summary.md**: every paper account side by side (totals, day by day), the reasons trades won or lost,
+- **Summary.md** (and **Summary.pdf**): every paper account side by side (totals, day by day), the reasons trades won or lost,
   and the signals the main account did not take.
 - **P&L ledger.csv**: one row per order, every account, all days (opens in Numbers or Excel). `account` says
   which account ("5 a day + volume filter"), `main` whether it was the main account that day. The `why`
   column has the reason in words. `best_R` is how far the trade went our way before it ended (1R = the
   planned risk).
 - **Daily P&L.csv**: one row per account per day, with each account's running total.
-- **days/**: the full write-up of each day: every account's trades and why each made or lost money.
+- **<date>.pdf**: each trading day in full, as a PDF: the strategy and its rules that day, Claude's news check
+  before the open, then every account's trades: why each was bought (the autopilot's steps: the signal, the
+  plan, the checks, the Time Machine's odds, the size, the risk check, the order), what happened, and why it
+  made or lost money; what the trade cap and each account's own filter kept out, replayed; Claude's analysis.
+- **days/**: the same day pages as plain text (Markdown).
 - **My notes.md**: yours. The autopilot never changes it.
 
 It is rebuilt after each trading day's 15:35 report from the autopilot's own records (reports, paper trades,
@@ -748,21 +987,26 @@ def folder_of(settings, home):
 
 def write_all(home, settings, cfg, upto=None):
     """Rebuild the journal; returns (folder written, number of days, note)."""
-    days = [D for D in (build_day(home, d, cfg) for d in report_days(home) if not upto or d <= upto) if D]
+    days = [D for D in (build_day(home, d, cfg, settings) for d in report_days(home) if not upto or d <= upto) if D]
     target = folder_of(settings, home)
     note = None
     now_main = accounts.name_of(cfg.get("max_trades_per_day") or 0)
+    pdf_home = home if (settings.get("journal") or {}).get("pdf") else None
     try:
-        _write(target, days, None, now_main)
+        errors = _write(target, days, None, now_main, pdf_home)
     except OSError as e:
         fallback = os.path.join(home, "journal")
         note = "could not write %s (%s); written to %s instead" % (target, e.__class__.__name__, fallback)
-        _write(fallback, days, note, now_main)
+        errors = _write(fallback, days, note, now_main, pdf_home)
         target = fallback
+    if errors:
+        note = "; ".join(x for x in (note, "PDF: " + "; ".join(errors)) if x)
     return target, len(days), note
 
 
-def _write(folder, days, note, now_main=None):
+def _write(folder, days, note, now_main=None, pdf_home=None):
+    """Write the journal's files; with pdf_home, each day's page and the summary as PDFs too. Returns the PDF
+    errors (an empty list when there were none or PDFs are off)."""
     os.makedirs(os.path.join(folder, "days"), exist_ok=True)
 
     def put(name, text):
@@ -773,7 +1017,8 @@ def _write(folder, days, note, now_main=None):
         os.replace(tmp, path)
 
     put("README.md", README)
-    put("Summary.md", summary_markdown(days, note, now_main))
+    summary = summary_markdown(days, note, now_main)
+    put("Summary.md", summary)
     put("P&L ledger.csv", csv_text(LEDGER_COLS, [r for D in days for B in D["accounts"] for r in B["rows"]]))
     run, daily = {}, []
     for D in days:
@@ -792,11 +1037,50 @@ def _write(folder, days, note, now_main=None):
     notes = os.path.join(folder, "My notes.md")
     if not os.path.exists(notes):
         put("My notes.md", "# My notes\n\nYour own notes on the trades. The autopilot never changes this file.\n")
+    if not pdf_home:
+        return []
+    jobs = [("%s.pdf" % D["date"], lambda D=D: day_markdown(D), "NSE paper trading, %s" % D["date"]) for D in days]
+    jobs.append(("Summary.pdf", lambda: summary, "NSE paper trading: profit and loss"))
+    return write_pdfs(pdf_home, folder, jobs)
+
+
+def _pdf_link(href):
+    """A link in the Markdown, as the PDFs have it: days/2026-11-20.md -> 2026-11-20.pdf (next to it)."""
+    m = re.match(r"^days/(\d{4}-\d{2}-\d{2})\.md$", href)
+    return "%s.pdf" % m.group(1) if m else href
+
+
+def write_pdfs(home, folder, jobs):
+    """Each (file name, markdown, title) as a PDF at the top of the folder. A page is printed again only when its
+    HTML changed since the last good print (kept in .pdf/). Stops at the first failure, so a Mac with nobody logged
+    in costs one timeout, not one per day. Returns the errors."""
+    import pdf
+    cache = os.path.join(folder, ".pdf")
+    os.makedirs(cache, exist_ok=True)
+    for name, md, title in jobs:
+        page = pdf.md_to_html(md(), title, link=_pdf_link)
+        out = os.path.join(folder, name)
+        done = os.path.join(cache, name[:-4] + ".html")
+        try:
+            with open(done, encoding="utf-8") as fh:
+                if fh.read() == page and os.path.isfile(out):
+                    continue
+        except OSError:
+            pass
+        todo = os.path.join(cache, name[:-4] + ".new.html")         # WebKit opens only an .html name
+        with open(todo, "w", encoding="utf-8") as fh:
+            fh.write(page)
+        try:
+            pdf.render(home, todo, out)
+        except pdf.PdfError as e:
+            return ["%s: %s" % (name, e)]
+        os.replace(todo, done)
+    return []
 
 
 def run(home, settings, cfg, show_day=None):
     if show_day:
-        D = build_day(home, show_day, cfg)
+        D = build_day(home, show_day, cfg, settings)
         if not D:
             print("no report for %s" % show_day, file=sys.stderr)
             return 1
