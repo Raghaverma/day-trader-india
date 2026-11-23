@@ -31,21 +31,30 @@ What lives here (and nowhere else):
   loss       The worst-case loss at the stop (the SL limit, not the trigger), the
              shared share-count rules and the order tick, so nse-exit,
              nse-timemachine, nse-budget and nse-risk all size the same way.
+  kite data  Kite Connect as the bar and quote source when today's login is valid
+             (autopilot/kite.py login): kite_answer(yahoo_url) returns the same
+             Yahoo-shaped JSON from Kite, or None and the caller asks Yahoo as before.
 """
 
+import csv
 import datetime
 import decimal
 import gzip
 import hashlib
 import http.cookiejar
+import io
 import json
 import os
 import re
+import subprocess
+import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-COMMON_VERSION = "1.1.0"
+COMMON_VERSION = "1.2.0"
 
 UA = "Mozilla/5.0 (compatible)"
 
@@ -1030,3 +1039,438 @@ def load_config(path=None, require=False):
             else:
                 cfg[k] = v
     return cfg
+
+
+# ---------------------------------------------------------------- Kite Connect market data
+#
+# When `autopilot/kite.py login` has left a valid session for today in the trader folder,
+# every Yahoo chart or spark request for an NSE symbol is answered from Kite Connect instead,
+# in Yahoo's own JSON shape, so no parser changes: callers do
+#
+#     text = nc.kite_answer(url) or <the Yahoo request they always made>
+#
+# kite_answer returns None (and the caller asks Yahoo) when there is no session, the session
+# has expired (06:00 IST each morning), NSE_DATA_SOURCE=yahoo, the symbol is not on NSE (world
+# indices, futures, FX), the interval or range has no Kite equivalent, or Kite fails. A Kite
+# failure is printed once per process to stderr; a rejected token marks the session dead so
+# the next process does not try again.
+#
+# The access token lives in the macOS login keychain (service KITE_TOKEN_SERVICE, account =
+# the API key); kite-session.json holds only the API key, the user id and the expiry.
+
+KITE_API = "https://api.kite.trade"
+KITE_LOGIN = "https://kite.zerodha.com/connect/login?v=3&api_key=%s"
+KITE_SESSION_FILE = "kite-session.json"
+KITE_SECRET_SERVICE = "nse-kite-api-secret"
+KITE_TOKEN_SERVICE = "nse-kite-access-token"
+DATA_ENV = "NSE_DATA_SOURCE"
+KITE_INDEX = {"^NSEI": "NIFTY 50", "^NSEBANK": "NIFTY BANK", "^INDIAVIX": "INDIA VIX", "^CNXIT": "NIFTY IT",
+              "^CNXAUTO": "NIFTY AUTO", "^CNXPHARMA": "NIFTY PHARMA", "^CNXFMCG": "NIFTY FMCG",
+              "^CNXMETAL": "NIFTY METAL"}
+# Yahoo interval -> (Kite interval, most days Kite serves in one request)
+KITE_INTERVAL = {"1m": ("minute", 60), "5m": ("5minute", 100), "15m": ("15minute", 200),
+                 "30m": ("30minute", 200), "60m": ("60minute", 400), "1h": ("60minute", 400), "1d": ("day", 2000)}
+KITE_GAP = {"hist": 0.35, "quote": 1.05, "other": 0.12}     # seconds between calls (Kite: 3/s, 1/s, 10/s)
+KITE_DAILY_DAYS = 400
+_KITE_LOCK = threading.Lock()
+_KITE = {"last": {}, "session": None, "instruments": None, "daily": {}, "said": False,
+         "http": None, "sleep": time.sleep, "error": None, "served": 0}
+_EPOCH = datetime.datetime(1970, 1, 1)
+
+
+class KiteError(Exception):
+    pass
+
+
+def kite_session_path(home=None):
+    return os.path.join(home or trader_home(), KITE_SESSION_FILE)
+
+
+def kite_expiry(login_utc):
+    """Kite access tokens die at 06:00 IST the next morning (this morning, for a login before 06:00)."""
+    ist = to_ist(login_utc)
+    six = ist.replace(hour=6, minute=0, second=0, microsecond=0)
+    if ist >= six:
+        six += datetime.timedelta(days=1)
+    return to_utc(six)
+
+
+def keychain_get(service, account):
+    try:
+        p = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    v = p.stdout.strip()
+    return v if p.returncode == 0 and v else None
+
+
+def keychain_set(service, account, secret):
+    """Save through `security -i` on stdin, so the secret never shows in a process list."""
+    if not secret or any(c in secret for c in '"\\\n\r') or any(c in account for c in '"\\\n\r'):
+        raise KiteError("refusing to store a value with quotes, backslashes or line breaks")
+    cmd = 'add-generic-password -U -s "%s" -a "%s" -w "%s"\n' % (service, account, secret)
+    try:
+        subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise KiteError("couldn't reach the keychain: %s" % e)
+    if keychain_get(service, account) != secret:
+        raise KiteError("the keychain did not keep the value (service %s)" % service)
+
+
+def kite_session(home=None, now_utc=None, env=None):
+    """{"api_key", "access_token", "user_id", "expires", "home", "path"} for today's valid Kite
+    login, or None. In test mode the token comes from the file's "access_token", never the keychain."""
+    env = os.environ if env is None else env
+    if (env.get(DATA_ENV) or "").strip().lower() == "yahoo":
+        return None
+    path = kite_session_path(home)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns)
+    if _KITE["session"] and _KITE["session"][0] == key:
+        sess = _KITE["session"][1]
+    else:
+        sess = None
+        try:
+            doc = read_json(path)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and doc.get("api_key") and not doc.get("dead"):
+            if test_mode(env):
+                token = doc.get("access_token")
+            else:
+                token = keychain_get(KITE_TOKEN_SERVICE, doc["api_key"])
+            if token:
+                sess = {"api_key": doc["api_key"], "access_token": token, "user_id": doc.get("user_id"),
+                        "expires": _utc_or_none(doc.get("expires_at")), "home": os.path.dirname(path), "path": path}
+        _KITE["session"] = (key, sess)
+    if not sess or not sess["expires"] or (now_utc or utc_now()) >= sess["expires"]:
+        return None
+    return sess
+
+
+def kite_mark_dead(sess, reason, now_utc=None):
+    """Kite rejected the token: say so in the session file so later processes go straight to Yahoo."""
+    try:
+        doc = read_json(sess["path"]) or {}
+        doc.update(dead=str(reason)[:300], dead_at=utc_iso(now_utc))
+        write_json(sess["path"], doc)
+        os.chmod(sess["path"], 0o600)
+    except (OSError, ValueError):
+        pass
+    _KITE["session"] = None
+
+
+def _kite_http(method, url, headers, data, timeout):
+    if _KITE["http"]:
+        return _KITE["http"](method, url, headers, data, timeout)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read() or b""
+        finally:
+            e.close()
+    except (urllib.error.URLError, OSError) as e:
+        raise KiteError("could not reach Kite: %s" % (getattr(e, "reason", None) or e))
+
+
+def kite_call(sess, path, params=None, method="GET", data=None, kind="other", timeout=20, raw=False):
+    """One Kite Connect API call -> its "data" (or the raw bytes with raw=True). Paced to Kite's
+    rate limits; a 429 or 5xx is tried twice more. A rejected token marks the session dead."""
+    url = KITE_API + path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+    headers = {"X-Kite-Version": "3", "User-Agent": UA, "Accept-Encoding": "gzip"}
+    if sess and sess.get("access_token"):
+        headers["Authorization"] = "token %s:%s" % (sess["api_key"], sess["access_token"])
+    body = urllib.parse.urlencode(data).encode("utf-8") if data else None
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    code, got = 0, b""
+    for attempt in range(3):
+        with _KITE_LOCK:      # deepscan fetches from threads: one paced queue per kind
+            wait = KITE_GAP.get(kind, 0.12) - (time.monotonic() - _KITE["last"].get(kind, -1e9))
+            if wait > 0:
+                _KITE["sleep"](wait)
+            _KITE["last"][kind] = time.monotonic()
+        code, got = _kite_http(method, url, headers, body, timeout)
+        if got[:2] == b"\x1f\x8b":
+            got = gzip.decompress(got)
+        if (code == 429 or code >= 500) and attempt < 2:
+            _KITE["sleep"](1.0 + attempt)
+            continue
+        break
+    if raw and code == 200:
+        return got
+    try:
+        doc = json.loads(got.decode("utf-8"))
+    except ValueError:
+        raise KiteError("Kite answered HTTP %d for %s with something that is not JSON" % (code, path))
+    if code == 200 and isinstance(doc, dict) and doc.get("status") == "success":
+        return doc.get("data")
+    doc = doc if isinstance(doc, dict) else {}
+    msg = doc.get("message") or "HTTP %d" % code
+    if code == 403 or doc.get("error_type") == "TokenException":
+        if sess and sess.get("path"):
+            kite_mark_dead(sess, msg)
+        raise KiteError("Kite rejected the login (%s): run `python3 autopilot/kite.py login`" % msg)
+    raise KiteError("Kite %s: %s" % (path, msg))
+
+
+def kite_instruments(sess, now_utc=None):
+    """{tradingsymbol: instrument_token} for NSE equities and indices, refreshed once a day."""
+    day = to_ist(now_utc or utc_now()).date().isoformat()
+    if _KITE["instruments"] and _KITE["instruments"][0] == day:
+        return _KITE["instruments"][1]
+    path = os.path.join(sess["home"], "cache", "kite", "instruments-NSE.json")
+    try:
+        doc = read_json(path)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict) and doc.get("day") == day and doc.get("tokens"):
+        tokens = doc["tokens"]
+    else:
+        text = kite_call(sess, "/instruments/NSE", raw=True, timeout=60).decode("utf-8", "replace")
+        tokens = {}
+        for row in csv.DictReader(io.StringIO(text)):
+            seg, kind = row.get("segment"), row.get("instrument_type")
+            if seg == "INDICES" or (seg == "NSE" and kind == "EQ"):
+                try:
+                    tokens[row["tradingsymbol"]] = int(row["instrument_token"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not tokens:
+            raise KiteError("Kite's NSE instrument list came back empty")
+        write_json(path, {"day": day, "tokens": tokens})
+    _KITE["instruments"] = (day, tokens)
+    return tokens
+
+
+def kite_symbol(ysym):
+    """Yahoo symbol -> Kite tradingsymbol on NSE, or None (not an NSE instrument Kite is used for)."""
+    s = urllib.parse.unquote(str(ysym or "")).strip().upper()
+    if s.startswith("^"):
+        return KITE_INDEX.get(s)
+    if s.endswith(".NS") and is_nse_symbol(s[:-3]):
+        return s[:-3]
+    return None
+
+
+def yahoo_request(url):
+    """("chart" | "spark", [yahoo symbols], {query}) for a Yahoo chart or spark URL, else None."""
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if not u.netloc.endswith("finance.yahoo.com"):
+        return None
+    q = dict(urllib.parse.parse_qsl(u.query))
+    if u.path.startswith("/v8/finance/chart/"):
+        return "chart", [urllib.parse.unquote(u.path[len("/v8/finance/chart/"):])], q
+    if u.path.rstrip("/") == "/v7/finance/spark":
+        return "spark", [s for s in (q.get("symbols") or "").split(",") if s], q
+    return None
+
+
+def kite_window(q, now_utc):
+    """A Yahoo range or period1/period2 -> (from IST, to IST, sessions to keep or None), or None
+    for ranges Kite can't mirror ("max", "ytd"). Yahoo's 1d-7d ranges count sessions, not days."""
+    now = to_ist(now_utc)
+    if q.get("period1"):
+        try:
+            a = to_ist(_EPOCH + datetime.timedelta(seconds=int(q["period1"])))
+            b = to_ist(_EPOCH + datetime.timedelta(seconds=int(q["period2"]))) if q.get("period2") else now
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return a, min(b, now), None
+    m = re.match(r"^(\d+)(d|wk|mo|y)$", (q.get("range") or "1d").strip().lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    if n < 1:
+        return None
+    if unit == "d" and n <= 7:
+        return now - datetime.timedelta(days=2 * n + 10), now, n
+    days = {"d": n, "wk": 7 * n, "mo": 31 * n, "y": 366 * n}[unit]
+    return now - datetime.timedelta(days=days), now, None
+
+
+def _kite_ts(text):
+    """"2026-11-23T09:15:00+0530" -> naive IST."""
+    return datetime.datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S")
+
+
+def _epoch(ist):
+    return int((to_utc(ist) - _EPOCH).total_seconds())
+
+
+def kite_candles(sess, token, kint, maxdays, a, b):
+    """[(naive IST, o, h, l, c, v)] from Kite's historical API, split into requests Kite accepts."""
+    out, start = {}, a.replace(microsecond=0)
+    b = b.replace(microsecond=0)
+    while start <= b:
+        end = min(b, start + datetime.timedelta(days=maxdays) - datetime.timedelta(seconds=1))
+        data = kite_call(sess, "/instruments/historical/%d/%s" % (int(token), kint),
+                         {"from": start.strftime("%Y-%m-%d %H:%M:%S"), "to": end.strftime("%Y-%m-%d %H:%M:%S")},
+                         kind="hist")
+        for c in (data or {}).get("candles") or []:
+            try:
+                t = _kite_ts(c[0])
+                out[t] = (t, float(c[1]), float(c[2]), float(c[3]), float(c[4]), int(c[5] or 0) if len(c) > 5 else 0)
+            except (IndexError, TypeError, ValueError):
+                continue
+        start = end + datetime.timedelta(seconds=1)
+    return [out[k] for k in sorted(out)]
+
+
+def kite_daily(sess, token, tsym, now_utc):
+    """Daily candles before today for the last KITE_DAILY_DAYS days, fetched once a day per symbol
+    (in memory and in <trader>/cache/kite/day/). [(date ISO, o, h, l, c, v)]."""
+    today = to_ist(now_utc).date()
+    k = (tsym, today.isoformat())
+    if k in _KITE["daily"]:
+        return _KITE["daily"][k]
+    path = os.path.join(sess["home"], "cache", "kite", "day", re.sub(r"[^A-Za-z0-9&\-]", "_", tsym) + ".json")
+    try:
+        doc = read_json(path)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict) and doc.get("day") == today.isoformat() and isinstance(doc.get("rows"), list):
+        rows = [tuple(r) for r in doc["rows"]]
+    else:
+        start = datetime.datetime.combine(today - datetime.timedelta(days=KITE_DAILY_DAYS), datetime.time(0, 0))
+        end = datetime.datetime.combine(today - datetime.timedelta(days=1), datetime.time(23, 59, 59))
+        rows = [(c[0].date().isoformat(),) + c[1:] for c in kite_candles(sess, token, "day", 2000, start, end)
+                if c[0].date() < today]
+        write_json(path, {"day": today.isoformat(), "symbol": tsym, "rows": [list(r) for r in rows]})
+    _KITE["daily"][k] = rows
+    return rows
+
+
+def kite_quotes(sess, tsyms):
+    """{tradingsymbol: Kite full quote} (last_price, last_trade_time, ohlc with yesterday's close, volume)."""
+    out, tsyms = {}, list(dict.fromkeys(t for t in tsyms if t))
+    for i in range(0, len(tsyms), 250):
+        chunk = tsyms[i:i + 250]
+        data = kite_call(sess, "/quote", {"i": ["NSE:" + t for t in chunk]}, kind="quote") or {}
+        for t in chunk:
+            if isinstance(data.get("NSE:" + t), dict):
+                out[t] = data["NSE:" + t]
+    return out
+
+
+def _live_today(now_utc):
+    """True when today is an NSE session and the market has opened (so today's bars exist)."""
+    ist = to_ist(now_utc)
+    try:
+        ok = trading_day(ist.date())[0]
+    except Exception:
+        ok = ist.weekday() < 5
+    return bool(ok) and ist.time() >= SESSION_OPEN
+
+
+def kite_result(sess, ysym, q, now_utc, quote=None):
+    """One Yahoo v8 chart "result" built from Kite, or None when Kite can't serve this request."""
+    tsym = kite_symbol(ysym)
+    interval = (q.get("interval") or "1d").strip()
+    if not tsym or interval not in KITE_INTERVAL:
+        return None
+    win = kite_window(q, now_utc)
+    if not win:
+        return None
+    token = kite_instruments(sess, now_utc).get(tsym)
+    if token is None:
+        return None
+    a, b, sessions = win
+    kint, maxdays = KITE_INTERVAL[interval]
+    today = to_ist(now_utc).date()
+    daily = kite_daily(sess, token, tsym, now_utc)
+    if kint == "day":
+        if (today - a.date()).days <= KITE_DAILY_DAYS:
+            rows = [r for r in daily if a.date().isoformat() <= r[0] <= b.date().isoformat()]
+        else:
+            rows = [(c[0].date().isoformat(),) + c[1:] for c in kite_candles(sess, token, "day", maxdays, a, b)
+                    if c[0].date() < today]
+        rows = [(datetime.datetime.combine(datetime.date.fromisoformat(r[0]), SESSION_OPEN),) + tuple(r[1:])
+                for r in rows]
+        ohlc = (quote or {}).get("ohlc") or {}
+        if (quote and b.date() == today and _live_today(now_utc) and ohlc.get("open")
+                and quote.get("last_price") is not None):
+            rows.append((datetime.datetime.combine(today, SESSION_OPEN), float(ohlc["open"]), float(ohlc["high"]),
+                         float(ohlc["low"]), float(quote["last_price"]), int(quote.get("volume") or 0)))
+    else:
+        rows = kite_candles(sess, token, kint, maxdays, a, b)
+    if sessions:
+        keep = sorted({r[0].date() for r in rows})[-sessions:]
+        rows = [r for r in rows if r[0].date() in keep]
+    if not rows:
+        return None
+    first, last = rows[0][0].date(), rows[-1][0].date()
+    before = [r for r in daily if r[0] < first.isoformat()]
+    last_day = [r for r in rows if r[0].date() == last]
+    meta = {"currency": "INR", "symbol": urllib.parse.unquote(ysym).upper(), "exchangeName": "NSI",
+            "fullExchangeName": "NSE", "instrumentType": "INDEX" if tsym in KITE_INDEX.values() else "EQUITY",
+            "dataGranularity": interval, "range": q.get("range") or "", "dataSource": "kite",
+            "chartPreviousClose": before[-1][4] if before else None,
+            "regularMarketPrice": rows[-1][4], "regularMarketDayHigh": max(r[2] for r in last_day),
+            "regularMarketDayLow": min(r[3] for r in last_day),
+            "regularMarketTime": _epoch(datetime.datetime.combine(last, SESSION_CLOSE))}
+    if quote and last == today and quote.get("last_price") is not None:
+        ohlc = quote.get("ohlc") or {}
+        meta["regularMarketPrice"] = float(quote["last_price"])
+        if ohlc.get("high"):
+            meta["regularMarketDayHigh"], meta["regularMarketDayLow"] = float(ohlc["high"]), float(ohlc["low"])
+        if ohlc.get("close"):
+            meta["previousClose"] = float(ohlc["close"])
+        when = quote.get("last_trade_time") or quote.get("timestamp")
+        try:
+            meta["regularMarketTime"] = _epoch(datetime.datetime.strptime(str(when)[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            meta["regularMarketTime"] = _epoch(min(to_ist(now_utc), rows[-1][0]))
+    elif last == today:
+        meta["regularMarketTime"] = _epoch(min(to_ist(now_utc), rows[-1][0]))
+    if sessions == 1 and "previousClose" not in meta and before:
+        meta["previousClose"] = before[-1][4]
+    return {"meta": meta, "timestamp": [_epoch(r[0]) for r in rows],
+            "indicators": {"quote": [{"open": [r[1] for r in rows], "high": [r[2] for r in rows],
+                                      "low": [r[3] for r in rows], "close": [r[4] for r in rows],
+                                      "volume": [r[5] for r in rows]}]}}
+
+
+def kite_answer(url, now_utc=None, home=None):
+    """The Yahoo JSON text for a Yahoo chart or spark URL, served from Kite, or None (ask Yahoo).
+    A spark batch is all-Kite or all-Yahoo, never mixed."""
+    req = yahoo_request(url)
+    if not req:
+        return None
+    now = now_utc or utc_now()
+    sess = kite_session(home, now)
+    if not sess:
+        return None
+    kind, ysyms, q = req
+    tsyms = [kite_symbol(s) for s in ysyms]
+    if not ysyms or not all(tsyms) or (q.get("interval") or "1d") not in KITE_INTERVAL:
+        return None
+    try:
+        quotes = kite_quotes(sess, tsyms) if _live_today(now) else {}
+        results = []
+        for ysym, tsym in zip(ysyms, tsyms):
+            res = kite_result(sess, ysym, q, now, quotes.get(tsym))
+            if res is None:
+                return None
+            results.append(res)
+    except (KiteError, ValueError, KeyError, TypeError, OSError) as e:
+        _KITE["error"] = str(e)
+        if not _KITE["said"]:
+            _KITE["said"] = True
+            print("Kite data unavailable (%s); using Yahoo" % e, file=sys.stderr)
+        return None
+    _KITE["served"] += 1
+    if kind == "chart":
+        return json.dumps({"chart": {"result": results, "error": None}})
+    return json.dumps({"spark": {"result": [{"symbol": s, "response": [r]} for s, r in zip(ysyms, results)],
+                                 "error": None}})

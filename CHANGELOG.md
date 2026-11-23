@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.18.0
+
+### Kite Connect as the market-data source
+
+- **`nse_common.kite_answer(url)`** (nse_common 1.2.0): while a Kite login from today is valid, a Yahoo chart or
+  spark request for an NSE stock or a mapped NSE index (`^NSEI`, `^NSEBANK`, `^INDIAVIX`, the sector indices) is
+  answered from Kite Connect in Yahoo's own JSON shape: Kite's historical candles, the live quote for the price,
+  the last trade time, the day's high and low and yesterday's close, and daily candles (cached once a day per
+  symbol) for `chartPreviousClose`. Yahoo's 1d-7d ranges count sessions, as Yahoo does; daily bars carry Yahoo's
+  09:15 stamp. A spark batch is all Kite or all Yahoo. Paced to Kite's limits (historical 3/s, quote 1/s, one
+  queue across threads), a 429 or 5xx tried twice more.
+- **Every Yahoo chart fetch asks Kite first**: nse-scanner (spark and chart), nse-entry, nse-exit, nse-alerts
+  (quotes now say `"source": "kite"`), nse-timemachine, nse-news and the dossier, the paper broker's 1-minute bars,
+  the autopilot's regime tags, archive, Nifty benchmark and the deep pre-market. World tickers, futures, FX and
+  fundamentals never touch Kite.
+- **Falls back to Yahoo by itself**: no login, a login past 06:00 IST, `NSE_DATA_SOURCE=yahoo`, an interval or
+  range Kite has no match for, a symbol not on Kite, or any Kite error (said once per run on stderr). A rejected
+  token marks `kite-session.json` dead, so the rest of the day goes straight to Yahoo.
+- **`autopilot/kite.py`**: `setup` (API key; the API secret into the login keychain through `security -i`, never
+  on a command line), `login` (opens Kite's login, catches the redirect on 127.0.0.1:5005 with a one-time state
+  check, or `--request-token` by hand), `status`, `logout`, `compare SYMBOL`. Defaults to the autopilot's folder
+  (`~/Trading/nse-autopilot`) when `NSE_TRADER_HOME` is not set; `--home` for another. The access token goes in the
+  keychain; the session file (0600) holds the API key, user id and expiry only.
+- **The report** says which source the day ran on (Health: "Market data: Kite", or "Yahoo (no Kite login
+  today)", and a change by the close); the pre-market logs it as `data_source`.
+- 23 tests (`tests/test_kite.py`) against a fake Kite.
+
 ## 1.17.0
 
 ### The deep pre-market: a research desk before the open, live on the paper accounts

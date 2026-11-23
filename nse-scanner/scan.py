@@ -236,6 +236,9 @@ def _other_host(url):
 def yahoo_get(url):
     """GET a Yahoo Finance URL, then the other host (query1 / query2) on a 429 or 5xx,
     and one more round after BACKOFF seconds if a 429 was seen. 4xx other than 429 is final."""
+    served = nc.kite_answer(url)
+    if served is not None:
+        return served
     last = "no answer"
     path = url.split("finance.yahoo.com")[-1].split("?")[0]
     for attempt in (0, 1):

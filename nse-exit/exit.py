@@ -436,7 +436,10 @@ def _sleep(seconds):
 
 
 def yahoo_get(sym, rng, interval):
-    """query2 first, query1 on 429 or 5xx; one retry after a pause on 429."""
+    """query2 first, query1 on 429 or 5xx; one retry after a pause on 429. Kite first, when logged in."""
+    served = nc.kite_answer(nc.yahoo_chart_url(sym, rng, interval))
+    if served is not None:
+        return served
     last = "no answer"
     for host in HOSTS:
         url = nc.yahoo_chart_url(sym, rng, interval, host)

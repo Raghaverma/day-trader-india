@@ -239,7 +239,10 @@ def _sleep(seconds):
 
 def yahoo_get(sym, rng, interval):
     """GET one chart: query2 first, query1 when query2 answers 429 or 5xx.
-    An HTTP 429 gets one retry on the same host after BACKOFF seconds."""
+    An HTTP 429 gets one retry on the same host after BACKOFF seconds. Kite first, when logged in."""
+    served = nc.kite_answer(chart_url(sym, rng, interval))
+    if served is not None:
+        return served
     last = "no answer"
     for host in HOSTS:
         url = chart_url(sym, rng, interval, host)

@@ -1137,6 +1137,9 @@ def read_bars_file(path):
 
 def fetch_bars(sym, timeout=15):
     url = nc.yahoo_chart_url(sym, "5d", "1m")
+    served = nc.kite_answer(url)
+    if served is not None:
+        return parse_bars(json.loads(served))
     req = urllib.request.Request(url, headers={"User-Agent": nc.UA, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

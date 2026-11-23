@@ -325,7 +325,7 @@ def parse_yahoo(text, sym):
     return {"symbol": sym, "price": float(price), "open": opens[0] if opens else None,
             "high": m.get("regularMarketDayHigh"), "low": m.get("regularMarketDayLow"),
             "prev_close": m.get("previousClose") or m.get("chartPreviousClose"), "time": when,
-            "currency": m.get("currency"), "source": "yahoo",
+            "currency": m.get("currency"), "source": m.get("dataSource") or "yahoo",
             "bar_seconds": BAR_SECONDS.get(m.get("dataGranularity"), 300),
             "bars": parse_bars(res[0].get("timestamp"), q)}
 
@@ -348,7 +348,10 @@ def parse_bars(stamps, q):
 
 def fetch_yahoo(sym, timeout=20):
     """query2 first. A 429 waits BACKOFF seconds and tries once more; a 429 or a 5xx
-    after that moves on to query1. A 404 comes back as Yahoo's own error JSON."""
+    after that moves on to query1. A 404 comes back as Yahoo's own error JSON. Kite first, when logged in."""
+    served = nc.kite_answer(yahoo_url(sym))
+    if served is not None:
+        return served
     last = None
     for host in YAHOO_HOSTS:
         url = yahoo_url(sym, host)

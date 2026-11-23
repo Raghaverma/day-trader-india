@@ -174,7 +174,10 @@ def _get(url, timeout=20):
 
 def fetch_chart(sym):
     """One request for 60 days of 5-min bars. query2 first, one retry after a 429,
-    then query1 on 429 or 5xx."""
+    then query1 on 429 or 5xx. Kite first, when logged in."""
+    served = nc.kite_answer(chart_url(sym))
+    if served is not None:
+        return served
     last = None
     for n, host in enumerate(HOSTS):
         if n:

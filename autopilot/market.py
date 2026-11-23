@@ -39,7 +39,11 @@ def chart_url(sym, interval, rng=None, period=None, host="query2"):
 
 
 def fetch_chart(sym, interval="5m", rng=None, period=None, timeout=20):
-    """A Yahoo v8 chart doc. Tries the other host once; raises MarketError with the reason."""
+    """A Yahoo v8 chart doc (from Kite when logged in, see nse_common.kite_answer). Tries the other
+    Yahoo host once; raises MarketError with the reason."""
+    served = nc.kite_answer(chart_url(sym, interval, rng, period))
+    if served is not None:
+        return json.loads(served)
     last = None
     for host in HOSTS:
         req = urllib.request.Request(chart_url(sym, interval, rng, period, host),

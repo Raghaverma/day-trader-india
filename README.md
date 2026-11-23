@@ -16,7 +16,7 @@
 
 11 Claude skills for day trading Indian stocks on the NSE: scan the Nifty for breakouts, read exchange filings, time every entry and exit, and replay every outcome before you risk a rupee.
 
-A port of [Jakeschincariol/day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill) (MIT) to India's NSE cash market: the IST clock and NSE holidays, every price on an NSE tick, Indian intraday charges in every number, Kite-shaped order tickets, and a built-in paper broker, so you need no broker account. Free, no signup, no API key: plain Python on public data (Yahoo `.NS` charts, NSE's archives and announcements, Google News).
+A port of [Jakeschincariol/day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill) (MIT) to India's NSE cash market: the IST clock and NSE holidays, every price on an NSE tick, Indian intraday charges in every number, Kite-shaped order tickets, and a built-in paper broker, so you need no broker account. Free, no signup, no API key: plain Python on public data (Yahoo `.NS` charts, NSE's archives and announcements, Google News). Optionally, a paid Kite Connect login replaces Yahoo as the chart and quote source: see [Kite Connect as the data source](#kite-connect-as-the-data-source-1180).
 
 > **Nothing here places an order on its own.** Paper trading is the default, and no trade goes anywhere until you type **yes** for that exact order. How firmly that is enforced depends on the broker mode: see [Fine print](#fine-print).
 
@@ -160,6 +160,26 @@ and, at 07:45, a CIO write the morning note (PDF in the journal folder, and an e
 rank for every stock. With `"deep": {"enabled": true, "apply": true}` in autopilot.json the sit-outs join Claude's
 veto (source "deep") and the report replays each one. `python3 autopilot/run_day.py deep --show` prints the day's
 run: steps, calls, tokens, sit-outs.
+
+### Kite Connect as the data source (1.18.0)
+
+With a Kite Connect app (Zerodha's paid API plan, with market data), every NSE chart and quote the skills and the
+autopilot fetch comes from Kite instead of Yahoo: the scans, the entry check, the paper broker's 1-minute bars, the
+quotes, the regime tags, the archive and the deep pre-market's Nifty 50 bars. The prices come from the exchange
+through your broker, Yahoo's unofficial endpoint and its rate limits drop out, and the quote time is the last trade's.
+World markets, futures, FX and fundamentals stay on Yahoo. Nothing in this places an order.
+
+    python3 autopilot/kite.py setup     # once: the API key, and the API secret (kept in the login keychain)
+    python3 autopilot/kite.py login     # each trading day after 06:00 IST: opens Kite, catches the token
+    python3 autopilot/kite.py status    # Kite or Yahoo right now, and until when
+    python3 autopilot/kite.py compare RELIANCE   # Kite's and Yahoo's latest 1-minute bars side by side
+
+In your app at developers.kite.trade the Redirect URL must be `http://127.0.0.1:5005/kite`. Kite's tokens expire at
+06:00 IST every morning, so log in on the Mac before the pre-market (08:40). A day with no login, an expired or
+rejected token, or any Kite error falls back to Yahoo by itself, request by request; the day's report says which
+source the day ran on ("Market data: Kite" in Health). `NSE_DATA_SOURCE=yahoo` turns Kite off for one run. The API
+secret and the day's access token live in the macOS login keychain; `kite.json` and `kite-session.json` in the
+trader folder hold only the API key, the user id and the expiry.
 
 ## Fine print
 

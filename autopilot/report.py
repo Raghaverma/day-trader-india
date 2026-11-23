@@ -110,9 +110,13 @@ def nifty_move(timeout=15):
     """The Nifty 50 index on the day: {"close", "prev_close", "pct"} from Yahoo (^NSEI), or None."""
     url = nc.yahoo_chart_url("^NSEI", "1d", "5m")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": nc.UA, "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            meta = json.loads(r.read().decode("utf-8"))["chart"]["result"][0]["meta"]
+        served = nc.kite_answer(url)
+        if served is not None:
+            meta = json.loads(served)["chart"]["result"][0]["meta"]
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": nc.UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                meta = json.loads(r.read().decode("utf-8"))["chart"]["result"][0]["meta"]
         close, prev = _f(meta.get("regularMarketPrice")), _f(meta.get("chartPreviousClose"))
         if close and prev:
             return {"close": close, "prev_close": prev, "pct": round(close / prev - 1, 5)}
@@ -465,7 +469,21 @@ def health(st, log):
             "first_tick": seen[0] if seen else None, "last_tick": seen[-1] if seen else None,
             "premarket": "ran" if pre.get("done") else ("started, not finished" if pre else "did not run"),
             "news": pre.get("news"), "veto": pre.get("veto"), "dossier": pre.get("dossier"),
+            "data": pre.get("data"), "data_at_close": (ph.get("eod") or {}).get("data"),
             "closed": ph.get("closed")}
+
+
+def data_words(pre, close=None):
+    """Where the day's bars came from: "Kite", or "Yahoo (no Kite login today)", and a change by the close."""
+    def one(x):
+        if not x:
+            return "Yahoo"
+        if x == "kite":
+            return "Kite"
+        return "Yahoo (%s)" % x.split(":", 1)[1].strip() if ":" in x else "Yahoo"
+    if close and close != pre:
+        return "%s at the open, %s by the close" % (one(pre), one(close))
+    return one(pre)
 
 
 def _count(items):
@@ -1125,6 +1143,7 @@ def blocks(rep, card, analysis=None):
           "Session minutes the runner saw: %d of %d (first %s, last %s)%s." % (
               h["session_minutes_seen"], h["session_minutes"], h["first_tick"] or "-", h["last_tick"] or "-",
               ("; gaps: " + ", ".join(h["gaps"])) if h["gaps"] else ""),
+          "Market data: %s." % data_words(h.get("data"), h.get("data_at_close")),
           "Step failures: %s." % (", ".join("%s x%d" % kv for kv in sorted(h["failures_by_step"].items()))
                                    or "none")]
     dz = h.get("dossier")

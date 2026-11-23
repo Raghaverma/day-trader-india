@@ -199,6 +199,9 @@ def write_text(path, text):
 # ------------------------------------------------------------------ HTTP
 
 def http_get(url, accept="application/json", timeout=25, tries=2):
+    served = nc.kite_answer(url)      # NSE charts from Kite when logged in; None for everything else
+    if served is not None:
+        return served.encode("utf-8")
     last = None
     for i in range(tries):
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})

@@ -276,6 +276,24 @@ class Runner(object):
         log_event(self.home, self.day, event)
 
 
+def data_source(home, now_utc=None):
+    """"kite" while today's Kite login is valid (nse_common.kite_answer serves the NSE charts), else
+    "yahoo: <why>"."""
+    if nc.kite_session(home, now_utc):
+        return "kite"
+    try:
+        doc = nc.read_json(nc.kite_session_path(home))
+    except ValueError:
+        doc = None
+    if (os.environ.get(nc.DATA_ENV) or "").strip().lower() == "yahoo":
+        return "yahoo: %s=yahoo" % nc.DATA_ENV
+    if not doc:
+        return "yahoo: no Kite login"
+    if doc.get("dead"):
+        return "yahoo: Kite rejected the login (%s)" % doc["dead"]
+    return "yahoo: no Kite login today"
+
+
 def keychain(service, account=None):
     """A secret from the login keychain (macOS `security`), or None. Secrets never go in a file."""
     argv = ["security", "find-generic-password", "-s", service, "-w"]

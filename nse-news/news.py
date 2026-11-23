@@ -257,6 +257,9 @@ class Fetcher(object):
                         data = fh.read()
                     return gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
             raise NewsError("offline: no file %s" % path)
+        served = None if nse else nc.kite_answer(url)
+        if served is not None:
+            return served.encode("utf-8")
         headers = nc.nse_headers() if nse else {"User-Agent": nc.UA, "Accept-Encoding": "gzip"}
         try:
             try:

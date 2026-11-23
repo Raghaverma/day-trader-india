@@ -165,6 +165,8 @@ class Day(object):
             self.runner.run("holidays", "alerts", ["holidays", "--refresh", "--if-stale"], parse=False, now=False)
         syms, names = self.universe()
         ph["premarket"]["universe"] = len(syms)
+        ph["premarket"]["data"] = ac.data_source(self.home, self.now)
+        self.runner.note("data_source", source=ph["premarket"]["data"])
         if self.settings.get("tags"):
             reg = market.regime(self.fetch, self.ist.date()) if self.fetch else {"errors": ["no market data"]}
             ph["premarket"]["regime"] = reg
@@ -671,7 +673,7 @@ class Day(object):
         EOD_ATTEMPTS times in all, so a bug can never mean a Claude run every minute."""
         ph = self.st["phases"]
         attempts = int((ph.get("eod") or {}).get("attempts") or 0) + 1
-        ph["eod"] = {"started": self.stamp(), "attempts": attempts}
+        ph["eod"] = {"started": self.stamp(), "attempts": attempts, "data": ac.data_source(self.home, self.now)}
         self.save()
         try:
             return self._eod(ph)
