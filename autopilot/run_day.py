@@ -201,8 +201,31 @@ class Day(object):
             ph["premarket"]["veto"] = ("%d vetoed" % len(vetoes)) if out and out.get("ok") else \
                 "Claude failed: %s" % (out or {}).get("error")
             self.runner.note("veto", vetoes=vetoes, ok=bool(out and out.get("ok")), error=(out or {}).get("error"))
+        ph["premarket"]["deep"] = self.merge_deep_vetoes(syms)
         ph["premarket"]["done"] = self.stamp()
         self.save()
+
+    def merge_deep_vetoes(self, syms):
+        """The deep pre-market's sit-outs (deepscan.py), added to Claude's vetoes when "apply" is on. It can
+        never fail the pre-market: any error is the status line."""
+        try:
+            import deepscan
+            deep, status = deepscan.live_vetoes(self.home, self.day, self.settings, syms)
+        except Exception as e:
+            deep, status = [], "failed: %s: %s" % (type(e).__name__, ac.tail(str(e), 200))
+        if deep:
+            doc = ac.read_json(self.path("vetoes.json")) or {"vetoes": [], "summary": None, "ok": False,
+                                                              "error": "Claude's veto did not run"}
+            have = {v["symbol"] for v in doc.get("vetoes") or []}
+            for v in doc.get("vetoes") or []:
+                v.setdefault("source", "claude")
+            for v in deep:
+                if v["symbol"] not in have:
+                    doc["vetoes"].append(dict(v, reason="Deep pre-market: %s" % v["reason"], source="deep"))
+            doc["deep"] = status
+            ac.write_json(self.path("vetoes.json"), doc)
+        self.runner.note("deep_vetoes", status=status, vetoes=[v["symbol"] for v in deep])
+        return status
 
     def dossier(self, syms):
         """The deep scan: a file per stock (nse-news/dossier.py) in <day>/stocks/. It must never run into the
@@ -266,6 +289,10 @@ class Day(object):
     def veto_categories(self):
         doc = ac.read_json(self.path("vetoes.json")) or {}
         return {v["symbol"]: v.get("category") or "OTHER" for v in doc.get("vetoes") or [] if v.get("symbol")}
+
+    def veto_sources(self):
+        doc = ac.read_json(self.path("vetoes.json")) or {}
+        return {v["symbol"]: v.get("source") or "claude" for v in doc.get("vetoes") or [] if v.get("symbol")}
 
     # ------------------------------------------------------------ paper trades
 
@@ -549,7 +576,9 @@ class Day(object):
         vetoed = self.vetoes()
         if sym in vetoed:
             c["veto_category"] = self.veto_categories().get(sym) or "OTHER"
-            self.finish(c, "vetoed", "Claude's pre-market veto: %s" % (vetoed[sym] or "no reason given"))
+            c["veto_source"] = self.veto_sources().get(sym) or "claude"
+            self.finish(c, "vetoed", "%s: %s" % ("Deep pre-market veto" if c["veto_source"] == "deep" else
+                                                 "Claude's pre-market veto", vetoed[sym] or "no reason given"))
             return
         mx, cr = self.charges_r_limit(), c["plan"]["charges_r"]
         if mx is not None:
@@ -967,6 +996,16 @@ def cmd_progress(a):
                         force=a.send_now)
 
 
+def cmd_deep(a):
+    """The deep pre-market (deepscan.py): launchd's com.nse-autopilot-deep runs this every 5 minutes. It never
+    takes the tick's lock: it runs for an hour or more and must not hold up the paper stops."""
+    import deepscan
+    home = ac.trader_home()
+    if a.show:
+        return deepscan.status(home, nc.to_ist(nc.utc_now()).date().isoformat())
+    return deepscan.tick(home)
+
+
 def cmd_journal(a):
     import journal
     home = ac.trader_home()
@@ -1027,6 +1066,8 @@ def main(argv=None):
     p.add_argument("--show", action="store_true", help="print the mail that would go out now; send nothing")
     p.add_argument("--send-now", action="store_true", help="send an update now, due or not")
     p.add_argument("--now", help="test only")
+    p = sub.add_parser("deep", help="the deep pre-market research, when it is due (launchd, every 5 minutes)")
+    p.add_argument("--show", action="store_true", help="print today's deep pre-market status instead")
     p = sub.add_parser("journal", help="rebuild the P&L journal (every trade, what it made or lost, and why)")
     p.add_argument("--print", dest="show_day", metavar="DAY", help="print one day's write-up instead")
     p = sub.add_parser("archive", help="save the last 5 sessions' 1- and 5-minute bars into archive/ now")
@@ -1039,7 +1080,7 @@ def main(argv=None):
     try:
         return {"tick": cmd_tick, "eod": cmd_eod, "replay": cmd_replay, "status": cmd_status,
                 "selftest": cmd_selftest, "archive": cmd_archive, "progress": cmd_progress,
-                "journal": cmd_journal}[a.cmd](a)
+                "journal": cmd_journal, "deep": cmd_deep}[a.cmd](a)
     except (ac.AutopilotError, ValueError, OSError) as e:
         print("run_day.py: %s" % e, file=sys.stderr)
         return 2

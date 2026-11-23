@@ -150,6 +150,17 @@ claude                                               # log in once
 - **Slippage** (1.5.0). Paper fills are exact: a LIMIT fills on a touch and a stop at its trigger. The report, the scorecard and the study show the edge at 0, 1, 2, 3 and 5 bps a side, and the break-even slippage that would take the average to zero.
 - **Account sizes** (`"sizes": [100000, 1000000, 5000000, 10000000, 50000000]`, 1.4.0). The report re-sizes each day's signals for every budget listed, each with its own rules: rupee limits scaled with the budget, the cost filter on its own charges, the trade cap, the daily loss limit and the cash left free. One paper account trades; the others are the same signals re-sized, so their fills ignore market impact. `study.py --sizes` does the same over the archive and shows each order's share of its entry bar's volume, the point where a big order's paper fill stops being believable.
 
+### The deep pre-market (1.17.0)
+
+`autopilot/deepscan.py` runs a research desk before the open on the Claude login on the Mac: from 03:30 IST it
+reads the world overnight, the whole Nifty 500, NSE's flows and F&O positioning, the bulk and block deals, the
+macro headlines and, for every Nifty 50 company, its NSE stock file, a year of bars, Yahoo's fundamentals, a month
+of headlines and its own ORB record; a macro desk, a desk per company (with a devil's advocate), a desk per sector
+and, at 07:45, a CIO write the morning note (PDF in the journal folder, and an email), the stocks to sit out and a
+rank for every stock. With `"deep": {"enabled": true, "apply": true}` in autopilot.json the sit-outs join Claude's
+veto (source "deep") and the report replays each one. `python3 autopilot/run_day.py deep --show` prints the day's
+run: steps, calls, tokens, sit-outs.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does arithmetic. It doesn't know your situation and can't see the future. SEBI's [study of intraday trading in the equity cash segment](https://www.business-standard.com/markets/news/7-in-10-intraday-traders-in-equity-cash-suffered-losses-in-fy23-sebi-study-124072400975_1.html) (July 2024) found that 71% of individual intraday traders lost money in FY2022-23, and the losers paid trading costs equal to another 57% of their losses. That's why every number here counts charges. You can lose money; talk to a SEBI-registered adviser if you need advice.

@@ -411,6 +411,8 @@ def shadows(st, day, cfg, bars=None):
         if r.get("why") == "vetoed":
             r["veto_category"] = (cands.get((r.get("side") or "long", r["symbol"])) or {}).get("veto_category") \
                 or "OTHER"
+            r["veto_source"] = (cands.get((r.get("side") or "long", r["symbol"])) or {}).get("veto_source") \
+                or "claude"
     by_why = {}
     for r in rows:
         w = by_why.setdefault(r.get("why") or "?", {"n": 0, "replayed": 0, "net": 0.0, "wins": 0, "targets": 0,
@@ -531,6 +533,11 @@ def build(home, day, settings, cfg, bars=None, index_move=None):
                                  (settings.get("cost_filter") or {}).get("max_charges_r"))
     rep["stocks"] = stock_files(home, day, rep)
     rep["accounts"] = paper_accounts(home, day, settings, cfg, rep.get("candidates"), (sh or {}).get("rows"))
+    try:
+        import deepscan
+        rep["deep"] = deepscan.review(home, day, rep)
+    except Exception as e:                      # the deep pre-market can never fail the report
+        rep["deep"] = {"error": "the review failed: %s: %s" % (type(e).__name__, ac.tail(str(e), 200))}
     return write_outputs(home, day, rep, None)
 
 
@@ -1002,8 +1009,9 @@ def blocks(rep, card, analysis=None):
     if fn["stop_gaps"]:
         items.append("%d stop(s) gapped through the SL limit" % fn["stop_gaps"])
     out.append(("ul", items))
+    out += deep_blocks(rep.get("deep"))
     if rep.get("vetoes"):
-        out.append(("p", "Claude's pre-market vetoes: " + "; ".join(
+        out.append(("p", "Pre-market vetoes: " + "; ".join(
             "%s (%s%s)" % (v["symbol"], (v["category"] + ": ") if v.get("category") else "", v["reason"])
             for v in rep["vetoes"])))
     wi = rep.get("whatif")
@@ -1233,6 +1241,40 @@ def blocks(rep, card, analysis=None):
     elif analysis is False:
         out.append(("h2", "Claude's analysis"))
         out.append(("p", "Claude's analysis is unavailable today; the numbers above are complete without it."))
+    return out
+
+
+def deep_blocks(d):
+    """The deep pre-market (deepscan.py) against the day: its sit-outs replayed, its favoured stocks' signals."""
+    if not d:
+        return []
+    out = [("h2", "Deep pre-market research")]
+    if d.get("error") and not d.get("ran"):
+        return out + [("p", "Deep pre-market: %s" % d["error"])]
+    out.append(("p", "%d Claude calls (%d answered), %s tokens, about $%.2f at API prices%s. CIO: %s. Regime: %s; "
+                     "expected open: %s." % (d.get("calls") or 0, d.get("calls_ok") or 0,
+                                              "{:,}".format(d.get("tokens") or 0), d.get("cost_usd") or 0,
+                                              ("; stopped early: %s" % d["stopped"]) if d.get("stopped") else "",
+                                              "ok" if d.get("cio_ok") else "did not answer (%s)" % d.get("error"),
+                                              d.get("regime") or "n/a", d.get("expected_open") or "n/a")))
+    if d.get("summary"):
+        out.append(("p", "The CIO's summary: " + str(d["summary"])))
+
+    def res(o):
+        n = o.get("net")
+        return "%s%s" % (o.get("what"), (", %s" % signed_money(n)) if n is not None else "")
+    if d.get("vetoes"):
+        out.append(("table", ["Sat out", "Category", "Applied", "What it did today", "Why"],
+                    [[v["symbol"], v.get("category"), "yes" if v.get("applied") else "no", res(v["outcome"]),
+                      v.get("reason")] for v in d["vetoes"]]))
+        if d.get("vetoes_net_if_taken") is not None:
+            out.append(("p", "The deep sit-outs, replayed: %s if they had been traded (positive = sitting out "
+                             "cost money)." % signed_money(d["vetoes_net_if_taken"])))
+    else:
+        out.append(("p", "The deep pre-market sat nothing out today."))
+    if d.get("favoured"):
+        out.append(("table", ["Favoured", "Conviction", "What it did today", "Why"],
+                    [[f["symbol"], f.get("conviction"), res(f["outcome"]), f.get("why")] for f in d["favoured"]]))
     return out
 
 

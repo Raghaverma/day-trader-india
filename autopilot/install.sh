@@ -18,6 +18,7 @@ set -euo pipefail
 
 LABEL="com.nse-autopilot"
 PROGRESS_LABEL="com.nse-autopilot-progress"
+DEEP_LABEL="com.nse-autopilot-deep"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TRADER_HOME="$HOME/Trading/nse-autopilot"
 while [ $# -gt 0 ]; do
@@ -154,6 +155,8 @@ EOF
 write_plist "$LABEL" tick launchd
 # the half-hourly progress email (progress.py): its own job, so it still reports when a tick is stuck
 write_plist "$PROGRESS_LABEL" progress progress
+# the deep pre-market research (deepscan.py): its own job, an hour or more from 03:30, never holding the tick
+write_plist "$DEEP_LABEL" deep deep
 
 say "6/6 Selftest inside launchd (this also sends one test email if mail is on)"
 rm -f "$SUPPORT/selftest.result"

@@ -1,8 +1,8 @@
 #!/bin/bash
-# Remove the paper autopilot's launchd jobs (the day and the progress email). The trader folder (config, paper trades, reports) and the
+# Remove the paper autopilot's launchd jobs (the day, the progress email and the deep pre-market). The trader folder (config, paper trades, reports) and the
 # keychain entry stay; the script says how to remove those by hand if you want to.
 set -u
-for LABEL in com.nse-autopilot com.nse-autopilot-progress; do
+for LABEL in com.nse-autopilot com.nse-autopilot-progress com.nse-autopilot-deep; do
   PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null && echo "stopped $LABEL" || echo "$LABEL was not loaded"
   if [ -f "$PLIST" ]; then

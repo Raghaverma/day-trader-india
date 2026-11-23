@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.17.0
+
+### The deep pre-market: a research desk before the open, live on the paper accounts
+
+- **`autopilot/deepscan.py`**, its own launchd job (`com.nse-autopilot-deep`, `run_day.py deep`), never holding the
+  tick's lock. Phase 1 from 03:30 IST gathers the world overnight (US, Europe and Asia indices, US futures, VIX,
+  Treasury yields, the dollar, rupee, yen and yuan, Brent, WTI, gas, gold, silver, copper, bitcoin, EM and India
+  ETFs, the Indian ADRs, US peers of each sector), the whole Nifty 500 (breadth, sectors, leaders, laggards,
+  52-week highs and lows, volume surges), NSE's FII/DII cash flows and F&O participant open interest, the bulk and
+  block deals, India and world macro headlines, and for every Nifty 50 stock its NSE stock file, a year of daily
+  bars, the last session's 5-minute bars, Yahoo's fundamentals (4 years, 5 quarters, valuation), 30 days of
+  headlines and every past ORB signal on it. Then the desks: macro, one analyst per Nifty 50 company, a devil's
+  advocate on every sit-out and every high-conviction call, a head per sector. Phase 2 at 07:45 refreshes the world
+  and the headlines and the CIO (Opus) writes the morning note, the sit-outs (at most 8) and a 0-1 rank per stock.
+- **Live** (`"deep": {"apply": true}`): run_day.py's pre-market adds the CIO's sit-outs to Claude's veto list with
+  `"source": "deep"`; if the deep pre-market finishes after that, it adds them to the day's `vetoes.json` itself,
+  so every later signal sees them. Vetoed signals say which check vetoed them. The ranks go to
+  `<trader folder>/deep-ranks.json` (the `rank_file`), which only tags signals "top half" / "bottom half".
+- **The morning note** as Markdown, a PDF in the P&L journal folder (`<date> pre-market research.pdf`) and an email.
+- **The report** gets a "Deep pre-market research" section: each deep sit-out with what the stock did (replayed),
+  the favoured stocks' signals, the calls, tokens and estimated cost. Claude's end-of-day analysis sees it.
+- **Limits:** `"max_tokens"` (6,000,000) stops new calls once used; the first usage-limit error stops the day's
+  remaining calls; every desk's answer is saved as it lands, so a crash or a reboot carries on. Claude gets no
+  tools, as before. Off unless `"deep": {"enabled": true}`.
+
 ## 1.16.0
 
 ### The journal as PDFs, with the strategy and why each trade was made
