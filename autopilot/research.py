@@ -203,7 +203,7 @@ def orb_signals(arch, cfg, days, until="14:30"):
             except shorts.ShortPlanError:
                 continue
             out.append({"setup": "orb", "day": day, "symbol": h["symbol"], "at": h["at"], "plan": p,
-                        "latency": LATENCY, "exec": {}})
+                        "latency": LATENCY, "exec": {}, "hit": h})
     return out
 
 

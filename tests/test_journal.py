@@ -102,6 +102,25 @@ class Reasons(unittest.TestCase):
         self.assertNotIn("blocked a later signal", r["why"])
         self.assertIsNone(journal.ttl_of("the LIMIT buy never filled by flat_by 15:10"))
 
+    def test_an_unfilled_order_still_says_what_happened(self):
+        t = trade(status="cancelled", exit_reason="cancelled", fill_time=None, fill_price=None)
+        b = bars(("09:37", 100.6, 100.2), ("09:50", 101.0, 100.4))
+        note = "the LIMIT buy did not fill within 15 minutes of the order (entry_ttl_minutes)"
+        story = journal.explain(t, CAND, b, [], CFG, note)["story"]
+        self.assertEqual(story[1:], ["Order: LIMIT buy 100 at ₹100 at 09:37; stop ₹99, target ₹102 (2R).",
+                                     "Not filled: cancelled at 09:52, 15 minutes after the order, with no trade at "
+                                     "or under the limit."])
+
+    def test_a_cancelled_limit_gives_its_slot_back(self):
+        note = "the LIMIT buy did not fill within 15 minutes of the order (entry_ttl_minutes)"
+        ts = [trade(id="A", ordered_at="%s 09:37" % DAY), trade(id="B", ordered_at="%s 09:37" % DAY,
+                                                                  status="cancelled", fingerprint="fb"),
+              trade(id="C", ordered_at="%s 09:42" % DAY), trade(id="D", ordered_at="%s 09:57" % DAY),
+              trade(id="E", ordered_at="%s 09:40" % DAY, status="cancelled", fingerprint="fe")]
+        # B gave its slot back at 09:52; E has no 15-minute note (an old LIMIT that waited all day): it keeps it
+        self.assertEqual(journal.slot_numbers(ts, {"fb": note, "fe": "never filled by flat_by"}),
+                         {"A": 1, "B": 2, "E": 3, "C": 4, "D": 4})
+
     def test_no_bars_still_explains(self):
         t = trade(exit_time="%s 10:00" % DAY, exit_price=99.0, exit_reason="stop", gross=-100.0, charges=20.0,
                   pnl_net=-120.0)

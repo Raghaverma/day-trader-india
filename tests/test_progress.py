@@ -76,6 +76,36 @@ class Due(unittest.TestCase):
         self.assertEqual(len(s), 15)
 
 
+class Reasons(unittest.TestCase):
+    def test_a_closed_trade_gets_the_journals_reason_and_the_day_is_not_over(self):
+        import datetime
+        t = {"id": "X-1", "date": DAY, "symbol": "XYZ", "qty": 100, "limit": 100.0, "status": "closed",
+             "ordered_at": "%s 09:37" % DAY, "fill_time": "%s 09:38" % DAY, "fill_price": 100.0,
+             "stop": {"trigger": 99.0}, "target": 102.0, "exit_time": "%s 10:00" % DAY, "exit_price": 99.0,
+             "exit_reason": "stop", "gross": -100.0, "charges": 20.0, "pnl_net": -120.0, "max_loss": 150.0}
+        cand = {"scan_at": "09:35", "or_high": 99.9, "or_low": 98.1, "pct_over": 0.02,
+                "trigger": {"at": "09:35", "price": 99.92, "volume_x": 0.8},
+                "plan": {"entry": 100.0, "stop": 99.0, "target": 102.0, "risk_per_share": 1.0},
+                "tm": {"p_target": 0.2, "p_stop": 0.6, "p_neither": 0.2, "category": "Leans toward the stop"},
+                "order": {"bound_by": "cash"}}
+        lines = progress.why_bought(t, cand, {"max_trades_per_day": 5, "flat_by": "15:10"}, 2)
+        self.assertIn("Note: a weak breakout (only 0.02% over the range high and below-normal volume on the "
+                      "breakout bar).", lines)
+        self.assertTrue(any("sized by the cash still free; trade 2 of 5 allowed today." in x for x in lines))
+
+        def row(hhmm, h, l):
+            t0 = datetime.datetime.strptime("%s %s" % (DAY, hhmm), "%Y-%m-%d %H:%M") - datetime.timedelta(
+                hours=5, minutes=30)
+            return (int(t0.replace(tzinfo=datetime.timezone.utc).timestamp()), (h + l) / 2, h, l, (h + l) / 2, 1)
+        rows = [row("09:38", 100.1, 99.9), row("09:50", 100.05, 99.5), row("10:00", 99.2, 98.9),
+                row("11:00", 98.5, 98.0)]
+        went = progress.how_it_went(t, cand, rows, [], {"max_trades_per_day": 5}, None, so_far=True)
+        self.assertTrue(went.startswith("Result: The breakout never got going"))
+        self.assertIn("is at ₹98.25 now (11:00)", went)
+        self.assertNotIn("ended the day", went)
+        self.assertIsNone(progress.how_it_went(t, cand, None, [], {}, None, so_far=True))
+
+
 class Mails(HomeBase):
     def run_at(self, hhmm, sender, **kw):
         settings = ac.load_settings(self.d)
@@ -98,6 +128,15 @@ class Mails(HomeBase):
                       "TRADES", "RELIANCE", "SIGNALS", "PRE-MARKET", "Next update 11:00 IST"):
             self.assertIn(words, text)
         self.assertNotIn("No paper trades yet today.", text)
+        # why it bought, the plan, the odds and how it is doing, from what the autopilot recorded at the time
+        self.assertIn("   Why: the 10:05 five-minute bar closed at ₹1,334, above the 09:15-09:30 high", text)
+        self.assertIn("not vetoed by the news check", text)
+        self.assertIn("   Plan: buy at ₹1,334; stop", text)
+        self.assertIn("(middle of the opening range", text)
+        self.assertIn("37 shares (₹49,358), sized by the max loss a trade", text)
+        self.assertIn("trade 1 of 3 allowed today", text)
+        self.assertIn("   Odds (Time Machine, shown, never used to choose):", text)
+        self.assertIn("   So far: now ", text)
         self.assertTrue(self.sent_file()["10:30"]["ok"])
 
     def test_a_slot_is_sent_once(self):

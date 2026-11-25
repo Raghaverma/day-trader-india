@@ -44,6 +44,10 @@
     "enabled": true,
     "dir": "~/Desktop/NSE Trading P&L"
   },
+  "dataset": {
+    "enabled": true,
+    "dir": null
+  },
   "dossier": {
     "enabled": true,
     "budget_s": 900,

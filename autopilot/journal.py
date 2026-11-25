@@ -125,9 +125,31 @@ def ttl_of(note):
     return float(m.group(1)) if m and "entry_ttl_minutes" in note else None
 
 
-def explain(t, cand, bars, nifty, cfg, cancel_note=None):
+def slot_numbers(trades, notes):
+    """{trade id: the trade slot it took}, in order time. A LIMIT the paper broker cancelled unfilled after
+    entry_ttl_minutes gave its slot back then (its note says so); any other order, filled or not, keeps its slot
+    all day. notes: {fingerprint: the cancel note} (cancel_notes)."""
+    out, held = {}, []
+    for t in sorted(trades, key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")):
+        at = t.get("ordered_at") or ""
+        held = [h for h in held if h is None or h > at]
+        out[t.get("id")] = len(held) + 1
+        ttl = ttl_of(notes.get(t.get("fingerprint"))) if t.get("status") == "cancelled" else None
+        free = None
+        if ttl and at:
+            try:
+                free = (datetime.datetime.strptime(at[:16], "%Y-%m-%d %H:%M") +
+                        datetime.timedelta(minutes=ttl)).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                free = None
+        held.append(free)
+    return out
+
+
+def explain(t, cand, bars, nifty, cfg, cancel_note=None, so_far=False):
     """The trade's row: the numbers, the price path around it, a category and the reason in plain words.
-    cancel_note: the paper broker's note when it cancelled an unfilled LIMIT (state/broker.json)."""
+    cancel_note: the paper broker's note when it cancelled an unfilled LIMIT (state/broker.json).
+    so_far: the session is not over (the progress email): the last bar is "now", not the day's close."""
     plan = cand.get("plan") or {}
     trig = cand.get("trigger") or {}
     tm = cand.get("tm") or {}
@@ -172,9 +194,17 @@ def explain(t, cand, bars, nifty, cfg, cancel_note=None):
         after = window(bars, row["ordered_at"], flat, include_after=True)
         ttl = ttl_of(cancel_note) if status == "cancelled" else None
         live = after
+        story.append("Order: LIMIT buy %s at %s at %s; stop %s, target %s (2R)." % (
+            qty, px(t.get("limit")), row["ordered_at"] or "?", px(stop), px(target)))
         if ttl and row["ordered_at"]:           # the order's own life: from the order to its cancel
             end = mins(row["ordered_at"]) + int(ttl)
             live = window(bars, row["ordered_at"], "%02d:%02d" % (end // 60, end % 60), include_after=True) or after
+            story.append("Not filled: cancelled at %02d:%02d, %d minutes after the order, with no trade at or "
+                         "under the limit." % (end // 60, end % 60, ttl))
+        elif status == "cancelled":
+            story.append("Not filled: cancelled unfilled.")
+        else:
+            story.append("Not filled yet: the LIMIT is still waiting.")
         row["result"] = "NO FILL"
         if after:
             low = min(live, key=lambda b: b[3])
@@ -273,14 +303,15 @@ def explain(t, cand, bars, nifty, cfg, cancel_note=None):
             low = min(after, key=lambda b: b[3])
             back = next((b[0] for b in after if target and b[2] >= target), None)
             last = after[-1][4]
+            ended = ("is at %s now (%s)" % (px(last), after[-1][0])) if so_far else "ended the day at %s" % px(last)
             if back:
                 why.append("After the stop it recovered and reached the target at %s: stopped out before the move." %
                            back)
             elif low[3] < t["exit_price"] and qty:
-                why.append("After the stop it fell further, to %s by %s (the stop saved about %s more), and ended "
-                           "the day at %s." % (px(low[3]), low[0], money(qty * (t["exit_price"] - low[3])), px(last)))
+                why.append("After the stop it fell further, to %s by %s (the stop saved about %s more), and %s." % (
+                    px(low[3]), low[0], money(qty * (t["exit_price"] - low[3])), ended))
             else:
-                why.append("After the stop it ended the day at %s." % px(last))
+                why.append("After the stop it %s." % ended)
     elif reason == "flat_by":
         row["why_category"] = "Squared off at 15:10 (%s)" % ("profit" if (t.get("pnl_net") or 0) > 0 else "loss")
         why.append("Neither the stop nor the target by 15:10, so it was squared off at %s. Best was %+.2fR at %s." % (
@@ -582,11 +613,13 @@ def build_account(A, day, rep, st, nifty, bars_for, cfg, replays, ctx=None):
     notes = cancel_notes(A["home"], day)
     acfg = dict(cfg, max_trades_per_day=A["cap"])
     rows = []
-    for slot, t in enumerate(sorted((t for t in paper.get("trades") or [] if t.get("date") == day),
-                                    key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")), 1):
+    mine = [t for t in paper.get("trades") or [] if t.get("date") == day]
+    slots = slot_numbers(mine, notes)
+    for t in sorted(mine, key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")):
+        slot = slots.get(t.get("id"))
         cand = st["candidates"].get(t["symbol"]) or {}
         r = explain(t, cand, bars_for(t["symbol"]), nifty, acfg, notes.get(t.get("fingerprint")))
-        r.update(account=A["short"], main="yes" if A["main"] else "no")
+        r.update(account=A["short"], main="yes" if A["main"] else "no", slot=slot)
         if ctx is not None:
             r["decisions"] = decisions(t, cand, A, ctx, slot)
         acc = cand.get("order") if A["main"] else (cand.get("accounts") or {}).get(A["name"])

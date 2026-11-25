@@ -7,6 +7,7 @@ keyboard, on PAPER only, and writes the end-of-day report. Standard library only
     python3 run_day.py selftest    # python, config, Claude (headless) and Gmail, from where it is run
     python3 run_day.py progress    # the half-hourly progress email, when one is due (progress.py)
     python3 run_day.py journal     # rebuild the P&L journal: every trade, what it made or lost, and why
+    python3 run_day.py dataset     # rebuild the dataset: every signal, trade, day and call as CSV tables
     python3 run_day.py eod --date 2026-11-13     # rebuild and resend a day's report
     NSE_TEST_MODE=1 python3 run_day.py replay --date 2026-11-13 --times 08:45,10:05,15:35
 
@@ -21,8 +22,8 @@ The day, in IST (times from autopilot.json):
           nse-entry -> nse-exit -> nse-timemachine -> nse-budget -> nse-alerts quote -> nse-risk ->
           ticket.py autopilot-approve -> paper-fill, one symbol at a time. After the day's trade cap or
           loss limit, a hit is planned but not traded: a shadow, which the report replays.
-  15:35   once: the last paper-check, the journal, report.py, Claude's analysis, the email, the bar archive and
-          the P&L journal (journal.py, "journal" in autopilot.json).
+  15:35   once: the last paper-check, the journal, report.py, Claude's analysis, the email, the bar archive,
+          the P&L journal (journal.py, "journal" in autopilot.json) and the dataset (dataset.py, "dataset").
 
 Paper only, by code, twice: this runner refuses unless config.json says "broker": "paper" and
 "autopilot": true, and ticket.py autopilot-approve checks both again. Nothing here changes config.json.
@@ -725,6 +726,7 @@ class Day(object):
         ac.notify(self.settings, "NSE autopilot (paper)", report.headline(rep["report"]))
         ph["eod"]["archive"] = self.archive()
         ph["eod"]["journal"] = self.journal()
+        ph["eod"]["dataset"] = self.dataset()
         ph["eod"]["done"] = self.stamp()
         self.save()
         return rep
@@ -740,6 +742,19 @@ class Day(object):
             return "failed: %s: %s" % (type(e).__name__, ac.tail(str(e), 200))
         self.runner.note("pnl_journal", folder=folder, days=n, note=note)
         return "%d days in %s%s" % (n, folder, (" (%s)" % note) if note else "")
+
+    def dataset(self):
+        """Rebuild the dataset (dataset.py) from every day's records, after the archive and the journal; it can
+        never fail the day."""
+        if not (self.settings.get("dataset") or {}).get("enabled"):
+            return "off"
+        try:
+            import dataset
+            folder, meta = dataset.write_all(self.home, self.settings, self.cfg)
+        except Exception as e:
+            return "failed: %s: %s" % (type(e).__name__, ac.tail(str(e), 200))
+        self.runner.note("dataset", folder=folder, rows=meta["rows"])
+        return "%d signals, %d trades in %s" % (meta["rows"]["signals"], meta["rows"]["trades"], folder)
 
     def archive(self, plan=None, force=False):
         """Keep the day's bars (and fill any of the last 5 sessions that are missing). After the report and the
@@ -1012,6 +1027,11 @@ def cmd_journal(a):
     return journal.run(home, ac.load_settings(home), ac.load_cfg(home), a.show_day)
 
 
+def cmd_dataset(a):
+    import dataset
+    return dataset.main(["--check"] if a.check else [])
+
+
 def cmd_selftest(a):
     home = ac.trader_home()
     ok = True
@@ -1070,6 +1090,8 @@ def main(argv=None):
     p.add_argument("--show", action="store_true", help="print today's deep pre-market status instead")
     p = sub.add_parser("journal", help="rebuild the P&L journal (every trade, what it made or lost, and why)")
     p.add_argument("--print", dest="show_day", metavar="DAY", help="print one day's write-up instead")
+    p = sub.add_parser("dataset", help="rebuild the dataset: every signal, trade, day and call as CSV tables")
+    p.add_argument("--check", action="store_true", help="build it and print the row counts; write nothing")
     p = sub.add_parser("archive", help="save the last 5 sessions' 1- and 5-minute bars into archive/ now")
     p.add_argument("--backfill", action="store_true",
                    help="everything Yahoo still has: 60 days of 5-minute bars, 28 days of 1-minute bars")
@@ -1080,7 +1102,7 @@ def main(argv=None):
     try:
         return {"tick": cmd_tick, "eod": cmd_eod, "replay": cmd_replay, "status": cmd_status,
                 "selftest": cmd_selftest, "archive": cmd_archive, "progress": cmd_progress,
-                "journal": cmd_journal, "deep": cmd_deep}[a.cmd](a)
+                "journal": cmd_journal, "deep": cmd_deep, "dataset": cmd_dataset}[a.cmd](a)
     except (ac.AutopilotError, ValueError, OSError) as e:
         print("run_day.py: %s" % e, file=sys.stderr)
         return 2

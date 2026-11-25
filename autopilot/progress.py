@@ -179,8 +179,8 @@ def tick_running():
         return None
 
 
-def last_price(fetch, sym):
-    """(price, 'HH:MM') from Yahoo 1-minute bars, or (None, why)."""
+def today_rows(fetch, sym):
+    """(Yahoo's 1-minute rows today, None) or (None, why)."""
     if not fetch:
         return None, "no market data"
     try:
@@ -189,9 +189,103 @@ def last_price(fetch, sym):
         return None, ac.tail(str(e), 120)
     if not rows:
         return None, "no bars yet"
+    return rows, None
+
+
+def last_price(fetch, sym, rows=None):
+    """(price, 'HH:MM') from Yahoo 1-minute bars, or (None, why)."""
+    if rows is None:
+        rows, why = today_rows(fetch, sym)
+        if rows is None:
+            return None, why
     t, _o, _h, _l, c, _v = rows[-1]
     at = datetime.datetime.fromtimestamp(t, datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
     return c, at.strftime("%H:%M")
+
+
+def hm_bars(rows):
+    """Yahoo rows -> the journal's [(HH:MM, o, h, l, c)]."""
+    return [(nc.ist_from_epoch(r[0]).strftime("%H:%M"), r[1], r[2], r[3], r[4]) for r in rows or []
+            if r[4] is not None]
+
+
+BOUND_WORDS = {"max loss": "the max loss a trade (%s)", "cash": "the cash still free",
+               "position cap": "the cap on one stock", "max order": "the largest order allowed"}
+
+
+def why_bought(t, cand, cfg, slot, veto_ran=True):
+    """Why the autopilot bought it, its plan and the Time Machine's odds: short lines from what it recorded when it
+    decided (the day's state), as the PDF tells it in full in the evening."""
+    trig, plan, tm = cand.get("trigger") or {}, cand.get("plan") or {}, cand.get("tm") or {}
+    if not trig and not plan:
+        return []
+    out = []
+    w = "Why: the %s five-minute bar closed at %s, above the 09:15-09:30 high %s" % (
+        trig.get("at") or cand.get("scan_at") or "?", px(trig.get("price") or cand.get("scan_price")),
+        px(cand.get("or_high")))
+    bits = []
+    if cand.get("pct_over") is not None:
+        bits.append("%.2f%% over" % cand["pct_over"])
+    if trig.get("volume_x") is not None:
+        bits.append("that bar's volume %.2fx normal" % trig["volume_x"])
+    if cand.get("open_rvol") is not None:
+        bits.append("opening volume %.1fx its 20-day median" % cand["open_rvol"])
+    w += (" (%s)" % ", ".join(bits) if bits else "") + ("; not vetoed by the news check" if veto_ran else "")
+    if cand.get("daily_setups"):
+        w += "; also a %s on the daily chart" % " and a ".join(str(x).replace("_", " ") for x in cand["daily_setups"])
+    out.append(w + ".")
+    weak = []
+    if cand.get("pct_over") is not None and cand["pct_over"] < 0.05:
+        weak.append("only %.2f%% over the range high" % cand["pct_over"])
+    if trig.get("volume_x") is not None and trig["volume_x"] < 1.0:
+        weak.append("below-normal volume on the breakout bar")
+    if weak:
+        out.append("Note: a weak breakout (%s)." % " and ".join(weak))
+    if plan.get("entry"):
+        p = "Plan: buy at %s; stop %s (middle of the opening range, %s a share at risk); target %s (2R); anything " \
+            "left sold at %s" % (px(plan["entry"]), px(plan.get("stop")), px(plan.get("risk_per_share")),
+                                 px(plan.get("target")), plan.get("flat_by") or cfg.get("flat_by") or "15:10")
+        qty = t.get("qty")
+        bound = (cand.get("order") or {}).get("bound_by")
+        if qty:
+            p += "; %s shares (%s)" % (qty, money(qty * (t.get("limit") or plan["entry"])))
+            if bound:
+                p += ", sized by %s" % (BOUND_WORDS.get(bound, bound) % money(cfg.get("max_loss_per_trade_inr"))
+                                        if bound == "max loss" else BOUND_WORDS.get(bound, bound))
+        if cfg.get("max_trades_per_day") and slot:
+            p += "; trade %d of %d allowed today" % (slot, int(cfg["max_trades_per_day"]))
+        out.append(p + ".")
+    if tm.get("p_target") is not None:
+        out.append("Odds (Time Machine, shown, never used to choose): %.0f%% target first, %.0f%% stop first, "
+                   "%.0f%% neither by 15:10 (%s)." % (100 * tm["p_target"], 100 * (tm.get("p_stop") or 0),
+                                                      100 * (tm.get("p_neither") or 0), tm.get("category") or "?"))
+    return out
+
+
+def how_it_went(t, cand, rows, nifty_rows, cfg, note, so_far):
+    """For a closed or cancelled trade, the journal's own "why it made or lost money"; for an open one, where it is
+    against the plan. None without bars."""
+    if not rows:
+        return None
+    st = t.get("status")
+    if st == "filled":
+        stop = (t.get("stop") or {}).get("trigger")
+        fill = t.get("fill_price")
+        if fill is None or stop is None or fill <= stop:
+            return None
+        risk = fill - stop
+        bars = [b for b in hm_bars(rows) if b[0] >= (t.get("fill_time") or "")[11:16]]
+        if not bars:
+            return None
+        best = max(bars, key=lambda b: b[2])
+        worst = min(bars, key=lambda b: b[3])
+        return "So far: now %+.2fR; best %+.2fR (%s), worst %+.2fR (%s); the target is +2R." % (
+            (bars[-1][4] - fill) / risk, (best[2] - fill) / risk, best[0], (worst[3] - fill) / risk, worst[0])
+    if st not in ("closed", "cancelled"):
+        return None
+    import journal
+    r = journal.explain(t, cand, hm_bars(rows), hm_bars(nifty_rows), cfg, note, so_far=so_far)
+    return ("Result: %s" % r["why"]) if r.get("why") else None
 
 
 def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None):
@@ -204,8 +298,33 @@ def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None)
     all_trades = paper.get("trades") or []
     today = [t for t in all_trades if t.get("date") == day]
     trades, made, lost, gmade, glost, charges, realised, opened = [], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    for t in today:
+    try:
+        import journal
+        notes = journal.cancel_notes(home, day)
+    except Exception:
+        notes = {}
+    vetoes = ac.read_json(os.path.join(ac.day_dir(home, day), "vetoes.json")) or {}
+    nifty_rows = None
+    so_far = ist.hour * 60 + ist.minute < mins(cfg.get("market_close") or "15:30")
+    try:
+        slots = journal.slot_numbers(today, notes)
+    except Exception:
+        slots = {}
+    for t in sorted(today, key=lambda t: (t.get("ordered_at") or "", t.get("id") or "")):
+        slot = slots.get(t.get("id"))
         row = dict(t)
+        cand = st["candidates"].get(t.get("symbol")) or {}
+        rows, _why = today_rows(fetch, t["symbol"]) if t.get("status") in ("filled", "closed", "cancelled") \
+            else (None, None)
+        try:
+            row["why_lines"] = why_bought(t, cand, cfg, slot, veto_ran=bool(vetoes))
+            if rows and t.get("status") in ("closed", "cancelled") and nifty_rows is None:
+                nifty_rows = today_rows(fetch, market.NIFTY)[0] or []
+            went = how_it_went(t, cand, rows, nifty_rows, cfg, notes.get(t.get("fingerprint")), so_far)
+            if went:
+                row["why_lines"].append(went)
+        except Exception as e:                     # the reasons are extra: never lose the mail over them
+            row["why_lines"] = ["(the reasons could not be written: %s)" % ac.tail(str(e), 120)]
         if t.get("status") == "closed":
             net, gross = float(t.get("pnl_net") or 0), float(t.get("gross") or 0)
             realised += net
@@ -219,7 +338,7 @@ def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None)
             elif gross < 0:
                 glost += gross
         elif t.get("status") == "filled":
-            last, at = last_price(fetch, t["symbol"])
+            last, at = last_price(fetch, t["symbol"], rows) if rows else (None, _why or "no bars yet")
             row["last"], row["last_at"] = last, at
             if last is not None:
                 g = round(t["qty"] * (last - t["fill_price"]), 2)
@@ -257,7 +376,7 @@ def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None)
         "all_closed": len(closed_all), "all_net": sum(float(t.get("pnl_net") or 0) for t in closed_all),
         "all_wins": sum(1 for t in closed_all if float(t.get("pnl_net") or 0) > 0),
         "all_losses": sum(1 for t in closed_all if float(t.get("pnl_net") or 0) < 0),
-        "vetoes": ac.read_json(os.path.join(ac.day_dir(home, day), "vetoes.json")) or {},
+        "vetoes": vetoes,
         "daily": ac.read_json(os.path.join(ac.day_dir(home, day), "daily.json")) or {},
         "problems": problems, "jobs": jobs,
         "tick_running": running if running is not None else tick_running(),
@@ -385,7 +504,10 @@ def trade_lines(s, cfg):
         else:
             tail = (st or "?").upper()
         out.append("%s\n   -> %s" % (head, tail))
-    return out
+        for w in t.get("why_lines") or []:
+            out.append("   " + w)
+        out.append("")
+    return out[:-1] if out and out[-1] == "" else out
 
 
 def signal_lines(s):

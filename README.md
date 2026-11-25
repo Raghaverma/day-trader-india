@@ -8,7 +8,7 @@
   <img alt="version 1.16.0" src="https://img.shields.io/badge/version-1.16.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="870 offline tests" src="https://img.shields.io/badge/tests-870%20offline-3fb950?style=flat-square">
+  <img alt="1008 offline tests" src="https://img.shields.io/badge/tests-1008%20offline-3fb950?style=flat-square">
   <img alt="NSE India" src="https://img.shields.io/badge/market-NSE%20India-FF9933?style=flat-square">
   <img alt="paper trading by default" src="https://img.shields.io/badge/broker-paper%20by%20default-58a6ff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat-square">
@@ -160,6 +160,24 @@ and, at 07:45, a CIO write the morning note (PDF in the journal folder, and an e
 rank for every stock. With `"deep": {"enabled": true, "apply": true}` in autopilot.json the sit-outs join Claude's
 veto (source "deep") and the report replays each one. `python3 autopilot/run_day.py deep --show` prints the day's
 run: steps, calls, tokens, sit-outs.
+
+### The dataset and the reasons in the progress email (1.19.0)
+
+`autopilot/dataset.py` keeps everything the autopilot has seen as CSV tables in `<trader folder>/dataset/`, rebuilt
+in full from its own records after each evening's journal (`"dataset": {"enabled": true}` in autopilot.json;
+`python3 autopilot/run_day.py dataset` by hand, `--check` to count rows only). `signals.csv` has one row per long
+ORB signal on every archived day: what was known when it fired (the opening range, how far over, opening and
+breakout-bar volume, gap, strength against the Nifty, room to the target, the Nifty and India VIX), what the
+autopilot decided and why on the days it ran (outcome, veto, the deep research's rank and call, the Time Machine's
+odds, the real trade), and what the signal went on to do when replayed with today's rules (`label_*`: the R under
+the plan and under three other exits, the best and worst while held). Next to it: each account's decision on each
+signal, every paper trade with the journal's reasons, each account's day, each day's market, every sit-out and every
+deep call with what the stock did, and Claude's own words each day (`notes.jsonl`). `README.md` in the folder lists
+every column and says which are features and which are labels.
+
+Each trade in the half-hourly progress email now says why it was bought (the breakout bar, how far over the range,
+the volume, the veto), the plan (stop, target, size and what set it, the trade slot), the Time Machine's odds and,
+once it has closed or been cancelled, the journal's reason for the result; an open trade shows where it stands in R.
 
 ## Fine print
 

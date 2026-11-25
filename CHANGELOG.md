@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.19.0
+
+### The dataset, and why each trade was made in the progress email
+
+- **`autopilot/dataset.py`**: the trader folder's records as CSV tables in `<trader folder>/dataset/` (or
+  `"dataset": {"dir"}`), rebuilt in full after the evening's journal with `"dataset": {"enabled": true}`, never
+  failing the day; `run_day.py dataset [--check]` by hand. `signals.csv`: every long ORB signal on every archived
+  day (64 days, 1,750 signals at first build), its features at the signal, the live autopilot's decision and
+  context on the days it ran (outcome, veto, deep rank and the company desk's call, Time Machine odds, the real
+  trade), and its replay with the live rules as labels (result, R, best and worst while held, R under the breakeven,
+  time and trail exits). Also `decisions.csv` (each account's decision on each signal), `trades.csv` (every paper
+  order with the journal's reasons and steps), `account_days.csv`, `days.csv`, `vetoes.csv`, `deep_calls.csv` (the
+  deep research's call on every stock and what it did) and `notes.jsonl` (the news check's summary, the morning
+  note, the evening analysis). The folder's README lists every column as feature, live or label, generated from
+  the same list that writes the files. `research.orb_signals` keeps the scanner's hit on each signal.
+- **The progress email says why.** Under each trade: why it was bought (the breakout bar, % over the range, the
+  bar's and the opening volume, not vetoed), a note when the breakout was weak, the plan (stop at the range's middle
+  and the risk a share, the 2R target, 15:10, the size and what set it, the trade slot), the Time Machine's odds
+  and, once closed or cancelled, the journal's own reason, worded for a session still running; an open trade shows
+  now, best and worst in R.
+- **Fixes.** An order the paper broker cancelled after `entry_ttl_minutes` gives its trade slot back in the day
+  page's steps ("5th of 5", not "6th of 5" after a cancelled order; `journal.slot_numbers`). An unfilled order's
+  "What happened" is no longer empty: the order and when it was cancelled.
+
 ## 1.17.0
 
 ### The deep pre-market: a research desk before the open, live on the paper accounts
