@@ -37,6 +37,7 @@ DEFAULTS = {"enabled": True, "every_min": 30, "to": None, "grace_min": 20, "wrap
 START_DELAY_MIN = 2          # the first mail waits for the first tick, so it can say the tick ran
 MAX_ATTEMPTS = 3             # a mail that keeps failing is tried on 3 ticks, then given up (and logged)
 STALE_TICK_MIN = 5           # no tick for this long in the working day = a warning in the mail
+BACKUP_STALE_H = 36          # the nightly backup (state/backup.json) older than this = a warning in the morning mail
 ORB_FIRST_SCAN = "09:36"
 
 OUTCOMES = collections.OrderedDict([
@@ -378,7 +379,8 @@ def snapshot(home, day, settings, cfg, now, fetch=None, jobs=None, running=None)
         "all_losses": sum(1 for t in closed_all if float(t.get("pnl_net") or 0) < 0),
         "vetoes": vetoes,
         "daily": ac.read_json(os.path.join(ac.day_dir(home, day), "daily.json")) or {},
-        "problems": problems, "jobs": jobs,
+        "problems": problems, "jobs": jobs, "now_utc": now,
+        "backup": ac.read_json(os.path.join(home, "state", "backup.json")),
         "tick_running": running if running is not None else tick_running(),
     }
 
@@ -442,6 +444,30 @@ def health(s, settings):
         else:
             out.append("Last tick %s IST (%d today)." % (last, len(s["ticks"])))
     return out
+
+
+def backup_line(s):
+    """The nightly backup's last run (state/backup.json, written by the backup job), for the morning mail; None
+    when there is no backup job."""
+    b = s.get("backup")
+    if not isinstance(b, dict):
+        return None
+    try:
+        at = datetime.datetime.fromisoformat(b["at"])
+    except (KeyError, TypeError, ValueError):
+        return "!! The nightly backup's status (state/backup.json) could not be read."
+    at_utc = at.astimezone(datetime.timezone.utc).replace(tzinfo=None) if at.tzinfo else at
+    when = nc.to_ist(at_utc).strftime("%d %b %H:%M")
+    where = b.get("where") or "the backup"
+    if not b.get("ok"):
+        return "!! The nightly backup FAILED on %s IST (%s); %s has the previous copy. Log: %s." % (
+            when, b.get("failed") or "see the log", where, b.get("log") or "backup.log")
+    hours = (s["now_utc"] - at_utc).total_seconds() / 3600.0
+    if hours > BACKUP_STALE_H:
+        return "!! The last backup was %s IST, %d hours ago: the nightly backup job may not be running." % (
+            when, hours)
+    size = " (%.0f MB)" % (b["bytes"] / 1e6) if b.get("bytes") else ""
+    return "Backup: copied to %s on %s IST%s." % (where, when, size)
 
 
 def premarket_lines(s):
@@ -599,6 +625,10 @@ def subject(kind, s):
 
 def body(kind, s, settings, cfg, pm):
     s["_health"] = health(s, settings)
+    if kind in ("start", "closed"):
+        line = backup_line(s)
+        if line:
+            s["_health"].append(line)
     lines = ["NSE paper autopilot, %s, %s IST" % (s["weekday"], s["now"]), ""]
     if kind == "closed":
         lines += [doing_now(s, settings, cfg), "Next trading day: %s IST." % s["status"].get("next_open"), ""]

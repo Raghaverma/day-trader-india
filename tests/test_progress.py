@@ -164,6 +164,25 @@ class Mails(HomeBase):
         self.assertIn("trading day %s, running" % DAY, subj)
         self.assertIn("The autopilot WILL run today", text)
 
+    def test_the_morning_mail_says_whether_last_nights_backup_worked(self):
+        self.replay(times=("08:40", "08:41"))
+        path = os.path.join(self.d, "state", "backup.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        doc = {"at": "%sT23:30:20+05:30" % "2026-11-12", "ok": True, "failed": None, "bytes": 18900000,
+               "where": "Google Drive: NSE autopilot backup/nightly", "log": "~/Library/Logs/nse-autopilot/backup.log"}
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        stub = SenderStub()
+        self.run_at("08:42", stub)
+        self.assertIn("Backup: copied to Google Drive: NSE autopilot backup/nightly on 12 Nov 23:30 IST (19 MB).",
+                      stub.sent[0][1])
+        s = {"now_utc": utc("%s 08:42" % DAY), "backup": dict(doc, ok=False, failed="the upload to Google Drive")}
+        self.assertTrue(progress.backup_line(s).startswith("!! The nightly backup FAILED on 12 Nov 23:30 IST (the "
+                                                           "upload to Google Drive)"))
+        s["backup"] = dict(doc, at="2026-11-10T23:30:20+05:30")
+        self.assertIn("!! The last backup was 10 Nov 23:30 IST, 57 hours ago", progress.backup_line(s))
+        self.assertIsNone(progress.backup_line({"now_utc": s["now_utc"], "backup": None}))
+
     def test_off_config_says_it_will_not_run(self):
         self.set_cfg(autopilot=False)
         stub = SenderStub()

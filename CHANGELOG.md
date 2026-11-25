@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.1
+
+### The morning email says whether last night's backup worked
+
+- A nightly backup job outside the repo writes `<trader folder>/state/backup.json` (`at`, `ok`, `failed`,
+  `bytes`, `where`, `log`). When the file is there, the 08:42 email (and the closed-day email) says when the last
+  copy went and how big it was, or warns with "!!" when it failed or is more than 36 hours old
+  (`progress.backup_line`). Without the file, nothing changes.
+
 ## 1.19.0
 
 ### The dataset, and why each trade was made in the progress email

@@ -8,7 +8,7 @@
   <img alt="version 1.16.0" src="https://img.shields.io/badge/version-1.16.0-blue?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="1008 offline tests" src="https://img.shields.io/badge/tests-1008%20offline-3fb950?style=flat-square">
+  <img alt="1009 offline tests" src="https://img.shields.io/badge/tests-1009%20offline-3fb950?style=flat-square">
   <img alt="NSE India" src="https://img.shields.io/badge/market-NSE%20India-FF9933?style=flat-square">
   <img alt="paper trading by default" src="https://img.shields.io/badge/broker-paper%20by%20default-58a6ff?style=flat-square">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat-square">
@@ -178,6 +178,9 @@ every column and says which are features and which are labels.
 Each trade in the half-hourly progress email now says why it was bought (the breakout bar, how far over the range,
 the volume, the veto), the plan (stop, target, size and what set it, the trade slot), the Time Machine's odds and,
 once it has closed or been cancelled, the journal's reason for the result; an open trade shows where it stands in R.
+
+If a backup job writes `<trader folder>/state/backup.json` (`{"at", "ok", "failed", "bytes", "where", "log"}`), the
+08:42 email says when last night's copy went, or warns when it failed or is more than 36 hours old (1.19.1).
 
 ## Fine print
 
